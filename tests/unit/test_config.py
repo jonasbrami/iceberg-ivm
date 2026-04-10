@@ -65,7 +65,6 @@ def test_load_views_valid(tmp_path):
     assert len(views) == 1
     v = views[0]
     assert v.filter_column == "ts"
-    assert v.filter_granularity == "day"
     assert v.merge_keys == ("symbol", "minute")
     assert isinstance(v.merge_keys, tuple)
 
@@ -81,7 +80,6 @@ def test_view_defaults(tmp_path):
         "    merge_keys: [a]\n"
     )
     views = load_views(write_views(tmp_path, minimal))
-    assert views[0].filter_granularity == "day"
     assert views[0].refresh_interval_seconds == 60
 
 
@@ -135,14 +133,12 @@ def test_save_views_and_reload(tmp_path):
         query="SELECT date_trunc('day', ts) AS d FROM t WHERE {range_filter} GROUP BY 1",
         merge_keys=("symbol", "minute"),
         filter_column="ts",
-        filter_granularity="day",
         refresh_interval_seconds=30,
     )]
     views_path = tmp_path / "views.yaml"
     save_views(views, views_path)
     loaded = load_views(views_path)
     assert loaded[0].filter_column == views[0].filter_column
-    assert loaded[0].filter_granularity == views[0].filter_granularity
     assert loaded[0].merge_keys == views[0].merge_keys
 
 
@@ -203,36 +199,36 @@ def test_infer_multiple_different_raises():
         infer_granularity(q)
 
 
-# ── views-level inference ──
+# ── views-level query validation ──
+# The loader calls infer_granularity() on the query to validate it, but the
+# result is not stored. These tests verify that valid queries load and invalid
+# queries are rejected.
 
-def test_load_views_infers_granularity(tmp_path):
+def test_load_views_accepts_minute(tmp_path):
     views_yaml = (
         "views:\n  - name: v\n    source_table: t\n    filter_column: ts\n"
         "    query: \"SELECT date_trunc('minute', ts) AS m FROM t WHERE {range_filter} GROUP BY 1\"\n"
         "    merge_keys: [m]\n"
     )
-    views = load_views(write_views(tmp_path, views_yaml))
-    assert views[0].filter_granularity == "minute"
+    assert len(load_views(write_views(tmp_path, views_yaml))) == 1
 
 
-def test_load_views_infers_quarter(tmp_path):
+def test_load_views_accepts_quarter(tmp_path):
     views_yaml = (
         "views:\n  - name: v\n    source_table: t\n    filter_column: ts\n"
         "    query: \"SELECT date_trunc('quarter', ts) AS q FROM t WHERE {range_filter} GROUP BY 1\"\n"
         "    merge_keys: [q]\n"
     )
-    views = load_views(write_views(tmp_path, views_yaml))
-    assert views[0].filter_granularity == "quarter"
+    assert len(load_views(write_views(tmp_path, views_yaml))) == 1
 
 
-def test_load_views_infers_year(tmp_path):
+def test_load_views_accepts_year(tmp_path):
     views_yaml = (
         "views:\n  - name: v\n    source_table: t\n    filter_column: ts\n"
         "    query: \"SELECT date_trunc('year', ts) AS y FROM t WHERE {range_filter} GROUP BY 1\"\n"
         "    merge_keys: [y]\n"
     )
-    views = load_views(write_views(tmp_path, views_yaml))
-    assert views[0].filter_granularity == "year"
+    assert len(load_views(write_views(tmp_path, views_yaml))) == 1
 
 
 def test_load_views_fails_when_cannot_infer(tmp_path):

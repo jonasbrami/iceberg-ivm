@@ -76,7 +76,6 @@ class ViewConfig:
     query: str
     merge_keys: tuple[str, ...]
     filter_column: str
-    filter_granularity: str = ""  # always set by infer_granularity()
     target_table: str | None = None
     target_partitioning: str | None = None
     refresh_interval_seconds: int = 60
@@ -122,7 +121,9 @@ def _parse_view(raw: dict) -> ViewConfig:
             f"view '{raw['name']}': query must contain {{range_filter}} placeholder"
         )
 
-    granularity = infer_granularity(raw["query"])
+    # Validate the query contains a simple date_trunc (raises on bad queries).
+    # The result is derived at refresh time — not stored on the view.
+    infer_granularity(raw["query"])
 
     return ViewConfig(
         name=raw["name"],
@@ -130,7 +131,6 @@ def _parse_view(raw: dict) -> ViewConfig:
         query=raw["query"],
         merge_keys=tuple(raw["merge_keys"]),
         filter_column=raw["filter_column"],
-        filter_granularity=granularity,
         target_table=raw.get("target_table"),
         target_partitioning=raw.get("target_partitioning"),
         refresh_interval_seconds=raw.get("refresh_interval_seconds", 60),

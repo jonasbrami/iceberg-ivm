@@ -25,7 +25,6 @@ CREATE TABLE {SOURCE_TABLE} (
 
 VIEW = ViewConfig(
     name="test_ohlcv", source_table=SOURCE_TABLE, filter_column="ts",
-    filter_granularity="minute",
     query=f"""
         SELECT symbol, date_trunc('minute', ts) AS minute,
                min_by(price, ts) AS open, max(price) AS high,

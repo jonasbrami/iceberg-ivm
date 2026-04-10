@@ -68,6 +68,25 @@ def test_metrics(client):
     assert "mv_views_configured" in client.get("/metrics").text
 
 
+def test_view_schema(client):
+    """Schema endpoint drives the dynamic UI — must expose all create-view fields."""
+    r = client.get("/api/views/schema")
+    assert r.status_code == 200
+    schema = r.json()
+    assert isinstance(schema, list)
+    names = {f["name"] for f in schema}
+    # All fields the user creates a view with
+    assert names == {
+        "name", "source_table", "query", "filter_column", "merge_keys",
+        "target_table", "target_partitioning", "refresh_interval_seconds",
+    }
+    # Every field has the metadata the form renderer needs
+    for f in schema:
+        assert "label" in f and "type" in f and "required" in f
+    # filter_granularity is NOT user-configurable — must not leak into the form
+    assert "filter_granularity" not in names
+
+
 # ── CRUD ──
 
 def test_list_views(client):
@@ -86,7 +105,7 @@ def test_create_view(client, setup_state):
         "merge_keys": ["x"],
     })
     assert r.status_code == 201
-    assert r.json()["filter_granularity"] == "day"
+    assert "filter_granularity" not in r.json()
     assert len(setup_state.config.views) == 2
 
 
@@ -189,9 +208,9 @@ def test_new_metrics_defined():
     assert SOURCE_SNAPSHOT is not None
 
 
-# ── Granularity inference via API ──
+# ── Query validation via API ──
 
-def test_create_view_infers_granularity(client, setup_state):
+def test_create_view_accepts_valid_query(client, setup_state):
     r = client.post("/api/views", json={
         "name": "auto_view",
         "source_table": "iceberg.db.t",
@@ -200,7 +219,6 @@ def test_create_view_infers_granularity(client, setup_state):
         "merge_keys": ["h"],
     })
     assert r.status_code == 201
-    assert r.json()["filter_granularity"] == "hour"
 
 
 def test_create_view_fails_when_cannot_infer(client, setup_state):

@@ -15,7 +15,6 @@ from prometheus_client import Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, field_validator
 
 from trino_mv_orchestrator.config import (
-    VALID_GRANULARITIES,
     Config,
     ViewConfig,
     _validate_identifier,
@@ -195,7 +194,7 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
         detect_start = time.monotonic()
         result = await detect_changes(
             cursor, view.source_table,
-            view.filter_column, view.filter_granularity,
+            view.filter_column, infer_granularity(view.query),
             last_snap,
         )
         detect_elapsed = time.monotonic() - detect_start
@@ -350,14 +349,42 @@ class ViewResponse(BaseModel):
     query: str
     merge_keys: tuple[str, ...]
     filter_column: str
-    filter_granularity: str
     target_table: str | None = None
     target_partitioning: str | None = None
     refresh_interval_seconds: int = 60
     status: dict | None = None
 
 
+# ── Form schema (drives the UI dynamically) ──
+
+VIEW_FORM_SCHEMA: list[dict] = [
+    {"name": "name", "label": "Name", "type": "string", "required": True,
+     "placeholder": "ohlcv_1m", "disabled_on_edit": True},
+    {"name": "source_table", "label": "Source Table", "type": "string", "required": True,
+     "placeholder": "iceberg.market_data.trades"},
+    {"name": "query", "label": "Query", "type": "text", "required": True,
+     "placeholder": "SELECT symbol, date_trunc('minute', ts) AS minute, ...\nFROM iceberg.market_data.trades\nWHERE {range_filter}\nGROUP BY 1, 2",
+     "help": "include {range_filter} placeholder", "rows": 8},
+    {"name": "filter_column", "label": "Filter Column", "type": "string", "required": True,
+     "placeholder": "ts"},
+    {"name": "merge_keys", "label": "Merge Keys", "type": "array", "required": True,
+     "placeholder": "symbol, minute", "help": "comma-separated"},
+    {"name": "target_table", "label": "Target Table", "type": "string", "required": False,
+     "placeholder": "auto-generated", "group": "target"},
+    {"name": "target_partitioning", "label": "Partitioning", "type": "string", "required": False,
+     "placeholder": "inherits from source", "group": "target"},
+    {"name": "refresh_interval_seconds", "label": "Refresh Interval", "type": "number",
+     "required": False, "default": 60, "min": 1, "suffix": "seconds"},
+]
+
+
 # ── Endpoints ──
+
+@app.get("/api/views/schema")
+def view_schema():
+    """Return form field metadata so the UI can render dynamically."""
+    return VIEW_FORM_SCHEMA
+
 
 @app.get("/health")
 def health(s: AppState = Depends(get_app_state)):
@@ -381,7 +408,6 @@ def list_views(s: AppState = Depends(get_app_state)) -> list[ViewResponse]:
         result.append(ViewResponse(
             name=v.name, source_table=v.source_table, query=v.query,
             merge_keys=v.merge_keys, filter_column=v.filter_column,
-            filter_granularity=v.filter_granularity,
             target_table=v.target_table, target_partitioning=v.target_partitioning,
             refresh_interval_seconds=v.refresh_interval_seconds,
             status={
@@ -403,15 +429,15 @@ def create_view(
     if any(v.name == body.name for v in s.config.views):
         raise HTTPException(409, f"view '{body.name}' already exists")
 
+    # Validate query contains a simple date_trunc (raises on bad queries)
     try:
-        resolved_granularity = infer_granularity(body.query)
+        infer_granularity(body.query)
     except ValueError as exc:
         raise HTTPException(422, str(exc))
 
     new_view = ViewConfig(
         name=body.name, source_table=body.source_table, query=body.query,
         merge_keys=body.merge_keys, filter_column=body.filter_column,
-        filter_granularity=resolved_granularity,
         target_table=body.target_table, target_partitioning=body.target_partitioning,
         refresh_interval_seconds=body.refresh_interval_seconds,
     )
@@ -427,7 +453,6 @@ def create_view(
     return ViewResponse(
         name=body.name, source_table=body.source_table, query=body.query,
         merge_keys=body.merge_keys, filter_column=body.filter_column,
-        filter_granularity=resolved_granularity,
         target_table=body.target_table, target_partitioning=body.target_partitioning,
         refresh_interval_seconds=body.refresh_interval_seconds,
     )
