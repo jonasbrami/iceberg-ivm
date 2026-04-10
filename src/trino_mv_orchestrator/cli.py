@@ -16,6 +16,11 @@ def main() -> None:
         help="path to config file (default: config.yaml)",
     )
     parser.add_argument(
+        "--views",
+        default="views.yaml",
+        help="path to views file (default: views.yaml)",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="enable debug logging",
@@ -32,10 +37,11 @@ def main() -> None:
     from pathlib import Path
 
     from trino_mv_orchestrator.config import load_config
-    from trino_mv_orchestrator.server import app, set_config_path
+    from trino_mv_orchestrator.server import app, set_config_path, set_views_path
 
     config_path = Path(args.config)
     set_config_path(config_path)
+    set_views_path(Path(args.views))
 
     # Pre-load config to get the port, then let lifespan do the real init
     cfg = load_config(config_path)

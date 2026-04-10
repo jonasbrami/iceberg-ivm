@@ -17,7 +17,7 @@ class MockCursor:
         self._rows = []
         self.executed = []
 
-    def execute(self, sql: str):
+    async def execute(self, sql: str):
         self.executed.append(sql)
         if self._idx < len(self._results):
             self._rows = list(self._results[self._idx])
@@ -25,17 +25,17 @@ class MockCursor:
             self._rows = []
         self._idx += 1
 
-    def fetchone(self):
+    async def fetchone(self):
         return self._rows[0] if self._rows else None
 
-    def fetchall(self):
+    async def fetchall(self):
         return self._rows
 
 
 # ── discover_source_partitioning ──
 
 class TestDiscoverSourcePartitioning:
-    def test_partitioned_table(self):
+    async def test_partitioned_table(self):
         create_sql = (
             "CREATE TABLE iceberg.market_data.trades (\n"
             "  ts timestamp(6) with time zone,\n"
@@ -47,39 +47,39 @@ class TestDiscoverSourcePartitioning:
             ")"
         )
         cursor = MockCursor([[(create_sql,)]])
-        result = discover_source_partitioning(cursor, "iceberg.market_data.trades")
+        result = await discover_source_partitioning(cursor, "iceberg.market_data.trades")
         assert result == "ARRAY['day(ts)']"
         assert "SHOW CREATE TABLE" in cursor.executed[0]
 
-    def test_multi_column_partitioning(self):
+    async def test_multi_column_partitioning(self):
         create_sql = (
             "CREATE TABLE t (\n  a int\n)\n"
             "WITH (\n  partitioning = ARRAY['day(ts)', 'bucket(16, id)']\n)"
         )
         cursor = MockCursor([[(create_sql,)]])
-        result = discover_source_partitioning(cursor, "t")
+        result = await discover_source_partitioning(cursor, "t")
         assert result == "ARRAY['day(ts)', 'bucket(16, id)']"
 
-    def test_not_partitioned(self):
+    async def test_not_partitioned(self):
         create_sql = (
             "CREATE TABLE t (\n  a int\n)\n"
             "WITH (\n  format = 'PARQUET'\n)"
         )
         cursor = MockCursor([[(create_sql,)]])
-        result = discover_source_partitioning(cursor, "t")
+        result = await discover_source_partitioning(cursor, "t")
         assert result is None
 
-    def test_whitespace_variations(self):
+    async def test_whitespace_variations(self):
         create_sql = "WITH (  partitioning  =  ARRAY['month(ts)']  )"
         cursor = MockCursor([[(create_sql,)]])
-        result = discover_source_partitioning(cursor, "t")
+        result = await discover_source_partitioning(cursor, "t")
         assert result == "ARRAY['month(ts)']"
 
 
 # ── discover_columns ──
 
 class TestDiscoverColumns:
-    def test_basic(self):
+    async def test_basic(self):
         # DESCRIBE OUTPUT returns: (name, catalog, schema, table, type, typeSize, aliased)
         cursor = MockCursor([
             [],  # PREPARE
@@ -90,7 +90,7 @@ class TestDiscoverColumns:
             ],
             [],  # DEALLOCATE
         ])
-        columns = discover_columns(cursor, "SELECT symbol, minute, open FROM t WHERE {range_filter}")
+        columns = await discover_columns(cursor, "SELECT symbol, minute, open FROM t WHERE {range_filter}")
         assert len(columns) == 3
         assert columns[0] == ColumnInfo(name="symbol", type="varchar")
         assert columns[1] == ColumnInfo(name="minute", type="timestamp(6)")
@@ -103,7 +103,7 @@ class TestDiscoverColumns:
 # ── discover_source_tables ──
 
 class TestDiscoverSourceTables:
-    def test_single_source(self):
+    async def test_single_source(self):
         explain_json = json.dumps({
             "inputTableColumnInfos": [
                 {
@@ -116,10 +116,10 @@ class TestDiscoverSourceTables:
             ]
         })
         cursor = MockCursor([[(explain_json,)]])
-        tables = discover_source_tables(cursor, "SELECT * FROM t WHERE {range_filter}")
+        tables = await discover_source_tables(cursor, "SELECT * FROM t WHERE {range_filter}")
         assert tables == ["iceberg.market_data.trades"]
 
-    def test_multiple_sources_deduped(self):
+    async def test_multiple_sources_deduped(self):
         explain_json = json.dumps({
             "inputTableColumnInfos": [
                 {"table": {"catalog": "c", "schemaTable": {"schema": "s", "table": "t1"}}, "columns": []},
@@ -128,7 +128,7 @@ class TestDiscoverSourceTables:
             ]
         })
         cursor = MockCursor([[(explain_json,)]])
-        tables = discover_source_tables(cursor, "SELECT * FROM t WHERE {range_filter}")
+        tables = await discover_source_tables(cursor, "SELECT * FROM t WHERE {range_filter}")
         assert tables == ["c.s.t1", "c.s.t2"]
 
 

@@ -39,36 +39,36 @@ def system_table(table: str, suffix: str) -> str:
     return f'{parts[0]}."{parts[1]}${suffix}"'
 
 
-def get_current_snapshot(cursor, source_table: str) -> int | None:
+async def get_current_snapshot(cursor, source_table: str) -> int | None:
     """Get latest snapshot_id from source table. Metadata-only."""
-    cursor.execute(
+    await cursor.execute(
         f"SELECT snapshot_id FROM {system_table(source_table, 'snapshots')} "
         f"ORDER BY committed_at DESC LIMIT 1"
     )
-    row = cursor.fetchone()
+    row = await cursor.fetchone()
     return row[0] if row else None
 
 
-def get_snapshots_since(cursor, source_table: str, last_snap: int) -> list[dict]:
+async def get_snapshots_since(cursor, source_table: str, last_snap: int) -> list[dict]:
     """Get snapshot_id and operation for all snapshots after last_snap.
 
     Snapshot IDs are random longs in Iceberg — not sequential. We find
     the committed_at of last_snap and return everything after it.
     """
     snaps_table = system_table(source_table, "snapshots")
-    cursor.execute(
+    await cursor.execute(
         f"SELECT snapshot_id, operation FROM {snaps_table} "
         f"WHERE committed_at > ("
         f"  SELECT committed_at FROM {snaps_table} WHERE snapshot_id = {last_snap}"
         f") ORDER BY committed_at"
     )
-    return [{"snapshot_id": row[0], "operation": row[1]} for row in cursor.fetchall()]
+    return [{"snapshot_id": row[0], "operation": row[1]} for row in await cursor.fetchall()]
 
 
 NON_APPEND_OPS = frozenset({"overwrite", "delete", "replace"})
 
 
-def get_new_files_column_range(
+async def get_new_files_column_range(
     cursor, source_table: str, snapshot_ids: list[int], filter_column: str,
 ) -> tuple[str, str] | None:
     """Read min/max of filter_column across files added in given snapshots.
@@ -77,7 +77,7 @@ def get_new_files_column_range(
     Returns (min_value_str, max_value_str) or None if no data files found.
     """
     snap_list = ", ".join(str(s) for s in snapshot_ids)
-    cursor.execute(
+    await cursor.execute(
         f"SELECT readable_metrics "
         f"FROM {system_table(source_table, 'all_entries')} "
         f"WHERE snapshot_id IN ({snap_list}) "
@@ -87,7 +87,7 @@ def get_new_files_column_range(
     overall_min = None
     overall_max = None
 
-    for (metrics_raw,) in cursor.fetchall():
+    for (metrics_raw,) in await cursor.fetchall():
         if metrics_raw is None:
             continue
         metrics = metrics_raw if isinstance(metrics_raw, dict) else json.loads(metrics_raw)
@@ -184,7 +184,7 @@ def snap_range(
     return start, end
 
 
-def detect_changes(
+async def detect_changes(
     cursor,
     source_table: str,
     filter_column: str,
@@ -197,7 +197,7 @@ def detect_changes(
     to compute the minimum range of data that needs recomputing, snapped
     to GROUP BY bucket boundaries.
     """
-    current_snap = get_current_snapshot(cursor, source_table)
+    current_snap = await get_current_snapshot(cursor, source_table)
     if current_snap is None:
         log.debug("%s: no snapshots found", source_table)
         return ChangeResult(action=RefreshAction.NO_CHANGE)
@@ -212,7 +212,7 @@ def detect_changes(
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=current_snap)
 
     # Get intermediate snapshots
-    snapshots = get_snapshots_since(cursor, source_table, last_snapshot)
+    snapshots = await get_snapshots_since(cursor, source_table, last_snapshot)
     if not snapshots:
         log.debug("%s: no new snapshots since %d", source_table, last_snapshot)
         return ChangeResult(action=RefreshAction.NO_CHANGE, current_snapshot=current_snap)
@@ -227,7 +227,7 @@ def detect_changes(
 
     # Read column range from new files
     snap_ids = [s["snapshot_id"] for s in snapshots]
-    col_range = get_new_files_column_range(cursor, source_table, snap_ids, filter_column)
+    col_range = await get_new_files_column_range(cursor, source_table, snap_ids, filter_column)
     if col_range is None:
         # New snapshots but no data files (e.g. compaction-only)
         log.debug("%s: new snapshots but no data files (compaction?)", source_table)

@@ -19,27 +19,27 @@ class MockCursor:
         self._rows = results or []
         self.executed = []
 
-    def execute(self, sql):
+    async def execute(self, sql):
         self.executed.append(sql)
 
-    def fetchone(self):
+    async def fetchone(self):
         return self._rows[0] if self._rows else None
 
 
 class TestReadLastSnapshot:
-    def test_returns_id(self):
+    async def test_returns_id(self):
         cursor = MockCursor(results=[("12345",)])
-        assert read_last_snapshot(cursor, "iceberg.analytics.ohlcv_1m") == 12345
+        assert await read_last_snapshot(cursor, "iceberg.analytics.ohlcv_1m") == 12345
         assert '"ohlcv_1m$properties"' in cursor.executed[0]
 
-    def test_returns_none(self):
-        assert read_last_snapshot(MockCursor(), "iceberg.analytics.ohlcv_1m") is None
+    async def test_returns_none(self):
+        assert await read_last_snapshot(MockCursor(), "iceberg.analytics.ohlcv_1m") is None
 
 
 class TestWriteLastSnapshot:
-    def test_writes_alter(self):
+    async def test_writes_alter(self):
         cursor = MockCursor()
-        write_last_snapshot(cursor, "iceberg.analytics.ohlcv_1m", 99999)
+        await write_last_snapshot(cursor, "iceberg.analytics.ohlcv_1m", 99999)
         sql = cursor.executed[0]
         assert "ALTER TABLE" in sql
         assert SNAPSHOT_KEY in sql

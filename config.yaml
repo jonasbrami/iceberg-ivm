@@ -1,32 +1,9 @@
 server:
   port: 8000
   config_reload_interval_seconds: 30
-
 trino:
-  host: localhost
-  port: 18080
+  host: trino
+  port: 8080
   catalog: iceberg
   schema: analytics
   user: demo
-
-views:
-  - name: ohlcv_1m
-    source_table: iceberg.market_data.trades
-    filter_column: ts
-    query: |
-      SELECT
-        symbol,
-        date_trunc('minute', ts) AS minute,
-        min_by(price, ts) AS open,
-        max(price) AS high,
-        min(price) AS low,
-        max_by(price, ts) AS close,
-        sum(quantity) AS volume,
-        count(*) AS trade_count
-      FROM iceberg.market_data.trades
-      WHERE {range_filter}
-      GROUP BY 1, 2
-    merge_keys: [symbol, minute]
-    target_table: iceberg.analytics.ohlcv_1m
-    target_partitioning: "ARRAY['day(minute)']"
-    refresh_interval_seconds: 30

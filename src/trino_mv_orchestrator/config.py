@@ -138,12 +138,13 @@ def _parse_view(raw: dict) -> ViewConfig:
 
 
 def load_config(path: str | Path) -> Config:
-    """Load and validate configuration from a YAML file."""
+    """Load static configuration (trino + server) from a YAML file.
+
+    Views are managed separately via load_views / save_views.
+    """
     raw = yaml.safe_load(Path(path).read_text())
     if "trino" not in raw:
         raise ValueError("config missing 'trino' section")
-    if "views" not in raw or not raw["views"]:
-        raise ValueError("config missing 'views' section or views list is empty")
 
     trino_raw = raw["trino"]
     for key in ("host", "port", "catalog", "schema", "user"):
@@ -158,42 +159,49 @@ def load_config(path: str | Path) -> Config:
         user=trino_raw["user"],
     )
 
-    views = [_parse_view(v) for v in raw["views"]]
-    names = [v.name for v in views]
-    if len(names) != len(set(names)):
-        raise ValueError("duplicate view names detected")
-
     server_raw = raw.get("server", {})
     server = ServerConfig(
         port=server_raw.get("port", 8000),
         config_reload_interval_seconds=server_raw.get("config_reload_interval_seconds", 30),
     )
 
-    cfg = Config(trino=trino, views=views, server=server)
+    cfg = Config(trino=trino, views=[], server=server)
     log.info(
-        "loaded %d view(s) from %s (trino=%s:%d/%s)",
-        len(views), path, trino.host, trino.port, trino.catalog,
+        "loaded static config from %s (trino=%s:%d/%s)",
+        path, trino.host, trino.port, trino.catalog,
     )
     return cfg
 
 
-def save_config(cfg: Config, path: str | Path) -> None:
-    """Save configuration to a YAML file."""
-    data = {
-        "server": {
-            "port": cfg.server.port,
-            "config_reload_interval_seconds": cfg.server.config_reload_interval_seconds,
-        },
-        "trino": {
-            "host": cfg.trino.host,
-            "port": cfg.trino.port,
-            "catalog": cfg.trino.catalog,
-            "schema": cfg.trino.schema,
-            "user": cfg.trino.user,
-        },
-        "views": [],
-    }
-    for v in cfg.views:
+def load_views(path: str | Path) -> list[ViewConfig]:
+    """Load views from a separate YAML file.
+
+    Returns an empty list if the file does not exist (e.g. fresh Docker volume).
+    """
+    p = Path(path)
+    if not p.exists():
+        log.info("views file not found: %s — starting with no views", p)
+        return []
+    raw = yaml.safe_load(p.read_text())
+    if not raw:
+        return []
+    views_raw = raw.get("views", raw) if isinstance(raw, dict) else raw
+    if not isinstance(views_raw, list):
+        raise ValueError(f"views file {path} must contain a list or a 'views' key")
+    views = [_parse_view(v) for v in views_raw]
+    names = [v.name for v in views]
+    if len(names) != len(set(names)):
+        raise ValueError("duplicate view names detected")
+    log.info("loaded %d view(s) from %s", len(views), p)
+    return views
+
+
+def save_views(views: list[ViewConfig], path: str | Path) -> None:
+    """Save views list to a YAML file."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    data: dict = {"views": []}
+    for v in views:
         vd: dict = {
             "name": v.name,
             "source_table": v.source_table,
@@ -207,6 +215,5 @@ def save_config(cfg: Config, path: str | Path) -> None:
         if v.target_partitioning:
             vd["target_partitioning"] = v.target_partitioning
         data["views"].append(vd)
-
-    Path(path).write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
-    log.info("saved config with %d view(s) to %s", len(cfg.views), path)
+    p.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
+    log.info("saved %d view(s) to %s", len(views), p)

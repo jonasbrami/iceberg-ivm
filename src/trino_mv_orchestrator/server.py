@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import trino
+import aiotrino
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
@@ -22,7 +22,8 @@ from trino_mv_orchestrator.config import (
     _validate_qualified_name,
     infer_granularity,
     load_config,
-    save_config,
+    load_views,
+    save_views,
 )
 from trino_mv_orchestrator.detector import RefreshAction, detect_changes
 from trino_mv_orchestrator.executor import execute_full_refresh, execute_incremental_refresh
@@ -94,20 +95,28 @@ class ViewStatus:
 @dataclass
 class AppState:
     config_path: Path = field(default_factory=lambda: Path("config.yaml"))
+    views_path: Path = field(default_factory=lambda: Path("views.yaml"))
     config: Config | None = None
     config_mtime: float = 0
+    views_mtime: float = 0
     view_statuses: dict[str, ViewStatus] = field(default_factory=dict)
     _stop: bool = False
 
 
-# ── Config path bootstrap (set by CLI before uvicorn starts) ──
+# ── Path bootstrap (set by CLI before uvicorn starts) ──
 
 _config_path: Path = Path("config.yaml")
+_views_path: Path = Path("views.yaml")
 
 
 def set_config_path(path: Path) -> None:
     global _config_path
     _config_path = path
+
+
+def set_views_path(path: Path) -> None:
+    global _views_path
+    _views_path = path
 
 
 # ── Dependency injection ──
@@ -118,10 +127,10 @@ def get_app_state(request: Request) -> AppState:
 
 # ── Core logic ──
 
-def get_trino_connection(s: AppState) -> trino.dbapi.Connection:
+def get_trino_connection(s: AppState) -> aiotrino.dbapi.Connection:
     cfg = s.config
     log.debug("connecting to Trino at %s:%s", cfg.trino.host, cfg.trino.port)
-    return trino.dbapi.connect(
+    return aiotrino.dbapi.connect(
         host=cfg.trino.host, port=cfg.trino.port,
         catalog=cfg.trino.catalog, schema=cfg.trino.schema,
         user=cfg.trino.user,
@@ -134,31 +143,37 @@ def resolve_target_table(view: ViewConfig, cfg: Config) -> str:
 
 def reload_config(s: AppState) -> bool:
     try:
-        mtime = s.config_path.stat().st_mtime
+        config_mtime = s.config_path.stat().st_mtime
     except FileNotFoundError:
         log.warning("config file not found: %s", s.config_path)
         return False
-    if mtime <= s.config_mtime:
+    views_mtime = s.views_path.stat().st_mtime if s.views_path.exists() else 0
+    if config_mtime <= s.config_mtime and views_mtime <= s.views_mtime:
         return False
     try:
         new_cfg = load_config(s.config_path)
-        s.config = new_cfg
-        s.config_mtime = mtime
-        VIEWS_CONFIGURED.set(len(new_cfg.views))
+        new_views = load_views(s.views_path)
+        s.config = Config(trino=new_cfg.trino, views=new_views, server=new_cfg.server)
+        s.config_mtime = config_mtime
+        s.views_mtime = views_mtime
+        VIEWS_CONFIGURED.set(len(new_views))
         CONFIG_RELOADS.inc()
-        log.info("config reloaded from %s: %d views", s.config_path, len(new_cfg.views))
-        for v in new_cfg.views:
+        log.info(
+            "config reloaded from %s + %s: %d views",
+            s.config_path, s.views_path, len(new_views),
+        )
+        for v in new_views:
             if v.name not in s.view_statuses:
                 s.view_statuses[v.name] = ViewStatus(name=v.name)
         return True
     except Exception:
-        log.exception("failed to reload config from %s", s.config_path)
+        log.exception("failed to reload config")
         return False
 
 
-def refresh_view(s: AppState, view: ViewConfig) -> None:
+async def refresh_view(s: AppState, view: ViewConfig) -> None:
     conn = get_trino_connection(s)
-    cursor = conn.cursor()
+    cursor = await conn.cursor()
     vs = s.view_statuses.setdefault(view.name, ViewStatus(name=view.name))
 
     try:
@@ -166,19 +181,19 @@ def refresh_view(s: AppState, view: ViewConfig) -> None:
         source_labels = _parse_table_labels(view.source_table)
 
         # Auto-discover columns and create target
-        columns = discover_columns(cursor, view.query)
-        target_partitioning = view.target_partitioning or discover_source_partitioning(cursor, view.source_table)
+        columns = await discover_columns(cursor, view.query)
+        target_partitioning = view.target_partitioning or await discover_source_partitioning(cursor, view.source_table)
         create_sql = build_create_table_sql(target_table, columns, target_partitioning)
-        cursor.execute(create_sql)
+        await cursor.execute(create_sql)
 
         value_columns = [c.name for c in columns if c.name not in view.merge_keys]
 
         # Read state
-        last_snap = read_last_snapshot(cursor, target_table)
+        last_snap = await read_last_snapshot(cursor, target_table)
 
         # Detect changes via file-level column stats
         detect_start = time.monotonic()
-        result = detect_changes(
+        result = await detect_changes(
             cursor, view.source_table,
             view.filter_column, view.filter_granularity,
             last_snap,
@@ -199,19 +214,19 @@ def refresh_view(s: AppState, view: ViewConfig) -> None:
             return
 
         if result.action == RefreshAction.FULL_REFRESH:
-            refresh_result = execute_full_refresh(cursor, view, target_table)
+            refresh_result = await execute_full_refresh(cursor, view, target_table)
             vs.last_action = "full"
             vs.last_range = None
             REFRESH_TOTAL.labels(view=view.name, type="full").inc()
         else:
-            refresh_result = execute_incremental_refresh(
+            refresh_result = await execute_incremental_refresh(
                 cursor, view, target_table, value_columns, result.filter_range,
             )
             vs.last_action = "incremental"
             vs.last_range = f"[{result.filter_range[0]}, {result.filter_range[1]})"
             REFRESH_TOTAL.labels(view=view.name, type="incremental").inc()
 
-        write_last_snapshot(cursor, target_table, result.current_snapshot)
+        await write_last_snapshot(cursor, target_table, result.current_snapshot)
 
         vs.last_refresh = time.time()
         vs.last_duration = refresh_result.elapsed
@@ -231,7 +246,7 @@ def refresh_view(s: AppState, view: ViewConfig) -> None:
         REFRESH_ERRORS.labels(view=view.name).inc()
         log.exception("%s: refresh failed", view.name)
     finally:
-        conn.close()
+        await conn.close()
 
 
 async def refresh_loop(s: AppState) -> None:
@@ -253,9 +268,7 @@ async def refresh_loop(s: AppState) -> None:
                 last = last_refresh_times.get(view.name, 0)
                 if now - last >= view.refresh_interval_seconds:
                     log.debug("%s: scheduling refresh (%.0fs since last)", view.name, now - last)
-                    await asyncio.get_event_loop().run_in_executor(
-                        None, refresh_view, s, view,
-                    )
+                    await refresh_view(s, view)
                     last_refresh_times[view.name] = time.time()
 
         await asyncio.sleep(1)
@@ -270,7 +283,7 @@ async def lifespan(app: FastAPI):
         s = app.state.s
         log.info("using pre-seeded app state")
     else:
-        s = AppState(config_path=_config_path)
+        s = AppState(config_path=_config_path, views_path=_views_path)
         reload_config(s)
         app.state.s = s
 
@@ -404,9 +417,9 @@ def create_view(
     )
     new_views = list(s.config.views) + [new_view]
     new_cfg = Config(trino=s.config.trino, views=new_views, server=s.config.server)
-    save_config(new_cfg, s.config_path)
+    save_views(new_views, s.views_path)
     s.config = new_cfg
-    s.config_mtime = s.config_path.stat().st_mtime
+    s.views_mtime = s.views_path.stat().st_mtime
     s.view_statuses[body.name] = ViewStatus(name=body.name)
     VIEWS_CONFIGURED.set(len(new_views))
     log.info("created view %r via API", body.name)
@@ -428,9 +441,9 @@ def delete_view(name: str, s: AppState = Depends(get_app_state)):
         raise HTTPException(404, f"view '{name}' not found")
     new_views = [v for v in s.config.views if v.name != name]
     new_cfg = Config(trino=s.config.trino, views=new_views, server=s.config.server)
-    save_config(new_cfg, s.config_path)
+    save_views(new_views, s.views_path)
     s.config = new_cfg
-    s.config_mtime = s.config_path.stat().st_mtime
+    s.views_mtime = s.views_path.stat().st_mtime
     s.view_statuses.pop(name, None)
     VIEWS_CONFIGURED.set(len(new_views))
     log.info("deleted view %r via API", name)
@@ -444,7 +457,7 @@ async def trigger_refresh(name: str, s: AppState = Depends(get_app_state)):
     if not view:
         raise HTTPException(404, f"view '{name}' not found")
     log.info("manual refresh triggered for %r", name)
-    await asyncio.get_event_loop().run_in_executor(None, refresh_view, s, view)
+    await refresh_view(s, view)
     vs = s.view_statuses.get(name)
     return {
         "status": "ok",

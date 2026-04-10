@@ -3,209 +3,567 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Trino MV Orchestrator</title>
+  <title>MV Orchestrator</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&family=Instrument+Mono:wght@300;400;500&display=swap" rel="stylesheet">
   <script src="https://cdn.tailwindcss.com"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['"Instrument Sans"', 'system-ui', 'sans-serif'],
+            mono: ['"Instrument Mono"', 'monospace'],
+          },
+        }
+      }
+    }
+  </script>
+
   <style>
     [x-cloak] { display: none !important; }
-    .fade-in { animation: fadeIn 0.2s ease-in; }
-    @keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+
+    *, *::before, *::after {
+      font-family: 'Instrument Sans', system-ui, sans-serif;
+    }
+    code, pre, .font-mono, input[class*="font-mono"], textarea[class*="font-mono"] {
+      font-family: 'Instrument Mono', monospace;
+    }
+
+    /* ── Animations ────────────────────────────────────────────── */
+    @keyframes dot-pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50%       { opacity: 0.45; transform: scale(0.85); }
+    }
+    .dot-pulse { animation: dot-pulse 2s ease-in-out infinite; }
+
+    @keyframes card-in {
+      from { opacity: 0; transform: translateY(7px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .card-enter { animation: card-in 0.28s cubic-bezier(0.16, 1, 0.3, 1) both; }
+
+    @keyframes modal-rise {
+      from { opacity: 0; transform: translateY(14px) scale(0.975); }
+      to   { opacity: 1; transform: translateY(0)   scale(1); }
+    }
+    .modal-enter { animation: modal-rise 0.26s cubic-bezier(0.16, 1, 0.3, 1) both; }
+
+    @keyframes spin-smooth { to { transform: rotate(360deg); } }
+    .spin { animation: spin-smooth 0.75s linear infinite; }
+
+    /* ── Accent line at page top ────────────────────────────────── */
+    body::before {
+      content: '';
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      height: 1px;
+      background: linear-gradient(
+        90deg,
+        transparent 0%,
+        rgba(99,102,241,0.0) 10%,
+        rgba(99,102,241,0.55) 40%,
+        rgba(139,92,246,0.4) 60%,
+        rgba(99,102,241,0.0) 90%,
+        transparent 100%
+      );
+      pointer-events: none;
+      z-index: 9999;
+    }
+
+    /* ── Scrollbar ─────────────────────────────────────────────── */
+    ::-webkit-scrollbar       { width: 4px; height: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.06); border-radius: 2px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.11); }
+
+    /* ── Details/summary reset ─────────────────────────────────── */
+    details > summary             { list-style: none; }
+    details > summary::-webkit-details-marker { display: none; }
+
+    /* ── Autofill override ─────────────────────────────────────── */
+    input:-webkit-autofill,
+    input:-webkit-autofill:focus {
+      -webkit-box-shadow: 0 0 0 100px #07070c inset;
+      -webkit-text-fill-color: #d4d4e8;
+    }
+
+    /* ── Card left accent bar ─────────────────────────────────── */
+    .card-accent::before {
+      content: '';
+      position: absolute;
+      left: 0;
+      top: 12px;
+      bottom: 12px;
+      width: 2px;
+      border-radius: 0 2px 2px 0;
+      background: rgba(99,102,241,0);
+      transition: background 0.25s ease;
+    }
+    .card-accent:hover::before {
+      background: rgba(99,102,241,0.28);
+    }
   </style>
 </head>
-<body class="bg-gray-950 text-gray-100 min-h-screen">
-<div x-data="app()" x-init="init()" class="max-w-5xl mx-auto px-6 py-10">
 
-  <!-- Header -->
-  <div class="flex items-center justify-between mb-10">
-    <div>
-      <h1 class="text-2xl font-semibold tracking-tight">Materialized Views</h1>
-      <p class="text-sm text-gray-500 mt-1">Trino / Iceberg incremental refresh orchestrator</p>
+<body x-data="app()" x-init="init()" class="bg-[#07070c] text-[#d8d8ec] min-h-screen antialiased font-sans">
+
+<div class="max-w-[880px] mx-auto px-6 py-12">
+
+  <!-- ── Header ──────────────────────────────────────────────── -->
+  <header class="flex items-center justify-between mb-10">
+    <div class="flex items-center gap-3.5">
+      <div class="relative w-8 h-8 shrink-0">
+        <div class="absolute inset-0 rounded-[10px] bg-indigo-500/10 border border-indigo-500/20"></div>
+        <svg class="absolute inset-0 m-auto w-4 h-4 text-indigo-400"
+             fill="none" viewBox="0 0 24 24" stroke-width="1.75" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round"
+                d="M20.25 6.375c0 2.278-3.694 4.125-8.25 4.125S3.75 8.653 3.75 6.375
+                   m16.5 0c0-2.278-3.694-4.125-8.25-4.125S3.75 4.097 3.75 6.375
+                   m16.5 0v11.25c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125V6.375
+                   m16.5 5.625c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125" />
+        </svg>
+      </div>
+      <div>
+        <h1 class="text-[15px] font-semibold text-[#eeeef8] tracking-[-0.015em] leading-none">
+          Materialized Views
+        </h1>
+        <p class="text-[11px] text-[#3a3a54] mt-[5px] leading-none tracking-[0.04em] uppercase font-mono">
+          Trino · Iceberg · Incremental
+        </p>
+      </div>
     </div>
+
     <button @click="showForm = true; editingView = null; resetForm()"
-            class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-sm font-medium rounded-lg transition">
-      + New View
+            class="flex items-center gap-2 px-4 py-[9px] rounded-[10px] text-[13px] font-semibold
+                   bg-indigo-600 hover:bg-indigo-500 text-white
+                   shadow-[0_0_0_1px_rgba(99,102,241,0.5),0_4px_16px_rgba(99,102,241,0.22)]
+                   hover:shadow-[0_0_0_1px_rgba(99,102,241,0.7),0_4px_20px_rgba(99,102,241,0.35)]
+                   transition-all duration-150 active:scale-[0.97]">
+      <svg class="w-[13px] h-[13px]" fill="none" viewBox="0 0 24 24" stroke-width="2.8" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+      </svg>
+      New View
     </button>
+  </header>
+
+  <!-- ── Meta row ────────────────────────────────────────────── -->
+  <div x-show="views.length > 0"
+       class="flex items-center gap-2 mb-4 pl-0.5">
+    <span class="text-[11px] font-mono text-[#30304a] tabular-nums"
+          x-text="views.length + (views.length === 1 ? ' view' : ' views')"></span>
+    <span class="text-[11px] text-[#1e1e2e]">·</span>
+    <span class="text-[11px] font-mono text-[#28283e]">polling every 5s</span>
   </div>
 
-  <!-- Views list -->
-  <div class="space-y-3">
-    <template x-for="view in views" :key="view.name">
-      <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 fade-in">
-        <div class="flex items-start justify-between">
-          <div class="flex-1 min-w-0">
-            <div class="flex items-center gap-3">
-              <h2 class="text-lg font-medium" x-text="view.name"></h2>
-              <span x-show="view.status?.last_action === 'skip'"
-                    class="text-xs px-2 py-0.5 rounded-full bg-gray-800 text-gray-400">idle</span>
-              <span x-show="view.status?.last_action === 'incremental'"
-                    class="text-xs px-2 py-0.5 rounded-full bg-emerald-900 text-emerald-300">incremental</span>
-              <span x-show="view.status?.last_action === 'full'"
-                    class="text-xs px-2 py-0.5 rounded-full bg-amber-900 text-amber-300">full</span>
-              <span x-show="view.status?.last_action === 'pending'"
-                    class="text-xs px-2 py-0.5 rounded-full bg-gray-800 text-gray-500">pending</span>
-              <span x-show="view.status?.last_error"
-                    class="text-xs px-2 py-0.5 rounded-full bg-red-900 text-red-300">error</span>
+  <!-- ── Views list ───────────────────────────────────────────── -->
+  <div class="space-y-2">
+    <template x-for="(view, idx) in views" :key="view.name">
+      <div class="card-accent relative bg-[#0c0c13] border border-[rgba(255,255,255,0.057)]
+                  rounded-xl card-enter overflow-hidden
+                  hover:border-[rgba(255,255,255,0.092)]
+                  transition-[border-color,box-shadow] duration-200
+                  hover:shadow-[0_8px_28px_rgba(0,0,0,0.5)]"
+           :style="`animation-delay:${idx * 45}ms`">
+
+        <div class="px-5 py-[18px]">
+
+          <!-- Row 1: name + badges + actions -->
+          <div class="flex items-start justify-between gap-4">
+            <div class="flex-1 min-w-0">
+
+              <!-- Name + status badges -->
+              <div class="flex items-center gap-2.5 flex-wrap">
+                <h2 class="text-[14px] font-semibold font-mono text-[#e8e8f6] tracking-[-0.01em]"
+                    x-text="view.name"></h2>
+
+                <!-- pending (no status yet or explicitly pending) -->
+                <span x-show="!view.status || view.status.last_action === 'pending'"
+                      class="inline-flex items-center gap-[5px] text-[10px] tracking-[0.06em]
+                             uppercase font-mono px-[7px] py-[2px] rounded-full
+                             bg-[#16162a] text-[#38385a] border border-[rgba(255,255,255,0.04)]">
+                  <span class="w-[5px] h-[5px] rounded-full bg-[#2e2e48] shrink-0"></span>
+                  pending
+                </span>
+
+                <!-- idle / skip -->
+                <span x-show="view.status?.last_action === 'skip'"
+                      class="inline-flex items-center gap-[5px] text-[10px] tracking-[0.06em]
+                             uppercase font-mono px-[7px] py-[2px] rounded-full
+                             bg-[#16162a] text-[#48486a] border border-[rgba(255,255,255,0.04)]">
+                  <span class="w-[5px] h-[5px] rounded-full bg-[#3a3a58] shrink-0"></span>
+                  idle
+                </span>
+
+                <!-- incremental -->
+                <span x-show="view.status?.last_action === 'incremental'"
+                      class="inline-flex items-center gap-[5px] text-[10px] tracking-[0.06em]
+                             uppercase font-mono px-[7px] py-[2px] rounded-full
+                             bg-emerald-500/[0.08] text-emerald-400 border border-emerald-500/[0.2]">
+                  <span class="w-[5px] h-[5px] rounded-full bg-emerald-400 shrink-0 dot-pulse"></span>
+                  incremental
+                </span>
+
+                <!-- full -->
+                <span x-show="view.status?.last_action === 'full'"
+                      class="inline-flex items-center gap-[5px] text-[10px] tracking-[0.06em]
+                             uppercase font-mono px-[7px] py-[2px] rounded-full
+                             bg-amber-500/[0.08] text-amber-400 border border-amber-500/[0.2]">
+                  <span class="w-[5px] h-[5px] rounded-full bg-amber-400 shrink-0 dot-pulse"></span>
+                  full
+                </span>
+
+                <!-- error -->
+                <span x-show="view.status?.last_error"
+                      class="inline-flex items-center gap-[5px] text-[10px] tracking-[0.06em]
+                             uppercase font-mono px-[7px] py-[2px] rounded-full
+                             bg-red-500/[0.08] text-red-400 border border-red-500/[0.2]">
+                  <span class="w-[5px] h-[5px] rounded-full bg-red-400 shrink-0"></span>
+                  error
+                </span>
+              </div>
+
+              <!-- Source → Target -->
+              <div class="flex items-center gap-[6px] mt-[7px]">
+                <span class="text-[11px] font-mono text-[#35354e]" x-text="view.source_table"></span>
+                <svg class="w-3 h-3 text-[#252538] shrink-0" fill="none" viewBox="0 0 24 24"
+                     stroke-width="2" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round"
+                        d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3" />
+                </svg>
+                <span class="text-[11px] font-mono text-[#35354e]"
+                      x-text="view.target_table || 'auto'"></span>
+              </div>
             </div>
-            <p class="text-sm text-gray-500 mt-1">
-              <span x-text="view.source_table"></span>
-              <span class="text-gray-700 mx-1">&rarr;</span>
-              <span x-text="view.target_table || '(auto)'"></span>
-            </p>
-          </div>
-          <div class="flex items-center gap-2 ml-4 shrink-0">
-            <button @click="triggerRefresh(view.name)"
-                    class="text-xs px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg transition"
-                    :class="{'opacity-50 pointer-events-none': refreshing[view.name]}">
-              <span x-show="!refreshing[view.name]">Refresh</span>
-              <span x-show="refreshing[view.name]">...</span>
-            </button>
-            <button @click="editView(view)"
-                    class="text-xs px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg transition">
-              Edit
-            </button>
-            <button @click="deleteView(view.name)"
-                    class="text-xs px-3 py-1.5 bg-gray-800 hover:bg-red-900 rounded-lg transition">
-              Delete
-            </button>
-          </div>
-        </div>
 
-        <!-- Stats row -->
-        <div x-show="view.status" class="flex gap-6 mt-3 text-xs text-gray-500">
-          <div>
-            <span class="text-gray-600">Refreshes:</span>
-            <span x-text="view.status?.total_refreshes || 0"></span>
-          </div>
-          <div>
-            <span class="text-gray-600">Duration:</span>
-            <span x-text="view.status?.last_duration ? view.status.last_duration.toFixed(1) + 's' : '-'"></span>
-          </div>
-          <div x-show="view.status?.last_range">
-            <span class="text-gray-600">Range:</span>
-            <span x-text="view.status?.last_range || '-'"></span>
-          </div>
-          <div>
-            <span class="text-gray-600">Interval:</span>
-            <span x-text="view.refresh_interval_seconds + 's'"></span>
-          </div>
-          <div x-show="view.status?.last_refresh">
-            <span class="text-gray-600">Last:</span>
-            <span x-text="view.status?.last_refresh ? timeAgo(view.status.last_refresh) : '-'"></span>
-          </div>
-          <div>
-            <span class="text-gray-600">Errors:</span>
-            <span x-text="view.status?.total_errors || 0"
-                  :class="{'text-red-400': view.status?.total_errors > 0}"></span>
-          </div>
-        </div>
+            <!-- Action buttons -->
+            <div class="flex items-center gap-1 shrink-0">
+              <button @click="triggerRefresh(view.name)"
+                      :disabled="refreshing[view.name]"
+                      class="flex items-center gap-[5px] text-[11px] font-medium
+                             px-[10px] py-[6px] rounded-lg
+                             bg-[rgba(255,255,255,0.03)] hover:bg-[rgba(255,255,255,0.07)]
+                             text-[#48486a] hover:text-[#9898b8]
+                             border border-[rgba(255,255,255,0.055)] hover:border-[rgba(255,255,255,0.10)]
+                             transition-all duration-150
+                             disabled:opacity-35 disabled:cursor-not-allowed active:scale-95">
+                <template x-if="!refreshing[view.name]">
+                  <span>Refresh</span>
+                </template>
+                <template x-if="refreshing[view.name]">
+                  <span class="flex items-center gap-[5px]">
+                    <svg class="w-3 h-3 spin" viewBox="0 0 24 24" fill="none">
+                      <circle cx="12" cy="12" r="9"
+                              stroke="currentColor" stroke-width="2.5"
+                              stroke-dasharray="56.55" stroke-dashoffset="42"
+                              stroke-linecap="round"/>
+                    </svg>
+                    Running
+                  </span>
+                </template>
+              </button>
 
-        <!-- Error message -->
-        <div x-show="view.status?.last_error"
-             class="mt-3 text-xs text-red-400 bg-red-950 border border-red-900 rounded-lg p-3 font-mono break-all">
-          <span x-text="view.status?.last_error"></span>
-        </div>
+              <button @click="editView(view)"
+                      class="text-[11px] font-medium px-[10px] py-[6px] rounded-lg
+                             bg-[rgba(255,255,255,0.03)] hover:bg-[rgba(255,255,255,0.07)]
+                             text-[#48486a] hover:text-[#9898b8]
+                             border border-[rgba(255,255,255,0.055)] hover:border-[rgba(255,255,255,0.10)]
+                             transition-all duration-150 active:scale-95">
+                Edit
+              </button>
 
-        <!-- Query preview -->
-        <details class="mt-3">
-          <summary class="text-xs text-gray-600 cursor-pointer hover:text-gray-400 transition">query</summary>
-          <pre class="mt-2 text-xs text-gray-400 bg-gray-950 border border-gray-800 rounded-lg p-3 overflow-x-auto"><code x-text="view.query"></code></pre>
-        </details>
+              <button @click="deleteView(view.name)"
+                      class="text-[11px] font-medium px-[10px] py-[6px] rounded-lg
+                             bg-[rgba(255,255,255,0.03)] hover:bg-red-500/10
+                             text-[#48486a] hover:text-red-400
+                             border border-[rgba(255,255,255,0.055)] hover:border-red-500/25
+                             transition-all duration-150 active:scale-95">
+                Delete
+              </button>
+            </div>
+          </div>
+
+          <!-- Stats row -->
+          <div x-show="view.status"
+               class="flex flex-wrap gap-x-[18px] gap-y-[6px] mt-4 pt-[14px]
+                      border-t border-[rgba(255,255,255,0.04)]">
+
+            <div class="flex items-baseline gap-[6px]">
+              <span class="text-[9.5px] font-mono text-[#2c2c44] uppercase tracking-[0.08em]">Refreshes</span>
+              <span class="text-[12px] font-mono tabular-nums text-[#606080]"
+                    x-text="view.status?.total_refreshes ?? 0"></span>
+            </div>
+
+            <div class="flex items-baseline gap-[6px]">
+              <span class="text-[9.5px] font-mono text-[#2c2c44] uppercase tracking-[0.08em]">Duration</span>
+              <span class="text-[12px] font-mono tabular-nums text-[#606080]"
+                    x-text="view.status?.last_duration != null ? view.status.last_duration.toFixed(2) + 's' : '—'"></span>
+            </div>
+
+            <div x-show="view.status?.last_range" class="flex items-baseline gap-[6px]">
+              <span class="text-[9.5px] font-mono text-[#2c2c44] uppercase tracking-[0.08em]">Range</span>
+              <span class="text-[10.5px] font-mono tabular-nums text-[#4a4a68]"
+                    x-text="view.status?.last_range"></span>
+            </div>
+
+            <div class="flex items-baseline gap-[6px]">
+              <span class="text-[9.5px] font-mono text-[#2c2c44] uppercase tracking-[0.08em]">Interval</span>
+              <span class="text-[12px] font-mono tabular-nums text-[#606080]"
+                    x-text="view.refresh_interval_seconds + 's'"></span>
+            </div>
+
+            <div x-show="view.status?.last_refresh" class="flex items-baseline gap-[6px]">
+              <span class="text-[9.5px] font-mono text-[#2c2c44] uppercase tracking-[0.08em]">Last</span>
+              <span class="text-[12px] font-mono tabular-nums text-[#606080]"
+                    x-text="view.status?.last_refresh ? timeAgo(view.status.last_refresh) : '—'"></span>
+            </div>
+
+            <div x-show="view.status?.total_errors > 0" class="flex items-baseline gap-[6px]">
+              <span class="text-[9.5px] font-mono text-[#2c2c44] uppercase tracking-[0.08em]">Errors</span>
+              <span class="text-[12px] font-mono tabular-nums font-semibold text-red-400"
+                    x-text="view.status?.total_errors"></span>
+            </div>
+          </div>
+
+          <!-- Error detail -->
+          <div x-show="view.status?.last_error"
+               class="mt-3 text-[11px] font-mono leading-relaxed text-red-400/75
+                      bg-red-500/[0.055] border border-red-500/[0.13] rounded-lg p-3 break-all">
+            <span x-text="view.status?.last_error"></span>
+          </div>
+
+          <!-- Query (collapsible) -->
+          <details class="group mt-3">
+            <summary class="flex items-center gap-[5px] w-fit cursor-pointer select-none
+                            text-[11px] font-mono text-[#2e2e48] hover:text-[#4a4a68]
+                            transition-colors duration-150">
+              <svg class="w-[11px] h-[11px] transition-transform duration-150 group-open:rotate-90 shrink-0"
+                   fill="none" viewBox="0 0 24 24" stroke-width="2.8" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" />
+              </svg>
+              query
+            </summary>
+            <pre class="mt-[9px] text-[11px] font-mono leading-[1.7] text-[#4a4a68]
+                        bg-[#07070c] border border-[rgba(255,255,255,0.04)]
+                        rounded-lg px-4 py-3.5 overflow-x-auto"><code x-text="view.query"></code></pre>
+          </details>
+
+        </div>
       </div>
     </template>
 
-    <div x-show="views.length === 0" class="text-center py-20 text-gray-600">
-      No views configured. Click <strong>+ New View</strong> to get started.
-    </div>
-  </div>
-
-  <!-- Modal: Create / Edit view -->
-  <div x-show="showForm" x-cloak
-       class="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4"
-       @keydown.escape.window="showForm = false">
-    <div @click.outside="showForm = false"
-         class="bg-gray-900 border border-gray-800 rounded-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto p-6 fade-in">
-      <h2 class="text-lg font-semibold mb-6" x-text="editingView ? 'Edit View' : 'New View'"></h2>
-
-      <div class="space-y-4">
-        <div>
-          <label class="block text-xs text-gray-500 mb-1.5">Name</label>
-          <input x-model="form.name" type="text" placeholder="ohlcv_1m"
-                 :disabled="editingView !== null"
-                 class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm
-                        focus:outline-none focus:border-blue-600 disabled:opacity-50">
-        </div>
-
-        <div>
-          <label class="block text-xs text-gray-500 mb-1.5">Source Table</label>
-          <input x-model="form.source_table" type="text" placeholder="iceberg.market_data.trades"
-                 class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm
-                        focus:outline-none focus:border-blue-600">
-        </div>
-
-        <div>
-          <label class="block text-xs text-gray-500 mb-1.5">Query (use {range_filter} placeholder)</label>
-          <textarea x-model="form.query" rows="10" placeholder="SELECT symbol, date_trunc('minute', ts) AS minute, ...
-FROM iceberg.market_data.trades
-WHERE {range_filter}
-GROUP BY 1, 2"
-                    class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm font-mono
-                           focus:outline-none focus:border-blue-600 resize-y"></textarea>
-        </div>
-
-        <div>
-          <label class="block text-xs text-gray-500 mb-1.5">Filter Column</label>
-          <input x-model="form.filter_column" type="text" placeholder="ts"
-                 class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm
-                        focus:outline-none focus:border-blue-600">
-        </div>
-
-        <div>
-          <label class="block text-xs text-gray-500 mb-1.5">Merge Keys (comma-separated)</label>
-          <input x-model="form.merge_keys_str" type="text" placeholder="symbol, minute"
-                 class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm
-                        focus:outline-none focus:border-blue-600">
-        </div>
-
-        <div class="grid grid-cols-2 gap-4">
-          <div>
-            <label class="block text-xs text-gray-500 mb-1.5">Target Table <span class="text-gray-700">(optional)</span></label>
-            <input x-model="form.target_table" type="text" placeholder="auto-generated"
-                   class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm
-                          focus:outline-none focus:border-blue-600">
-          </div>
-          <div>
-            <label class="block text-xs text-gray-500 mb-1.5">Target Partitioning <span class="text-gray-700">(optional)</span></label>
-            <input x-model="form.target_partitioning" type="text" placeholder="inherits from source"
-                   class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm
-                          focus:outline-none focus:border-blue-600">
-          </div>
-        </div>
-
-        <div>
-          <label class="block text-xs text-gray-500 mb-1.5">Refresh Interval (seconds)</label>
-          <input x-model.number="form.refresh_interval_seconds" type="number" min="1"
-                 class="w-32 bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm
-                        focus:outline-none focus:border-blue-600">
-        </div>
+    <!-- Empty state -->
+    <div x-show="views.length === 0"
+         class="flex flex-col items-center justify-center py-[120px] select-none">
+      <div class="w-14 h-14 rounded-2xl bg-[#0c0c14] border border-[rgba(255,255,255,0.05)]
+                  flex items-center justify-center mb-5">
+        <svg class="w-6 h-6 text-[#232338]" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round"
+                d="M20.25 6.375c0 2.278-3.694 4.125-8.25 4.125S3.75 8.653 3.75 6.375
+                   m16.5 0c0-2.278-3.694-4.125-8.25-4.125S3.75 4.097 3.75 6.375
+                   m16.5 0v11.25c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125V6.375
+                   m16.5 5.625c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125" />
+        </svg>
       </div>
-
-      <!-- Error -->
-      <div x-show="formError" class="mt-4 text-sm text-red-400" x-text="formError"></div>
-
-      <!-- Actions -->
-      <div class="flex justify-end gap-3 mt-6">
-        <button @click="showForm = false"
-                class="px-4 py-2 text-sm text-gray-400 hover:text-gray-200 transition">Cancel</button>
-        <button @click="submitForm()"
-                class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-sm font-medium rounded-lg transition">
-          <span x-text="editingView ? 'Save' : 'Create'"></span>
-        </button>
-      </div>
+      <p class="text-[13px] text-[#44445e] font-medium">No views configured</p>
+      <p class="text-[11px] text-[#26263a] mt-2 font-mono">
+        Click <span class="text-[#3c3c58] border-b border-[#28283c] pb-px cursor-pointer"
+                    @click="showForm = true; editingView = null; resetForm()">New View</span>
+        to get started
+      </p>
     </div>
   </div>
 
 </div>
 
+<!-- ── Modal overlay ────────────────────────────────────────────── -->
+<div x-show="showForm" x-cloak
+     class="fixed inset-0 z-50 flex items-center justify-center p-4"
+     @keydown.escape.window="showForm = false">
+
+  <!-- Backdrop -->
+  <div class="absolute inset-0 bg-black/72 backdrop-blur-[10px]"
+       @click="showForm = false"></div>
+
+  <!-- Panel -->
+  <div class="relative bg-[#0e0e16] border border-[rgba(255,255,255,0.075)]
+              rounded-2xl w-full max-w-[680px] max-h-[92vh] overflow-y-auto
+              shadow-[0_0_0_1px_rgba(99,102,241,0.07),0_40px_80px_rgba(0,0,0,0.75)]
+              modal-enter">
+
+    <!-- Modal header -->
+    <div class="flex items-start justify-between px-6 py-5
+                border-b border-[rgba(255,255,255,0.055)]">
+      <div>
+        <h2 class="text-[14px] font-semibold text-[#eeeef8] tracking-[-0.01em]"
+            x-text="editingView ? 'Edit View' : 'New View'"></h2>
+        <p class="text-[11px] font-mono text-[#32324c] mt-1"
+           x-text="editingView ? 'Update configuration for ' + editingView : 'Configure a new incremental materialized view'"></p>
+      </div>
+      <button @click="showForm = false"
+              class="w-7 h-7 rounded-lg bg-[rgba(255,255,255,0.04)] hover:bg-[rgba(255,255,255,0.08)]
+                     flex items-center justify-center shrink-0 ml-4
+                     text-[#3a3a56] hover:text-[#7070a0]
+                     border border-[rgba(255,255,255,0.05)]
+                     transition-all duration-150 active:scale-90">
+        <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
+        </svg>
+      </button>
+    </div>
+
+    <!-- Form body -->
+    <div class="px-6 py-5 space-y-[18px]">
+
+      <!-- Name -->
+      <div>
+        <label class="block text-[10.5px] font-mono font-medium text-[#38385a]
+                      uppercase tracking-[0.08em] mb-[7px]">Name</label>
+        <input x-model="form.name" type="text" placeholder="ohlcv_1m"
+               :disabled="editingView !== null"
+               class="w-full bg-[#07070c] border border-[rgba(255,255,255,0.065)] rounded-[10px]
+                      px-3 py-[10px] text-[13px] font-mono text-[#cccce0] placeholder-[#22223a]
+                      focus:outline-none focus:border-indigo-500/45
+                      focus:ring-2 focus:ring-indigo-500/[0.11]
+                      disabled:opacity-40 disabled:cursor-not-allowed
+                      transition-[border-color,box-shadow] duration-150">
+      </div>
+
+      <!-- Source Table -->
+      <div>
+        <label class="block text-[10.5px] font-mono font-medium text-[#38385a]
+                      uppercase tracking-[0.08em] mb-[7px]">Source Table</label>
+        <input x-model="form.source_table" type="text" placeholder="iceberg.market_data.trades"
+               class="w-full bg-[#07070c] border border-[rgba(255,255,255,0.065)] rounded-[10px]
+                      px-3 py-[10px] text-[13px] font-mono text-[#cccce0] placeholder-[#22223a]
+                      focus:outline-none focus:border-indigo-500/45
+                      focus:ring-2 focus:ring-indigo-500/[0.11]
+                      transition-[border-color,box-shadow] duration-150">
+      </div>
+
+      <!-- Query -->
+      <div>
+        <label class="block text-[10.5px] font-mono font-medium text-[#38385a]
+                      uppercase tracking-[0.08em] mb-[7px]">
+          Query
+          <span class="normal-case text-[#28283e] font-normal ml-1.5 tracking-normal">
+            — include <code class="text-indigo-500/60">{range_filter}</code> placeholder
+          </span>
+        </label>
+        <textarea x-model="form.query" rows="8"
+                  placeholder="SELECT symbol, date_trunc('minute', ts) AS minute, ...
+FROM iceberg.market_data.trades
+WHERE {range_filter}
+GROUP BY 1, 2"
+                  class="w-full bg-[#07070c] border border-[rgba(255,255,255,0.065)] rounded-[10px]
+                         px-3 py-[10px] text-[12px] font-mono text-[#9090aa] placeholder-[#22223a]
+                         leading-[1.75] resize-y
+                         focus:outline-none focus:border-indigo-500/45
+                         focus:ring-2 focus:ring-indigo-500/[0.11]
+                         transition-[border-color,box-shadow] duration-150"></textarea>
+      </div>
+
+      <!-- Filter Column -->
+      <div>
+        <label class="block text-[10.5px] font-mono font-medium text-[#38385a]
+                      uppercase tracking-[0.08em] mb-[7px]">Filter Column</label>
+        <input x-model="form.filter_column" type="text" placeholder="ts"
+               class="w-full bg-[#07070c] border border-[rgba(255,255,255,0.065)] rounded-[10px]
+                      px-3 py-[10px] text-[13px] font-mono text-[#cccce0] placeholder-[#22223a]
+                      focus:outline-none focus:border-indigo-500/45
+                      focus:ring-2 focus:ring-indigo-500/[0.11]
+                      transition-[border-color,box-shadow] duration-150">
+      </div>
+
+      <!-- Merge Keys -->
+      <div>
+        <label class="block text-[10.5px] font-mono font-medium text-[#38385a]
+                      uppercase tracking-[0.08em] mb-[7px]">
+          Merge Keys
+          <span class="normal-case text-[#28283e] font-normal ml-1.5 tracking-normal">— comma-separated</span>
+        </label>
+        <input x-model="form.merge_keys_str" type="text" placeholder="symbol, minute"
+               class="w-full bg-[#07070c] border border-[rgba(255,255,255,0.065)] rounded-[10px]
+                      px-3 py-[10px] text-[13px] font-mono text-[#cccce0] placeholder-[#22223a]
+                      focus:outline-none focus:border-indigo-500/45
+                      focus:ring-2 focus:ring-indigo-500/[0.11]
+                      transition-[border-color,box-shadow] duration-150">
+      </div>
+
+      <!-- Target Table + Partitioning -->
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-[10.5px] font-mono font-medium text-[#38385a]
+                        uppercase tracking-[0.08em] mb-[7px]">
+            Target Table
+            <span class="text-[#1e1e30] font-normal normal-case tracking-normal">(optional)</span>
+          </label>
+          <input x-model="form.target_table" type="text" placeholder="auto-generated"
+                 class="w-full bg-[#07070c] border border-[rgba(255,255,255,0.065)] rounded-[10px]
+                        px-3 py-[10px] text-[13px] font-mono text-[#cccce0] placeholder-[#22223a]
+                        focus:outline-none focus:border-indigo-500/45
+                        focus:ring-2 focus:ring-indigo-500/[0.11]
+                        transition-[border-color,box-shadow] duration-150">
+        </div>
+        <div>
+          <label class="block text-[10.5px] font-mono font-medium text-[#38385a]
+                        uppercase tracking-[0.08em] mb-[7px]">
+            Partitioning
+            <span class="text-[#1e1e30] font-normal normal-case tracking-normal">(optional)</span>
+          </label>
+          <input x-model="form.target_partitioning" type="text" placeholder="inherits from source"
+                 class="w-full bg-[#07070c] border border-[rgba(255,255,255,0.065)] rounded-[10px]
+                        px-3 py-[10px] text-[13px] font-mono text-[#cccce0] placeholder-[#22223a]
+                        focus:outline-none focus:border-indigo-500/45
+                        focus:ring-2 focus:ring-indigo-500/[0.11]
+                        transition-[border-color,box-shadow] duration-150">
+        </div>
+      </div>
+
+      <!-- Refresh Interval -->
+      <div>
+        <label class="block text-[10.5px] font-mono font-medium text-[#38385a]
+                      uppercase tracking-[0.08em] mb-[7px]">Refresh Interval (seconds)</label>
+        <input x-model.number="form.refresh_interval_seconds" type="number" min="1"
+               class="w-28 bg-[#07070c] border border-[rgba(255,255,255,0.065)] rounded-[10px]
+                      px-3 py-[10px] text-[13px] font-mono tabular-nums text-[#cccce0]
+                      focus:outline-none focus:border-indigo-500/45
+                      focus:ring-2 focus:ring-indigo-500/[0.11]
+                      transition-[border-color,box-shadow] duration-150">
+      </div>
+
+    </div>
+
+    <!-- Form error -->
+    <div x-show="formError"
+         class="mx-6 -mt-1 mb-1 text-[11px] font-mono text-red-400/80 leading-relaxed
+                bg-red-500/[0.06] border border-red-500/[0.14] rounded-lg px-4 py-3"
+         x-text="formError"></div>
+
+    <!-- Modal footer -->
+    <div class="flex justify-end items-center gap-2.5 px-6 py-[18px]
+                border-t border-[rgba(255,255,255,0.05)]">
+      <button @click="showForm = false"
+              class="px-4 py-[8px] text-[13px] font-medium text-[#42425e] hover:text-[#7878a0]
+                     hover:bg-[rgba(255,255,255,0.04)] rounded-lg
+                     transition-all duration-150">
+        Cancel
+      </button>
+      <button @click="submitForm()"
+              class="px-5 py-[8px] bg-indigo-600 hover:bg-indigo-500 text-[13px] font-semibold text-white
+                     rounded-lg transition-colors duration-150 active:scale-[0.97]
+                     shadow-[0_0_0_1px_rgba(99,102,241,0.4),0_4px_14px_rgba(99,102,241,0.2)]">
+        <span x-text="editingView ? 'Save Changes' : 'Create View'"></span>
+      </button>
+    </div>
+
+  </div>
+</div>
+
+<!-- ── Alpine.js logic ──────────────────────────────────────────── -->
 <script>
 function app() {
   return {
@@ -217,7 +575,8 @@ function app() {
     form: {
       name: '', source_table: '', query: '', merge_keys_str: '',
       filter_column: '',
-      target_table: '', target_partitioning: '', refresh_interval_seconds: 60,
+      target_table: '', target_partitioning: '',
+      refresh_interval_seconds: 60,
     },
 
     async init() {
@@ -229,13 +588,17 @@ function app() {
       try {
         const res = await fetch('/api/views');
         this.views = await res.json();
-      } catch (e) { console.error('Failed to load views:', e); }
+      } catch (e) {
+        console.error('Failed to load views:', e);
+      }
     },
 
     resetForm() {
       this.form = {
         name: '', source_table: '', query: '', merge_keys_str: '',
-        target_table: '', target_partitioning: '', refresh_interval_seconds: 60,
+        filter_column: '',
+        target_table: '', target_partitioning: '',
+        refresh_interval_seconds: 60,
       };
       this.formError = '';
     },
@@ -248,6 +611,7 @@ function app() {
         query: view.query,
         merge_keys_str: view.merge_keys.join(', '),
         filter_column: view.filter_column || '',
+
         target_table: view.target_table || '',
         target_partitioning: view.target_partitioning || '',
         refresh_interval_seconds: view.refresh_interval_seconds,
@@ -259,12 +623,14 @@ function app() {
     async submitForm() {
       this.formError = '';
       const keys = this.form.merge_keys_str.split(',').map(s => s.trim()).filter(Boolean);
-      if (!this.form.name || !this.form.source_table || !this.form.query || keys.length === 0 || !this.form.filter_column) {
+
+      if (!this.form.name || !this.form.source_table || !this.form.query
+          || keys.length === 0 || !this.form.filter_column) {
         this.formError = 'Name, source table, query, filter column, and merge keys are required.';
         return;
       }
       if (!this.form.query.includes('{range_filter}')) {
-        this.formError = 'Query must contain {range_filter} placeholder.';
+        this.formError = 'Query must contain the {range_filter} placeholder.';
         return;
       }
 
@@ -274,6 +640,7 @@ function app() {
         query: this.form.query,
         merge_keys: keys,
         filter_column: this.form.filter_column,
+
         target_table: this.form.target_table || null,
         target_partitioning: this.form.target_partitioning || null,
         refresh_interval_seconds: this.form.refresh_interval_seconds,
@@ -283,12 +650,16 @@ function app() {
         if (this.editingView) {
           await fetch(`/api/views/${this.editingView}`, { method: 'DELETE' });
           const res = await fetch('/api/views', {
-            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
           });
           if (!res.ok) { const e = await res.json(); throw new Error(e.detail); }
         } else {
           const res = await fetch('/api/views', {
-            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
           });
           if (!res.ok) { const e = await res.json(); throw new Error(e.detail); }
         }
@@ -306,23 +677,24 @@ function app() {
     },
 
     async triggerRefresh(name) {
-      this.refreshing[name] = true;
+      this.refreshing = { ...this.refreshing, [name]: true };
       try {
         await fetch(`/api/views/${name}/refresh`, { method: 'POST' });
         await this.loadViews();
       } finally {
-        this.refreshing[name] = false;
+        this.refreshing = { ...this.refreshing, [name]: false };
       }
     },
 
     timeAgo(ts) {
       const diff = Math.floor(Date.now() / 1000 - ts);
-      if (diff < 60) return diff + 's ago';
+      if (diff < 60)   return diff + 's ago';
       if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
       return Math.floor(diff / 3600) + 'h ago';
     },
   };
 }
 </script>
+
 </body>
 </html>

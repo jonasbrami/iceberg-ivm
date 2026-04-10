@@ -5,17 +5,20 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from trino_mv_orchestrator.config import load_config
+from trino_mv_orchestrator.config import Config, load_config, load_views
 from trino_mv_orchestrator.server import AppState, ViewStatus, app, get_app_state
 
 
-CONFIG_YAML = textwrap.dedent("""\
+STATIC_CONFIG_YAML = textwrap.dedent("""\
     trino:
       host: localhost
       port: 8080
       catalog: iceberg
       schema: analytics
       user: test
+""")
+
+VIEWS_YAML = textwrap.dedent("""\
     views:
       - name: test_view
         source_table: iceberg.db.trades
@@ -29,10 +32,15 @@ CONFIG_YAML = textwrap.dedent("""\
 def setup_state(tmp_path):
     """Pre-seed AppState on app.state so lifespan skips init and refresh loop exits immediately."""
     cfg_path = tmp_path / "config.yaml"
-    cfg_path.write_text(CONFIG_YAML)
-    s = AppState(config_path=cfg_path)
-    s.config = load_config(cfg_path)
+    views_path = tmp_path / "views.yaml"
+    cfg_path.write_text(STATIC_CONFIG_YAML)
+    views_path.write_text(VIEWS_YAML)
+    static_cfg = load_config(cfg_path)
+    views = load_views(views_path)
+    s = AppState(config_path=cfg_path, views_path=views_path)
+    s.config = Config(trino=static_cfg.trino, views=views, server=static_cfg.server)
     s.config_mtime = cfg_path.stat().st_mtime
+    s.views_mtime = views_path.stat().st_mtime
     s.view_statuses = {
         "test_view": ViewStatus(name="test_view", last_action="skip", total_refreshes=3),
     }
@@ -116,7 +124,7 @@ def test_delete_not_found(client):
 
 # ── Trigger refresh ──
 
-@patch("trino_mv_orchestrator.server.refresh_view")
+@patch("trino_mv_orchestrator.server.refresh_view", new_callable=AsyncMock)
 def test_trigger_refresh(mock_refresh, client):
     r = client.post("/api/views/test_view/refresh")
     assert r.status_code == 200
@@ -141,20 +149,17 @@ def test_ui(client):
 def test_reload_config_on_mtime_change(setup_state, tmp_path):
     from trino_mv_orchestrator.server import reload_config
 
-    # Initial state
     assert len(setup_state.config.views) == 1
 
-    # Write new config with an extra view (must be indented under views:)
-    new_yaml = CONFIG_YAML + (
+    new_views_yaml = VIEWS_YAML + (
         "  - name: second_view\n"
         "    source_table: iceberg.db.other\n"
         "    filter_column: ts\n"
         '    query: "SELECT date_trunc(\'hour\', ts) AS h FROM t2 WHERE {range_filter} GROUP BY 1"\n'
         "    merge_keys: [x]\n"
     )
-    setup_state.config_path.write_text(new_yaml)
+    setup_state.views_path.write_text(new_views_yaml)
 
-    # Force mtime to be newer
     reloaded = reload_config(setup_state)
     assert reloaded is True
     assert len(setup_state.config.views) == 2

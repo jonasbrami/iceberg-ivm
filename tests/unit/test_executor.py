@@ -64,17 +64,17 @@ class MockCursorWithStats:
         self._stats = stats or {}
         self.executed = []
 
-    def execute(self, sql: str):
+    async def execute(self, sql: str):
         self.executed.append(sql)
 
     @property
     def stats(self):
         return self._stats
 
-    def fetchone(self):
+    async def fetchone(self):
         return None
 
-    def fetchall(self):
+    async def fetchall(self):
         return []
 
 
@@ -92,28 +92,28 @@ class TestRefreshResult:
 
 
 class TestExecuteFullRefresh:
-    def test_returns_refresh_result_with_stats(self):
+    async def test_returns_refresh_result_with_stats(self):
         cursor = MockCursorWithStats(stats={
             "processedRows": 5000,
             "processedBytes": 128000,
         })
         view = make_view()
-        result = execute_full_refresh(cursor, view, "iceberg.out.mv")
+        result = await execute_full_refresh(cursor, view, "iceberg.out.mv")
         assert isinstance(result, RefreshResult)
         assert result.elapsed > 0
         assert result.processed_rows == 5000
         assert result.processed_bytes == 128000
 
-    def test_returns_zero_stats_when_missing(self):
+    async def test_returns_zero_stats_when_missing(self):
         cursor = MockCursorWithStats(stats={})
         view = make_view()
-        result = execute_full_refresh(cursor, view, "iceberg.out.mv")
+        result = await execute_full_refresh(cursor, view, "iceberg.out.mv")
         assert result.processed_rows == 0
         assert result.processed_bytes == 0
 
 
 class TestExecuteIncrementalRefresh:
-    def test_returns_refresh_result_with_stats(self):
+    async def test_returns_refresh_result_with_stats(self):
         cursor = MockCursorWithStats(stats={
             "processedRows": 200,
             "processedBytes": 8192,
@@ -121,7 +121,7 @@ class TestExecuteIncrementalRefresh:
         view = make_view()
         start = datetime(2026, 4, 8, 0, 0, tzinfo=timezone.utc)
         end = datetime(2026, 4, 9, 0, 0, tzinfo=timezone.utc)
-        result = execute_incremental_refresh(
+        result = await execute_incremental_refresh(
             cursor, view, "iceberg.out.mv", ["open"], (start, end),
         )
         assert isinstance(result, RefreshResult)

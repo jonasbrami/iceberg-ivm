@@ -18,17 +18,17 @@ class MockCursor:
         self._idx = 0
         self._rows = []
 
-    def execute(self, sql: str):
+    async def execute(self, sql: str):
         if self._idx < len(self._results):
             self._rows = list(self._results[self._idx])
         else:
             self._rows = []
         self._idx += 1
 
-    def fetchone(self):
+    async def fetchone(self):
         return self._rows[0] if self._rows else None
 
-    def fetchall(self):
+    async def fetchall(self):
         return self._rows
 
 
@@ -295,67 +295,61 @@ class TestParseTs:
 # ── get_current_snapshot ──
 
 class TestGetCurrentSnapshot:
-    def test_returns_id(self):
-        assert get_current_snapshot(MockCursor([[(12345,)]]), "db.t") == 12345
+    async def test_returns_id(self):
+        assert await get_current_snapshot(MockCursor([[(12345,)]]), "db.t") == 12345
 
-    def test_returns_none(self):
-        assert get_current_snapshot(MockCursor([[]]), "db.t") is None
+    async def test_returns_none(self):
+        assert await get_current_snapshot(MockCursor([[]]), "db.t") is None
 
 
 # ── get_new_files_column_range ──
 
 class TestGetNewFilesColumnRange:
-    def test_computes_range(self):
+    async def test_computes_range(self):
         cursor = MockCursor([[
             ({"ts": {"lower_bound": "2026-04-08T09:00:00+00:00", "upper_bound": "2026-04-08T12:00:00+00:00"}},),
             ({"ts": {"lower_bound": "2026-04-08T11:00:00+00:00", "upper_bound": "2026-04-08T15:00:00+00:00"}},),
         ]])
-        result = get_new_files_column_range(cursor, "db.t", [100, 200], "ts")
+        result = await get_new_files_column_range(cursor, "db.t", [100, 200], "ts")
         assert result is not None
         assert "09:00:00" in result[0]
         assert "15:00:00" in result[1]
 
-    def test_no_data_files(self):
+    async def test_no_data_files(self):
         cursor = MockCursor([[]])
-        assert get_new_files_column_range(cursor, "db.t", [100], "ts") is None
+        assert await get_new_files_column_range(cursor, "db.t", [100], "ts") is None
 
 
 # ── detect_changes ──
 
 class TestDetectChanges:
-    def test_no_change_same_snapshot(self):
+    async def test_no_change_same_snapshot(self):
         cursor = MockCursor([[(100,)]])
-        r = detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
+        r = await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
         assert r.action == RefreshAction.NO_CHANGE
 
-    def test_full_refresh_first_run(self):
+    async def test_full_refresh_first_run(self):
         cursor = MockCursor([[(200,)]])
-        r = detect_changes(cursor, "db.t", "ts", "day", last_snapshot=None)
+        r = await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=None)
         assert r.action == RefreshAction.FULL_REFRESH
         assert r.current_snapshot == 200
 
-    def test_full_refresh_on_overwrite(self):
-        cursor = MockCursor([
-            [(200,)],                                  # get_current_snapshot
-            [{"snapshot_id": 200, "operation": "overwrite"}],  # get_snapshots_since
-        ])
-        # get_snapshots_since returns list of rows; mock returns dicts directly
-        # Need to mock differently — the cursor returns tuples
+    async def test_full_refresh_on_overwrite(self):
         cursor = MockCursor([
             [(200,)],              # get_current_snapshot
             [(200, "overwrite")],  # get_snapshots_since
         ])
-        r = detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
+        r = await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
         assert r.action == RefreshAction.FULL_REFRESH
 
-    def test_incremental_with_range(self):
+    async def test_incremental_with_range(self):
         cursor = MockCursor([
             [(200,)],              # get_current_snapshot
             [(200, "append")],     # get_snapshots_since
             # get_new_files_column_range — readable_metrics per file
             [({"ts": {"lower_bound": "2026-04-08T10:00:00+00:00", "upper_bound": "2026-04-08T15:30:00+00:00"}},)],
         ])
-        r = detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
+        r = await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
         assert r.action == RefreshAction.INCREMENTAL
         assert r.filter_range is not None
         # Day granularity: should snap to full day
@@ -363,24 +357,24 @@ class TestDetectChanges:
         assert start.day == 8 and start.hour == 0
         assert end.day == 9 and end.hour == 0
 
-    def test_incremental_week_granularity(self):
+    async def test_incremental_week_granularity(self):
         cursor = MockCursor([
             [(200,)],
             [(200, "append")],
             [({"ts": {"lower_bound": "2026-04-08T10:00:00+00:00", "upper_bound": "2026-04-08T15:00:00+00:00"}},)],
         ])
-        r = detect_changes(cursor, "db.t", "ts", "week", last_snapshot=100)
+        r = await detect_changes(cursor, "db.t", "ts", "week", last_snapshot=100)
         assert r.action == RefreshAction.INCREMENTAL
         start, end = r.filter_range
         # Apr 8 is Wednesday → week snaps to Mon Apr 6 – Mon Apr 13
         assert start.day == 6
         assert end.day == 13
 
-    def test_no_data_files_in_new_snapshots(self):
+    async def test_no_data_files_in_new_snapshots(self):
         cursor = MockCursor([
             [(200,)],
             [(200, "append")],
             [],  # no entries from $all_entries
         ])
-        r = detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
+        r = await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
         assert r.action == RefreshAction.NO_CHANGE
