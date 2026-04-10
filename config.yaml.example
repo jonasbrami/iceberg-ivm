@@ -13,7 +13,7 @@ views:
   - name: ohlcv_1m
     source_table: iceberg.market_data.trades
     filter_column: ts
-    # filter_granularity inferred as "minute" from date_trunc('minute', ts)
+    # filter_granularity is always inferred from date_trunc in the query
     query: |
       SELECT
         symbol,

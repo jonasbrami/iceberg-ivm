@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from trino_mv_orchestrator.config import ViewConfig
+from trino_mv_orchestrator.config import ViewConfig, infer_granularity
 from trino_mv_orchestrator.detector import RefreshAction, detect_changes
 from trino_mv_orchestrator.executor import execute_full_refresh, execute_incremental_refresh
 from trino_mv_orchestrator.introspect import discover_columns, build_create_table_sql
@@ -28,7 +28,6 @@ CREATE TABLE {SOURCE_TABLE} (
 
 WEEKLY_VIEW = ViewConfig(
     name="test_weekly", source_table=SOURCE_TABLE, filter_column="ts",
-    filter_granularity="week",
     query=f"""
         SELECT symbol, date_trunc('week', ts) AS week,
                min_by(price, ts) AS open, max(price) AS high,
@@ -42,7 +41,6 @@ WEEKLY_VIEW = ViewConfig(
 
 MONTHLY_VIEW = ViewConfig(
     name="test_monthly", source_table=SOURCE_TABLE, filter_column="ts",
-    filter_granularity="month",
     query=f"""
         SELECT symbol, date_trunc('month', ts) AS month,
                min_by(price, ts) AS open, max(price) AS high,
@@ -68,7 +66,7 @@ async def setup_and_full_refresh(cursor, view, target):
     value_cols = [c.name for c in cols if c.name not in view.merge_keys]
     await cursor.execute(build_create_table_sql(target, cols, view.target_partitioning))
     await execute_full_refresh(cursor, view, target)
-    result = await detect_changes(cursor, SOURCE_TABLE, "ts", view.filter_granularity, last_snapshot=None)
+    result = await detect_changes(cursor, SOURCE_TABLE, "ts", infer_granularity(view.query), last_snapshot=None)
     await write_last_snapshot(cursor, target, result.current_snapshot)
     return result, value_cols
 

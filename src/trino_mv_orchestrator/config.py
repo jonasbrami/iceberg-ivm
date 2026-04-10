@@ -10,7 +10,7 @@ import yaml
 
 log = logging.getLogger(__name__)
 
-VALID_GRANULARITIES = ("minute", "hour", "day", "week", "month")
+VALID_GRANULARITIES = ("minute", "hour", "day", "week", "month", "quarter", "year")
 
 _IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 _QUALIFIED_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$")
@@ -26,24 +26,33 @@ _COMPLEX_EXPR_RE = re.compile(
 )
 
 
-def infer_granularity(query: str) -> str | None:
+def infer_granularity(query: str) -> str:
     """Infer filter_granularity from ``date_trunc('X', ...)`` in the query.
 
     Returns the granularity string if exactly one valid granularity is found
-    in a simple ``date_trunc`` call (not part of arithmetic).  Returns *None*
-    when inference is not possible.
+    in a simple ``date_trunc`` call (not part of arithmetic).  Raises
+    ``ValueError`` when inference is not possible.
     """
     if _COMPLEX_EXPR_RE.search(query):
-        return None
+        raise ValueError(
+            "complex date_trunc expressions are not supported; "
+            "use date_trunc('X', col) directly in GROUP BY"
+        )
 
     matches = _DATE_TRUNC_RE.findall(query)
     if not matches:
-        return None
+        raise ValueError(
+            "query must contain a date_trunc('X', col) expression "
+            "for automatic granularity inference"
+        )
 
     granularities = {m.lower() for m in matches}
     valid = granularities & set(VALID_GRANULARITIES)
     if len(valid) != 1:
-        return None
+        raise ValueError(
+            f"could not infer a single granularity from query; "
+            f"found: {granularities}"
+        )
 
     return valid.pop()
 
@@ -67,7 +76,6 @@ class ViewConfig:
     query: str
     merge_keys: tuple[str, ...]
     filter_column: str
-    filter_granularity: str = "day"
     target_table: str | None = None
     target_partitioning: str | None = None
     refresh_interval_seconds: int = 60
@@ -113,21 +121,9 @@ def _parse_view(raw: dict) -> ViewConfig:
             f"view '{raw['name']}': query must contain {{range_filter}} placeholder"
         )
 
-    explicit = raw.get("filter_granularity")
-    if explicit is not None:
-        granularity = explicit
-        if granularity not in VALID_GRANULARITIES:
-            raise ValueError(
-                f"filter_granularity must be one of {VALID_GRANULARITIES}, got: {granularity}"
-            )
-    else:
-        granularity = infer_granularity(raw["query"])
-        if granularity is None:
-            raise ValueError(
-                f"view '{raw['name']}': filter_granularity not specified and could "
-                f"not be inferred from query. Add an explicit filter_granularity "
-                f"({', '.join(VALID_GRANULARITIES)})."
-            )
+    # Validate the query contains a simple date_trunc (raises on bad queries).
+    # The result is derived at refresh time — not stored on the view.
+    infer_granularity(raw["query"])
 
     return ViewConfig(
         name=raw["name"],
@@ -135,7 +131,6 @@ def _parse_view(raw: dict) -> ViewConfig:
         query=raw["query"],
         merge_keys=tuple(raw["merge_keys"]),
         filter_column=raw["filter_column"],
-        filter_granularity=granularity,
         target_table=raw.get("target_table"),
         target_partitioning=raw.get("target_partitioning"),
         refresh_interval_seconds=raw.get("refresh_interval_seconds", 60),
@@ -213,7 +208,6 @@ def save_views(views: list[ViewConfig], path: str | Path) -> None:
             "query": v.query,
             "merge_keys": list(v.merge_keys),
             "filter_column": v.filter_column,
-            "filter_granularity": v.filter_granularity,
             "refresh_interval_seconds": v.refresh_interval_seconds,
         }
         if v.target_table:

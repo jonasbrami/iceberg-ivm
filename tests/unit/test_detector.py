@@ -98,6 +98,177 @@ class TestSnapRange:
         assert s == datetime(2026, 12, 1, tzinfo=timezone.utc)
         assert e == datetime(2027, 1, 1, tzinfo=timezone.utc)
 
+    def test_quarter(self):
+        # Apr 15 is in Q2 (Apr-Jun)
+        s, e = snap_range(
+            datetime(2026, 4, 15, tzinfo=timezone.utc),
+            datetime(2026, 5, 20, tzinfo=timezone.utc),
+            "quarter",
+        )
+        assert s == datetime(2026, 4, 1, tzinfo=timezone.utc)
+        assert e == datetime(2026, 7, 1, tzinfo=timezone.utc)
+
+    def test_quarter_spanning_two(self):
+        # Mar (Q1) to May (Q2)
+        s, e = snap_range(
+            datetime(2026, 3, 15, tzinfo=timezone.utc),
+            datetime(2026, 5, 10, tzinfo=timezone.utc),
+            "quarter",
+        )
+        assert s == datetime(2026, 1, 1, tzinfo=timezone.utc)   # Q1 start
+        assert e == datetime(2026, 7, 1, tzinfo=timezone.utc)    # Q3 start (next after Q2)
+
+    def test_quarter_year_boundary(self):
+        # Q4 (Oct-Dec) spanning into year boundary
+        s, e = snap_range(
+            datetime(2026, 11, 1, tzinfo=timezone.utc),
+            datetime(2026, 12, 15, tzinfo=timezone.utc),
+            "quarter",
+        )
+        assert s == datetime(2026, 10, 1, tzinfo=timezone.utc)  # Q4 start
+        assert e == datetime(2027, 1, 1, tzinfo=timezone.utc)    # Q1 next year
+
+    def test_year(self):
+        s, e = snap_range(
+            datetime(2026, 6, 15, tzinfo=timezone.utc),
+            datetime(2026, 9, 20, tzinfo=timezone.utc),
+            "year",
+        )
+        assert s == datetime(2026, 1, 1, tzinfo=timezone.utc)
+        assert e == datetime(2027, 1, 1, tzinfo=timezone.utc)
+
+    def test_year_spanning(self):
+        # Dec 2026 to Jan 2027
+        s, e = snap_range(
+            datetime(2026, 12, 15, tzinfo=timezone.utc),
+            datetime(2027, 1, 10, tzinfo=timezone.utc),
+            "year",
+        )
+        assert s == datetime(2026, 1, 1, tzinfo=timezone.utc)
+        assert e == datetime(2028, 1, 1, tzinfo=timezone.utc)
+
+
+# ── snap_range is the inverse of date_trunc ──
+
+def _py_date_trunc(granularity: str, ts: datetime) -> datetime:
+    """Python equivalent of Trino's date_trunc — the forward function."""
+    if granularity == "minute":
+        return ts.replace(second=0, microsecond=0)
+    elif granularity == "hour":
+        return ts.replace(minute=0, second=0, microsecond=0)
+    elif granularity == "day":
+        return ts.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif granularity == "week":
+        return (ts - timedelta(days=ts.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+    elif granularity == "month":
+        return ts.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    elif granularity == "quarter":
+        q = ((ts.month - 1) // 3) * 3 + 1
+        return ts.replace(month=q, day=1, hour=0, minute=0, second=0, microsecond=0)
+    elif granularity == "year":
+        return ts.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    raise ValueError(granularity)
+
+
+# Sample timestamps designed to hit edge cases: mid-bucket, bucket boundaries,
+# year/quarter/month/week transitions.
+_SAMPLE_PAIRS = [
+    # same point
+    (datetime(2026, 4, 8, 10, 30, 45, 123456, tzinfo=timezone.utc),
+     datetime(2026, 4, 8, 10, 30, 45, 123456, tzinfo=timezone.utc)),
+    # within same day
+    (datetime(2026, 4, 8, 9, 15, tzinfo=timezone.utc),
+     datetime(2026, 4, 8, 16, 45, tzinfo=timezone.utc)),
+    # spanning days
+    (datetime(2026, 4, 8, 23, 59, 59, tzinfo=timezone.utc),
+     datetime(2026, 4, 9, 0, 0, 1, tzinfo=timezone.utc)),
+    # spanning weeks (Wed to next Wed)
+    (datetime(2026, 4, 8, 12, 0, tzinfo=timezone.utc),
+     datetime(2026, 4, 15, 12, 0, tzinfo=timezone.utc)),
+    # spanning months
+    (datetime(2026, 3, 28, tzinfo=timezone.utc),
+     datetime(2026, 4, 5, tzinfo=timezone.utc)),
+    # spanning quarters (Q1 → Q2)
+    (datetime(2026, 3, 15, tzinfo=timezone.utc),
+     datetime(2026, 5, 10, tzinfo=timezone.utc)),
+    # spanning year boundary
+    (datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc),
+     datetime(2027, 1, 1, 0, 1, tzinfo=timezone.utc)),
+    # Q4 year boundary
+    (datetime(2026, 11, 15, tzinfo=timezone.utc),
+     datetime(2026, 12, 20, tzinfo=timezone.utc)),
+    # exact bucket boundary (minute)
+    (datetime(2026, 4, 8, 10, 0, 0, 0, tzinfo=timezone.utc),
+     datetime(2026, 4, 8, 11, 0, 0, 0, tzinfo=timezone.utc)),
+]
+
+_GRANULARITIES = ["minute", "hour", "day", "week", "month", "quarter", "year"]
+
+
+import pytest
+
+
+class TestSnapRangeInversesDateTrunc:
+    """Verify the invariant: snap_range is the exact inverse of date_trunc.
+
+    For every granularity and every sample timestamp pair:
+    1. start and end are bucket boundaries (date_trunc is idempotent on them)
+    2. The bucket containing min_ts starts at or after start
+    3. The bucket containing max_ts starts before end
+    4. No bucket is partially covered — start and end ARE bucket boundaries
+    """
+
+    @pytest.mark.parametrize("granularity", _GRANULARITIES)
+    @pytest.mark.parametrize("min_ts, max_ts", _SAMPLE_PAIRS)
+    def test_boundaries_are_bucket_aligned(self, granularity, min_ts, max_ts):
+        start, end = snap_range(min_ts, max_ts, granularity)
+
+        # start is a bucket boundary: date_trunc(start) == start
+        assert _py_date_trunc(granularity, start) == start, (
+            f"start {start} is not a {granularity} boundary"
+        )
+        # end is a bucket boundary: date_trunc(end) == end
+        assert _py_date_trunc(granularity, end) == end, (
+            f"end {end} is not a {granularity} boundary"
+        )
+
+    @pytest.mark.parametrize("granularity", _GRANULARITIES)
+    @pytest.mark.parametrize("min_ts, max_ts", _SAMPLE_PAIRS)
+    def test_touched_buckets_are_fully_covered(self, granularity, min_ts, max_ts):
+        start, end = snap_range(min_ts, max_ts, granularity)
+
+        # The bucket containing min_ts is within [start, end)
+        bucket_min = _py_date_trunc(granularity, min_ts)
+        assert bucket_min >= start, (
+            f"min_ts bucket {bucket_min} is before start {start}"
+        )
+        assert bucket_min < end, (
+            f"min_ts bucket {bucket_min} is at or after end {end}"
+        )
+
+        # The bucket containing max_ts is within [start, end)
+        bucket_max = _py_date_trunc(granularity, max_ts)
+        assert bucket_max >= start, (
+            f"max_ts bucket {bucket_max} is before start {start}"
+        )
+        assert bucket_max < end, (
+            f"max_ts bucket {bucket_max} is at or after end {end}"
+        )
+
+    @pytest.mark.parametrize("granularity", _GRANULARITIES)
+    @pytest.mark.parametrize("min_ts, max_ts", _SAMPLE_PAIRS)
+    def test_range_is_tight(self, granularity, min_ts, max_ts):
+        """start is the earliest bucket boundary that covers min_ts."""
+        start, end = snap_range(min_ts, max_ts, granularity)
+
+        # start == date_trunc(min_ts): the range starts exactly at the
+        # bucket containing min_ts, not one bucket earlier
+        assert start == _py_date_trunc(granularity, min_ts), (
+            f"start {start} is not tight — should be {_py_date_trunc(granularity, min_ts)}"
+        )
+
 
 # ── _parse_ts ──
 

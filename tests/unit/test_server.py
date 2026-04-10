@@ -23,8 +23,7 @@ VIEWS_YAML = textwrap.dedent("""\
       - name: test_view
         source_table: iceberg.db.trades
         filter_column: ts
-        filter_granularity: day
-        query: "SELECT a, b FROM t WHERE {range_filter} GROUP BY 1"
+        query: "SELECT date_trunc('day', ts) AS d, a FROM t WHERE {range_filter} GROUP BY 1, 2"
         merge_keys: [a]
 """)
 
@@ -69,6 +68,25 @@ def test_metrics(client):
     assert "mv_views_configured" in client.get("/metrics").text
 
 
+def test_view_schema(client):
+    """Schema endpoint drives the dynamic UI — must expose all create-view fields."""
+    r = client.get("/api/views/schema")
+    assert r.status_code == 200
+    schema = r.json()
+    assert isinstance(schema, list)
+    names = {f["name"] for f in schema}
+    # All fields the user creates a view with
+    assert names == {
+        "name", "source_table", "query", "filter_column", "merge_keys",
+        "target_table", "target_partitioning", "refresh_interval_seconds",
+    }
+    # Every field has the metadata the form renderer needs
+    for f in schema:
+        assert "label" in f and "type" in f and "required" in f
+    # filter_granularity is NOT user-configurable — must not leak into the form
+    assert "filter_granularity" not in names
+
+
 # ── CRUD ──
 
 def test_list_views(client):
@@ -83,11 +101,11 @@ def test_create_view(client, setup_state):
         "name": "new_view",
         "source_table": "iceberg.db.t",
         "filter_column": "ts",
-        "filter_granularity": "day",
-        "query": "SELECT x FROM t WHERE {range_filter}",
+        "query": "SELECT date_trunc('day', ts) AS d FROM t WHERE {range_filter} GROUP BY 1",
         "merge_keys": ["x"],
     })
     assert r.status_code == 201
+    assert "filter_granularity" not in r.json()
     assert len(setup_state.config.views) == 2
 
 
@@ -97,8 +115,7 @@ def test_create_view_invalid_name(client):
         "name": "bad-name",
         "source_table": "iceberg.db.t",
         "filter_column": "ts",
-        "filter_granularity": "day",
-        "query": "SELECT x FROM t WHERE {range_filter}",
+        "query": "SELECT date_trunc('day', ts) AS d FROM t WHERE {range_filter} GROUP BY 1",
         "merge_keys": ["x"],
     })
     assert r.status_code == 422
@@ -109,8 +126,7 @@ def test_create_duplicate(client):
         "name": "test_view",
         "source_table": "t",
         "filter_column": "ts",
-        "filter_granularity": "day",
-        "query": "q {range_filter}",
+        "query": "SELECT date_trunc('day', ts) AS d FROM t WHERE {range_filter} GROUP BY 1",
         "merge_keys": ["a"],
     })
     assert r.status_code == 409
@@ -158,8 +174,7 @@ def test_reload_config_on_mtime_change(setup_state, tmp_path):
         "  - name: second_view\n"
         "    source_table: iceberg.db.other\n"
         "    filter_column: ts\n"
-        "    filter_granularity: day\n"
-        '    query: "SELECT x FROM t2 WHERE {range_filter}"\n'
+        '    query: "SELECT date_trunc(\'hour\', ts) AS h FROM t2 WHERE {range_filter} GROUP BY 1"\n'
         "    merge_keys: [x]\n"
     )
     setup_state.views_path.write_text(new_views_yaml)
@@ -193,9 +208,9 @@ def test_new_metrics_defined():
     assert SOURCE_SNAPSHOT is not None
 
 
-# ── Granularity inference via API ──
+# ── Query validation via API ──
 
-def test_create_view_infers_granularity(client, setup_state):
+def test_create_view_accepts_valid_query(client, setup_state):
     r = client.post("/api/views", json={
         "name": "auto_view",
         "source_table": "iceberg.db.t",
@@ -204,20 +219,6 @@ def test_create_view_infers_granularity(client, setup_state):
         "merge_keys": ["h"],
     })
     assert r.status_code == 201
-    assert r.json()["filter_granularity"] == "hour"
-
-
-def test_create_view_explicit_overrides(client, setup_state):
-    r = client.post("/api/views", json={
-        "name": "explicit_view",
-        "source_table": "iceberg.db.t",
-        "filter_column": "ts",
-        "filter_granularity": "day",
-        "query": "SELECT date_trunc('hour', ts) AS h FROM t WHERE {range_filter} GROUP BY 1",
-        "merge_keys": ["h"],
-    })
-    assert r.status_code == 201
-    assert r.json()["filter_granularity"] == "day"
 
 
 def test_create_view_fails_when_cannot_infer(client, setup_state):
@@ -229,3 +230,16 @@ def test_create_view_fails_when_cannot_infer(client, setup_state):
         "merge_keys": ["ts"],
     })
     assert r.status_code == 422
+    assert "date_trunc" in r.json()["detail"]
+
+
+def test_create_view_fails_on_complex_expr(client, setup_state):
+    r = client.post("/api/views", json={
+        "name": "complex_view",
+        "source_table": "iceberg.db.t",
+        "filter_column": "ts",
+        "query": "SELECT date_trunc('minute', ts) - INTERVAL '5' MINUTE AS x FROM t WHERE {range_filter} GROUP BY 1",
+        "merge_keys": ["x"],
+    })
+    assert r.status_code == 422
+    assert "complex" in r.json()["detail"]

@@ -25,7 +25,6 @@ CREATE TABLE {SOURCE_TABLE} (
 
 VIEW = ViewConfig(
     name="test_ohlcv", source_table=SOURCE_TABLE, filter_column="ts",
-    filter_granularity="day",
     query=f"""
         SELECT symbol, date_trunc('minute', ts) AS minute,
                min_by(price, ts) AS open, max(price) AS high,
@@ -81,7 +80,7 @@ class TestFullRefresh:
         cols = await discover_columns(cursor, VIEW.query)
         await cursor.execute(build_create_table_sql(TARGET_TABLE, cols, "ARRAY['day(minute)']"))
 
-        result = await detect_changes(cursor, SOURCE_TABLE, "ts", "day", last_snapshot=None)
+        result = await detect_changes(cursor, SOURCE_TABLE, "ts", "minute", last_snapshot=None)
         assert result.action == RefreshAction.FULL_REFRESH
 
         await execute_full_refresh(cursor, VIEW, TARGET_TABLE)
@@ -104,12 +103,12 @@ class TestIncrementalRefresh:
         await cursor.execute(build_create_table_sql(TARGET_TABLE, cols, "ARRAY['day(minute)']"))
         await execute_full_refresh(cursor, VIEW, TARGET_TABLE)
 
-        result = await detect_changes(cursor, SOURCE_TABLE, "ts", "day", last_snapshot=None)
+        result = await detect_changes(cursor, SOURCE_TABLE, "ts", "minute", last_snapshot=None)
         await write_last_snapshot(cursor, TARGET_TABLE, result.current_snapshot)
 
         await insert_trades(cursor, "2026-04-09", [("AAPL", "10:00:00", 155.0, 200)])
 
-        result = await detect_changes(cursor, SOURCE_TABLE, "ts", "day", last_snapshot=result.current_snapshot)
+        result = await detect_changes(cursor, SOURCE_TABLE, "ts", "minute", last_snapshot=result.current_snapshot)
         assert result.action == RefreshAction.INCREMENTAL
         assert result.filter_range is not None
 
@@ -126,12 +125,12 @@ class TestIncrementalRefresh:
         await cursor.execute(build_create_table_sql(TARGET_TABLE, cols, "ARRAY['day(minute)']"))
         await execute_full_refresh(cursor, VIEW, TARGET_TABLE)
 
-        result = await detect_changes(cursor, SOURCE_TABLE, "ts", "day", last_snapshot=None)
+        result = await detect_changes(cursor, SOURCE_TABLE, "ts", "minute", last_snapshot=None)
         await write_last_snapshot(cursor, TARGET_TABLE, result.current_snapshot)
 
         await insert_trades(cursor, "2026-04-08", [("AAPL", "09:30:30", 160.0, 200)])
 
-        result = await detect_changes(cursor, SOURCE_TABLE, "ts", "day", last_snapshot=result.current_snapshot)
+        result = await detect_changes(cursor, SOURCE_TABLE, "ts", "minute", last_snapshot=result.current_snapshot)
         assert result.action == RefreshAction.INCREMENTAL
 
         await execute_incremental_refresh(cursor, VIEW, TARGET_TABLE, value_cols, result.filter_range)
@@ -156,6 +155,6 @@ class TestNoChangeSkip:
         cursor = await trino_conn.cursor()
         await cursor.execute(CREATE_SOURCE)
         await insert_trades(cursor, "2026-04-08", [("AAPL", "09:30:00", 150.0, 100)])
-        result = await detect_changes(cursor, SOURCE_TABLE, "ts", "day", last_snapshot=None)
-        r2 = await detect_changes(cursor, SOURCE_TABLE, "ts", "day", last_snapshot=result.current_snapshot)
+        result = await detect_changes(cursor, SOURCE_TABLE, "ts", "minute", last_snapshot=None)
+        r2 = await detect_changes(cursor, SOURCE_TABLE, "ts", "minute", last_snapshot=result.current_snapshot)
         assert r2.action == RefreshAction.NO_CHANGE

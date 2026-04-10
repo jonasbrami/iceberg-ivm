@@ -33,8 +33,7 @@ views:
   - name: ohlcv_1m
     source_table: iceberg.market_data.trades
     filter_column: ts
-    filter_granularity: day
-    query: "SELECT * FROM t WHERE {range_filter} GROUP BY 1"
+    query: "SELECT date_trunc('day', ts) AS d FROM t WHERE {range_filter} GROUP BY 1"
     merge_keys: [symbol, minute]
     refresh_interval_seconds: 30
 """
@@ -66,7 +65,6 @@ def test_load_views_valid(tmp_path):
     assert len(views) == 1
     v = views[0]
     assert v.filter_column == "ts"
-    assert v.filter_granularity == "day"
     assert v.merge_keys == ("symbol", "minute")
     assert isinstance(v.merge_keys, tuple)
 
@@ -76,21 +74,18 @@ def test_load_views_missing_file(tmp_path):
 
 
 def test_view_defaults(tmp_path):
-    minimal = "views:\n  - name: v\n    source_table: t\n    filter_column: ts\n    filter_granularity: day\n    query: \"q {range_filter}\"\n    merge_keys: [a]\n"
+    minimal = (
+        "views:\n  - name: v\n    source_table: t\n    filter_column: ts\n"
+        "    query: \"SELECT date_trunc('day', ts) AS d FROM t WHERE {range_filter} GROUP BY 1\"\n"
+        "    merge_keys: [a]\n"
+    )
     views = load_views(write_views(tmp_path, minimal))
-    assert views[0].filter_granularity == "day"
     assert views[0].refresh_interval_seconds == 60
 
 
 def test_missing_filter_column(tmp_path):
     bad = VALID_VIEWS.replace("    filter_column: ts\n", "")
     with pytest.raises(ValueError, match="filter_column"):
-        load_views(write_views(tmp_path, bad))
-
-
-def test_invalid_granularity(tmp_path):
-    bad = VALID_VIEWS.replace("filter_granularity: day", "filter_granularity: century")
-    with pytest.raises(ValueError, match="filter_granularity"):
         load_views(write_views(tmp_path, bad))
 
 
@@ -135,17 +130,15 @@ def test_save_views_and_reload(tmp_path):
     views = [ViewConfig(
         name="ohlcv_1m",
         source_table="iceberg.market_data.trades",
-        query="SELECT * FROM t WHERE {range_filter} GROUP BY 1",
+        query="SELECT date_trunc('day', ts) AS d FROM t WHERE {range_filter} GROUP BY 1",
         merge_keys=("symbol", "minute"),
         filter_column="ts",
-        filter_granularity="day",
         refresh_interval_seconds=30,
     )]
     views_path = tmp_path / "views.yaml"
     save_views(views, views_path)
     loaded = load_views(views_path)
     assert loaded[0].filter_column == views[0].filter_column
-    assert loaded[0].filter_granularity == views[0].filter_granularity
     assert loaded[0].merge_keys == views[0].merge_keys
 
 
@@ -160,54 +153,82 @@ def test_save_views_creates_parent_dirs(tmp_path):
 def test_infer_minute():
     assert infer_granularity("SELECT date_trunc('minute', ts) FROM t") == "minute"
 
+def test_infer_hour():
+    assert infer_granularity("SELECT date_trunc('hour', ts) FROM t") == "hour"
+
+def test_infer_day():
+    assert infer_granularity("SELECT date_trunc('day', ts) FROM t") == "day"
+
 def test_infer_week():
     assert infer_granularity("SELECT date_trunc('week', ts) FROM t") == "week"
+
+def test_infer_month():
+    assert infer_granularity("SELECT date_trunc('month', ts) FROM t") == "month"
+
+def test_infer_quarter():
+    assert infer_granularity("SELECT date_trunc('quarter', ts) FROM t") == "quarter"
+
+def test_infer_year():
+    assert infer_granularity("SELECT date_trunc('year', ts) FROM t") == "year"
 
 def test_infer_case_insensitive():
     assert infer_granularity("SELECT DATE_TRUNC('Hour', ts) FROM t") == "hour"
 
-def test_infer_no_date_trunc():
-    assert infer_granularity("SELECT ts FROM t") is None
+def test_infer_no_date_trunc_raises():
+    with pytest.raises(ValueError, match="must contain a date_trunc"):
+        infer_granularity("SELECT ts FROM t")
 
-def test_infer_complex_expr_returns_none():
-    """date_trunc used in arithmetic (5-min bars) should not be inferred."""
+def test_infer_complex_expr_raises():
+    """date_trunc used in arithmetic should be rejected."""
     q = ("SELECT date_trunc('minute', minute) "
          "- (extract(minute FROM minute) % 5) * INTERVAL '1' MINUTE AS bar FROM t")
-    assert infer_granularity(q) is None
+    with pytest.raises(ValueError, match="complex date_trunc"):
+        infer_granularity(q)
 
-def test_infer_invalid_granularity_ignored():
-    assert infer_granularity("SELECT date_trunc('second', ts) FROM t") is None
+def test_infer_invalid_granularity_raises():
+    with pytest.raises(ValueError, match="could not infer a single granularity"):
+        infer_granularity("SELECT date_trunc('second', ts) FROM t")
 
 def test_infer_multiple_same():
     q = "SELECT date_trunc('hour', ts), date_trunc('hour', other) FROM t"
     assert infer_granularity(q) == "hour"
 
-def test_infer_multiple_different_returns_none():
+def test_infer_multiple_different_raises():
     q = "SELECT date_trunc('hour', ts), date_trunc('day', ts) FROM t"
-    assert infer_granularity(q) is None
+    with pytest.raises(ValueError, match="could not infer a single granularity"):
+        infer_granularity(q)
 
 
-# ── views-level inference ──
+# ── views-level query validation ──
+# The loader calls infer_granularity() on the query to validate it, but the
+# result is not stored. These tests verify that valid queries load and invalid
+# queries are rejected.
 
-def test_load_views_infers_granularity(tmp_path):
+def test_load_views_accepts_minute(tmp_path):
     views_yaml = (
         "views:\n  - name: v\n    source_table: t\n    filter_column: ts\n"
         "    query: \"SELECT date_trunc('minute', ts) AS m FROM t WHERE {range_filter} GROUP BY 1\"\n"
         "    merge_keys: [m]\n"
     )
-    views = load_views(write_views(tmp_path, views_yaml))
-    assert views[0].filter_granularity == "minute"
+    assert len(load_views(write_views(tmp_path, views_yaml))) == 1
 
 
-def test_load_views_explicit_overrides_inference(tmp_path):
+def test_load_views_accepts_quarter(tmp_path):
     views_yaml = (
         "views:\n  - name: v\n    source_table: t\n    filter_column: ts\n"
-        "    filter_granularity: day\n"
-        "    query: \"SELECT date_trunc('minute', ts) AS m FROM t WHERE {range_filter} GROUP BY 1\"\n"
-        "    merge_keys: [m]\n"
+        "    query: \"SELECT date_trunc('quarter', ts) AS q FROM t WHERE {range_filter} GROUP BY 1\"\n"
+        "    merge_keys: [q]\n"
     )
-    views = load_views(write_views(tmp_path, views_yaml))
-    assert views[0].filter_granularity == "day"
+    assert len(load_views(write_views(tmp_path, views_yaml))) == 1
+
+
+def test_load_views_accepts_year(tmp_path):
+    views_yaml = (
+        "views:\n  - name: v\n    source_table: t\n    filter_column: ts\n"
+        "    query: \"SELECT date_trunc('year', ts) AS y FROM t WHERE {range_filter} GROUP BY 1\"\n"
+        "    merge_keys: [y]\n"
+    )
+    assert len(load_views(write_views(tmp_path, views_yaml))) == 1
 
 
 def test_load_views_fails_when_cannot_infer(tmp_path):
@@ -216,5 +237,15 @@ def test_load_views_fails_when_cannot_infer(tmp_path):
         "    query: \"SELECT ts FROM t WHERE {range_filter}\"\n"
         "    merge_keys: [ts]\n"
     )
-    with pytest.raises(ValueError, match="could not be inferred"):
+    with pytest.raises(ValueError, match="must contain a date_trunc"):
+        load_views(write_views(tmp_path, views_yaml))
+
+
+def test_load_views_fails_on_complex_expr(tmp_path):
+    views_yaml = (
+        "views:\n  - name: v\n    source_table: t\n    filter_column: ts\n"
+        "    query: \"SELECT date_trunc('minute', ts) - INTERVAL '5' MINUTE AS x FROM t WHERE {range_filter} GROUP BY 1\"\n"
+        "    merge_keys: [x]\n"
+    )
+    with pytest.raises(ValueError, match="complex date_trunc"):
         load_views(write_views(tmp_path, views_yaml))

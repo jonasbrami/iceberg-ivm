@@ -415,152 +415,81 @@
       </button>
     </div>
 
-    <!-- Form body -->
+    <!-- Form body — dynamically rendered from /api/views/schema -->
     <div class="px-6 py-5 space-y-[18px]">
 
-      <!-- Name -->
-      <div>
-        <label class="block text-[10.5px] font-mono font-medium text-[#38385a]
-                      uppercase tracking-[0.08em] mb-[7px]">Name</label>
-        <input x-model="form.name" type="text" placeholder="ohlcv_1m"
-               :disabled="editingView !== null"
-               class="w-full bg-[#07070c] border border-[rgba(255,255,255,0.065)] rounded-[10px]
-                      px-3 py-[10px] text-[13px] font-mono text-[#cccce0] placeholder-[#22223a]
-                      focus:outline-none focus:border-indigo-500/45
-                      focus:ring-2 focus:ring-indigo-500/[0.11]
-                      disabled:opacity-40 disabled:cursor-not-allowed
-                      transition-[border-color,box-shadow] duration-150">
-      </div>
+      <template x-for="(row, idx) in schemaRows" :key="idx">
+        <div :class="row.length > 1 ? 'grid grid-cols-2 gap-3' : ''">
 
-      <!-- Source Table -->
-      <div>
-        <label class="block text-[10.5px] font-mono font-medium text-[#38385a]
-                      uppercase tracking-[0.08em] mb-[7px]">Source Table</label>
-        <input x-model="form.source_table" type="text" placeholder="iceberg.market_data.trades"
-               class="w-full bg-[#07070c] border border-[rgba(255,255,255,0.065)] rounded-[10px]
-                      px-3 py-[10px] text-[13px] font-mono text-[#cccce0] placeholder-[#22223a]
-                      focus:outline-none focus:border-indigo-500/45
-                      focus:ring-2 focus:ring-indigo-500/[0.11]
-                      transition-[border-color,box-shadow] duration-150">
-      </div>
+          <template x-for="field in row" :key="field.name">
+            <div>
 
-      <!-- Query -->
-      <div>
-        <label class="block text-[10.5px] font-mono font-medium text-[#38385a]
-                      uppercase tracking-[0.08em] mb-[7px]">
-          Query
-          <span class="normal-case text-[#28283e] font-normal ml-1.5 tracking-normal">
-            — include <code class="text-indigo-500/60">{range_filter}</code> placeholder
-          </span>
-        </label>
-        <textarea x-model="form.query" rows="8"
-                  placeholder="SELECT symbol, date_trunc('minute', ts) AS minute, ...
-FROM iceberg.market_data.trades
-WHERE {range_filter}
-GROUP BY 1, 2"
+              <!-- Label -->
+              <label class="block text-[10.5px] font-mono font-medium text-[#38385a]
+                            uppercase tracking-[0.08em] mb-[7px]">
+                <span x-text="field.label"></span>
+                <template x-if="field.help">
+                  <span class="normal-case text-[#28283e] font-normal ml-1.5 tracking-normal">
+                    — <span x-text="field.help"></span>
+                  </span>
+                </template>
+                <template x-if="!field.required && !field.help">
+                  <span class="text-[#1e1e30] font-normal normal-case tracking-normal">(optional)</span>
+                </template>
+              </label>
+
+              <!-- text (multi-line) -->
+              <template x-if="field.type === 'text'">
+                <textarea
+                  x-model="form[field.name]"
+                  :rows="field.rows || 6"
+                  :placeholder="field.placeholder"
                   class="w-full bg-[#07070c] border border-[rgba(255,255,255,0.065)] rounded-[10px]
                          px-3 py-[10px] text-[12px] font-mono text-[#9090aa] placeholder-[#22223a]
                          leading-[1.75] resize-y
                          focus:outline-none focus:border-indigo-500/45
                          focus:ring-2 focus:ring-indigo-500/[0.11]
                          transition-[border-color,box-shadow] duration-150"></textarea>
-      </div>
+              </template>
 
-      <!-- Filter Column + Granularity -->
-      <div class="grid grid-cols-2 gap-3">
-        <div>
-          <label class="block text-[10.5px] font-mono font-medium text-[#38385a]
-                        uppercase tracking-[0.08em] mb-[7px]">Filter Column</label>
-          <input x-model="form.filter_column" type="text" placeholder="ts"
-                 class="w-full bg-[#07070c] border border-[rgba(255,255,255,0.065)] rounded-[10px]
-                        px-3 py-[10px] text-[13px] font-mono text-[#cccce0] placeholder-[#22223a]
-                        focus:outline-none focus:border-indigo-500/45
-                        focus:ring-2 focus:ring-indigo-500/[0.11]
-                        transition-[border-color,box-shadow] duration-150">
-        </div>
-        <div>
-          <label class="block text-[10.5px] font-mono font-medium text-[#38385a]
-                        uppercase tracking-[0.08em] mb-[7px]">Granularity</label>
-          <div class="relative">
-            <select x-model="form.filter_granularity"
-                    class="w-full bg-[#07070c] border border-[rgba(255,255,255,0.065)] rounded-[10px]
-                           px-3 py-[10px] text-[13px] font-mono text-[#cccce0] appearance-none
+              <!-- number -->
+              <template x-if="field.type === 'number'">
+                <div class="flex items-center gap-2">
+                  <input
+                    x-model.number="form[field.name]"
+                    type="number"
+                    :min="field.min"
+                    :placeholder="field.placeholder"
+                    class="w-28 bg-[#07070c] border border-[rgba(255,255,255,0.065)] rounded-[10px]
+                           px-3 py-[10px] text-[13px] font-mono tabular-nums text-[#cccce0]
                            focus:outline-none focus:border-indigo-500/45
                            focus:ring-2 focus:ring-indigo-500/[0.11]
                            transition-[border-color,box-shadow] duration-150">
-              <option value="" class="bg-[#0e0e16] text-[#9090aa]">auto (from query)</option>
-              <option value="minute" class="bg-[#0e0e16]">minute</option>
-              <option value="hour"   class="bg-[#0e0e16]">hour</option>
-              <option value="day"    class="bg-[#0e0e16]">day</option>
-              <option value="week"   class="bg-[#0e0e16]">week</option>
-              <option value="month"  class="bg-[#0e0e16]">month</option>
-            </select>
-            <div class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2">
-              <svg class="w-3.5 h-3.5 text-[#32324c]" fill="none" viewBox="0 0 24 24"
-                   stroke-width="2.5" stroke="currentColor">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5" />
-              </svg>
+                  <span x-show="field.suffix" x-text="field.suffix"
+                        class="text-[11px] font-mono text-[#38385a]"></span>
+                </div>
+              </template>
+
+              <!-- string / array (single-line input) -->
+              <template x-if="field.type === 'string' || field.type === 'array'">
+                <input
+                  x-model="form[field.name]"
+                  type="text"
+                  :placeholder="field.placeholder"
+                  :disabled="field.disabled_on_edit && editingView !== null"
+                  class="w-full bg-[#07070c] border border-[rgba(255,255,255,0.065)] rounded-[10px]
+                         px-3 py-[10px] text-[13px] font-mono text-[#cccce0] placeholder-[#22223a]
+                         focus:outline-none focus:border-indigo-500/45
+                         focus:ring-2 focus:ring-indigo-500/[0.11]
+                         disabled:opacity-40 disabled:cursor-not-allowed
+                         transition-[border-color,box-shadow] duration-150">
+              </template>
+
             </div>
-          </div>
-        </div>
-      </div>
+          </template>
 
-      <!-- Merge Keys -->
-      <div>
-        <label class="block text-[10.5px] font-mono font-medium text-[#38385a]
-                      uppercase tracking-[0.08em] mb-[7px]">
-          Merge Keys
-          <span class="normal-case text-[#28283e] font-normal ml-1.5 tracking-normal">— comma-separated</span>
-        </label>
-        <input x-model="form.merge_keys_str" type="text" placeholder="symbol, minute"
-               class="w-full bg-[#07070c] border border-[rgba(255,255,255,0.065)] rounded-[10px]
-                      px-3 py-[10px] text-[13px] font-mono text-[#cccce0] placeholder-[#22223a]
-                      focus:outline-none focus:border-indigo-500/45
-                      focus:ring-2 focus:ring-indigo-500/[0.11]
-                      transition-[border-color,box-shadow] duration-150">
-      </div>
-
-      <!-- Target Table + Partitioning -->
-      <div class="grid grid-cols-2 gap-3">
-        <div>
-          <label class="block text-[10.5px] font-mono font-medium text-[#38385a]
-                        uppercase tracking-[0.08em] mb-[7px]">
-            Target Table
-            <span class="text-[#1e1e30] font-normal normal-case tracking-normal">(optional)</span>
-          </label>
-          <input x-model="form.target_table" type="text" placeholder="auto-generated"
-                 class="w-full bg-[#07070c] border border-[rgba(255,255,255,0.065)] rounded-[10px]
-                        px-3 py-[10px] text-[13px] font-mono text-[#cccce0] placeholder-[#22223a]
-                        focus:outline-none focus:border-indigo-500/45
-                        focus:ring-2 focus:ring-indigo-500/[0.11]
-                        transition-[border-color,box-shadow] duration-150">
         </div>
-        <div>
-          <label class="block text-[10.5px] font-mono font-medium text-[#38385a]
-                        uppercase tracking-[0.08em] mb-[7px]">
-            Partitioning
-            <span class="text-[#1e1e30] font-normal normal-case tracking-normal">(optional)</span>
-          </label>
-          <input x-model="form.target_partitioning" type="text" placeholder="inherits from source"
-                 class="w-full bg-[#07070c] border border-[rgba(255,255,255,0.065)] rounded-[10px]
-                        px-3 py-[10px] text-[13px] font-mono text-[#cccce0] placeholder-[#22223a]
-                        focus:outline-none focus:border-indigo-500/45
-                        focus:ring-2 focus:ring-indigo-500/[0.11]
-                        transition-[border-color,box-shadow] duration-150">
-        </div>
-      </div>
-
-      <!-- Refresh Interval -->
-      <div>
-        <label class="block text-[10.5px] font-mono font-medium text-[#38385a]
-                      uppercase tracking-[0.08em] mb-[7px]">Refresh Interval (seconds)</label>
-        <input x-model.number="form.refresh_interval_seconds" type="number" min="1"
-               class="w-28 bg-[#07070c] border border-[rgba(255,255,255,0.065)] rounded-[10px]
-                      px-3 py-[10px] text-[13px] font-mono tabular-nums text-[#cccce0]
-                      focus:outline-none focus:border-indigo-500/45
-                      focus:ring-2 focus:ring-indigo-500/[0.11]
-                      transition-[border-color,box-shadow] duration-150">
-      </div>
+      </template>
 
     </div>
 
@@ -599,16 +528,38 @@ function app() {
     editingView: null,
     formError: '',
     refreshing: {},
-    form: {
-      name: '', source_table: '', query: '', merge_keys_str: '',
-      filter_column: '', filter_granularity: '',
-      target_table: '', target_partitioning: '',
-      refresh_interval_seconds: 60,
+    schema: [],
+    form: {},
+
+    get schemaRows() {
+      // Group consecutive fields sharing the same non-null `group` into a single row.
+      const rows = [];
+      let current = null;
+      for (const f of this.schema) {
+        if (f.group && current && current[0].group === f.group) {
+          current.push(f);
+        } else {
+          current = [f];
+          rows.push(current);
+        }
+      }
+      return rows;
     },
 
     async init() {
+      await this.loadSchema();
+      this.resetForm();
       await this.loadViews();
       setInterval(() => this.loadViews(), 5000);
+    },
+
+    async loadSchema() {
+      try {
+        const res = await fetch('/api/views/schema');
+        this.schema = await res.json();
+      } catch (e) {
+        console.error('Failed to load form schema:', e);
+      }
     },
 
     async loadViews() {
@@ -621,57 +572,67 @@ function app() {
     },
 
     resetForm() {
-      this.form = {
-        name: '', source_table: '', query: '', merge_keys_str: '',
-        filter_column: '', filter_granularity: '',
-        target_table: '', target_partitioning: '',
-        refresh_interval_seconds: 60,
-      };
+      const fresh = {};
+      for (const f of this.schema) {
+        fresh[f.name] = f.default !== undefined ? f.default
+                      : f.type === 'number' ? null
+                      : '';
+      }
+      this.form = fresh;
       this.formError = '';
     },
 
     editView(view) {
       this.editingView = view.name;
-      this.form = {
-        name: view.name,
-        source_table: view.source_table,
-        query: view.query,
-        merge_keys_str: view.merge_keys.join(', '),
-        filter_column: view.filter_column || '',
-        filter_granularity: view.filter_granularity || '',
-        target_table: view.target_table || '',
-        target_partitioning: view.target_partitioning || '',
-        refresh_interval_seconds: view.refresh_interval_seconds,
-      };
+      const populated = {};
+      for (const f of this.schema) {
+        const v = view[f.name];
+        if (f.type === 'array') {
+          populated[f.name] = Array.isArray(v) ? v.join(', ') : (v || '');
+        } else {
+          populated[f.name] = v != null ? v : '';
+        }
+      }
+      this.form = populated;
       this.formError = '';
       this.showForm = true;
     },
 
+    buildBody() {
+      const body = {};
+      for (const f of this.schema) {
+        const raw = this.form[f.name];
+        if (f.type === 'array') {
+          body[f.name] = String(raw || '').split(',').map(s => s.trim()).filter(Boolean);
+        } else if (f.type === 'number') {
+          body[f.name] = raw;
+        } else if (f.required) {
+          body[f.name] = raw;
+        } else {
+          body[f.name] = raw || null;
+        }
+      }
+      return body;
+    },
+
+    validateForm() {
+      for (const f of this.schema) {
+        if (!f.required) continue;
+        const v = this.form[f.name];
+        const empty = f.type === 'array'
+          ? String(v || '').split(',').map(s => s.trim()).filter(Boolean).length === 0
+          : v === '' || v == null;
+        if (empty) return `${f.label} is required.`;
+      }
+      return null;
+    },
+
     async submitForm() {
       this.formError = '';
-      const keys = this.form.merge_keys_str.split(',').map(s => s.trim()).filter(Boolean);
+      const err = this.validateForm();
+      if (err) { this.formError = err; return; }
 
-      if (!this.form.name || !this.form.source_table || !this.form.query
-          || keys.length === 0 || !this.form.filter_column) {
-        this.formError = 'Name, source table, query, filter column, and merge keys are required.';
-        return;
-      }
-      if (!this.form.query.includes('{range_filter}')) {
-        this.formError = 'Query must contain the {range_filter} placeholder.';
-        return;
-      }
-
-      const body = {
-        name: this.form.name,
-        source_table: this.form.source_table,
-        query: this.form.query,
-        merge_keys: keys,
-        filter_column: this.form.filter_column,
-        filter_granularity: this.form.filter_granularity || null,
-        target_table: this.form.target_table || null,
-        target_partitioning: this.form.target_partitioning || null,
-        refresh_interval_seconds: this.form.refresh_interval_seconds,
-      };
+      const body = this.buildBody();
 
       try {
         if (this.editingView) {
