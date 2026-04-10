@@ -16,8 +16,7 @@ CONFIG_YAML = textwrap.dedent("""\
       - name: test_view
         source_table: iceberg.db.trades
         filter_column: ts
-        filter_granularity: day
-        query: "SELECT a, b FROM t WHERE {range_filter} GROUP BY 1"
+        query: "SELECT date_trunc('day', ts) AS d, a FROM t WHERE {range_filter} GROUP BY 1, 2"
         merge_keys: [a]
 """)
 

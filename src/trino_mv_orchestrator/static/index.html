@@ -152,26 +152,11 @@ GROUP BY 1, 2"
                            focus:outline-none focus:border-blue-600 resize-y"></textarea>
         </div>
 
-        <div class="grid grid-cols-2 gap-4">
-          <div>
-            <label class="block text-xs text-gray-500 mb-1.5">Filter Column</label>
-            <input x-model="form.filter_column" type="text" placeholder="ts"
-                   class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm
-                          focus:outline-none focus:border-blue-600">
-          </div>
-          <div>
-            <label class="block text-xs text-gray-500 mb-1.5">Filter Granularity</label>
-            <select x-model="form.filter_granularity"
-                    class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm
-                           focus:outline-none focus:border-blue-600">
-              <option value="">auto (from query)</option>
-              <option value="minute">minute</option>
-              <option value="hour">hour</option>
-              <option value="day">day</option>
-              <option value="week">week</option>
-              <option value="month">month</option>
-            </select>
-          </div>
+        <div>
+          <label class="block text-xs text-gray-500 mb-1.5">Filter Column</label>
+          <input x-model="form.filter_column" type="text" placeholder="ts"
+                 class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm
+                        focus:outline-none focus:border-blue-600">
         </div>
 
         <div>
@@ -231,7 +216,7 @@ function app() {
     refreshing: {},
     form: {
       name: '', source_table: '', query: '', merge_keys_str: '',
-      filter_column: '', filter_granularity: '',
+      filter_column: '',
       target_table: '', target_partitioning: '', refresh_interval_seconds: 60,
     },
 
@@ -263,7 +248,6 @@ function app() {
         query: view.query,
         merge_keys_str: view.merge_keys.join(', '),
         filter_column: view.filter_column || '',
-        filter_granularity: view.filter_granularity || '',
         target_table: view.target_table || '',
         target_partitioning: view.target_partitioning || '',
         refresh_interval_seconds: view.refresh_interval_seconds,
@@ -290,7 +274,6 @@ function app() {
         query: this.form.query,
         merge_keys: keys,
         filter_column: this.form.filter_column,
-        filter_granularity: this.form.filter_granularity || null,
         target_table: this.form.target_table || null,
         target_partitioning: this.form.target_partitioning || null,
         refresh_interval_seconds: this.form.refresh_interval_seconds,

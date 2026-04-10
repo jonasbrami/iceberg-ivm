@@ -300,7 +300,6 @@ class ViewCreate(BaseModel):
     query: str
     merge_keys: tuple[str, ...]
     filter_column: str
-    filter_granularity: str | None = None
     target_table: str | None = None
     target_partitioning: str | None = None
     refresh_interval_seconds: int = 60
@@ -391,19 +390,10 @@ def create_view(
     if any(v.name == body.name for v in s.config.views):
         raise HTTPException(409, f"view '{body.name}' already exists")
 
-    resolved_granularity = body.filter_granularity
-    if resolved_granularity is None:
+    try:
         resolved_granularity = infer_granularity(body.query)
-        if resolved_granularity is None:
-            raise HTTPException(
-                422,
-                f"filter_granularity not specified and could not be inferred from "
-                f"query. Set it explicitly to one of: {', '.join(VALID_GRANULARITIES)}",
-            )
-    elif resolved_granularity not in VALID_GRANULARITIES:
-        raise HTTPException(
-            422, f"filter_granularity must be one of {VALID_GRANULARITIES}",
-        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
 
     new_view = ViewConfig(
         name=body.name, source_table=body.source_table, query=body.query,

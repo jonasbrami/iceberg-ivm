@@ -163,6 +163,21 @@ def snap_range(
         else:
             end = max_ts.replace(month=max_ts.month + 1, day=1,
                                  hour=0, minute=0, second=0, microsecond=0)
+    elif granularity == "quarter":
+        q_start = ((min_ts.month - 1) // 3) * 3 + 1
+        start = min_ts.replace(month=q_start, day=1, hour=0, minute=0, second=0, microsecond=0)
+        q_start_max = ((max_ts.month - 1) // 3) * 3 + 1
+        next_q = q_start_max + 3
+        if next_q > 12:
+            end = max_ts.replace(year=max_ts.year + 1, month=next_q - 12, day=1,
+                                 hour=0, minute=0, second=0, microsecond=0)
+        else:
+            end = max_ts.replace(month=next_q, day=1,
+                                 hour=0, minute=0, second=0, microsecond=0)
+    elif granularity == "year":
+        start = min_ts.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = max_ts.replace(year=max_ts.year + 1, month=1, day=1,
+                             hour=0, minute=0, second=0, microsecond=0)
     else:
         raise ValueError(f"unsupported granularity: {granularity}")
 

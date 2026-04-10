@@ -12,6 +12,7 @@ trino:
 views:
   - name: ohlcv_1m
     source_table: iceberg.market_data.trades
+    filter_column: ts
     query: |
       SELECT
         symbol,
@@ -29,24 +30,3 @@ views:
     target_table: iceberg.analytics.ohlcv_1m
     target_partitioning: "ARRAY['day(minute)']"
     refresh_interval_seconds: 30
-
-  - name: ohlcv_5m
-    source_table: iceberg.analytics.ohlcv_1m
-    query: |
-      SELECT
-        symbol,
-        date_trunc('minute', minute)
-          - (extract(minute FROM minute) % 5) * INTERVAL '1' MINUTE AS bar,
-        min_by(open, minute) AS open,
-        max(high) AS high,
-        min(low) AS low,
-        max_by(close, minute) AS close,
-        sum(volume) AS volume,
-        sum(trade_count) AS trade_count
-      FROM iceberg.analytics.ohlcv_1m
-      WHERE {range_filter}
-      GROUP BY 1, 2
-    merge_keys: [symbol, bar]
-    target_table: iceberg.analytics.ohlcv_5m
-    target_partitioning: "ARRAY['day(bar)']"
-    refresh_interval_seconds: 60

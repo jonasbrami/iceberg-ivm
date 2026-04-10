@@ -45,6 +45,94 @@ sequenceDiagram
 4. **Refresh** -- `MERGE INTO` with a plain column range filter (Trino pushes down to partition pruning)
 5. **Persist** -- store snapshot ID in target table's Iceberg properties
 
+### `date_trunc` and `snap_range`: forward and inverse
+
+The entire incremental refresh correctness depends on one thing: given the
+min/max timestamps from new files, compute a filter range that covers **every
+complete GROUP BY bucket** touched by that data. This is done by inverting
+the `date_trunc` function used in the query's GROUP BY.
+
+```mermaid
+flowchart TB
+    subgraph forward["<b>Forward: date_trunc('hour', ts)</b> — many timestamps → one bucket"]
+        direction LR
+        t1["09:15:42"] & t2["09:47:03"] -->|date_trunc| b1["<b>09:00</b>"]
+        t3["10:22:18"] & t4["10:55:31"] -->|date_trunc| b2["<b>10:00</b>"]
+    end
+
+    subgraph inverse["<b>Inverse: snap_range('hour')</b> — file stats → complete bucket boundaries"]
+        direction LR
+        stats["file stats<br/><b>min=09:15, max=10:55</b>"]
+        snap["snap_range"]
+        result["filter range<br/><b>[09:00, 11:00)</b>"]
+        stats --> snap --> result
+    end
+
+    forward -..->|"snap_range reverses date_trunc"| inverse
+
+    style forward fill:#1a1a2e,stroke:#16213e,color:#e0e0e0
+    style inverse fill:#0f3460,stroke:#16213e,color:#e0e0e0
+    style b1 fill:#2d6a4f,stroke:#40916c,color:#fff
+    style b2 fill:#2d6a4f,stroke:#40916c,color:#fff
+    style result fill:#2d6a4f,stroke:#40916c,color:#fff
+```
+
+`date_trunc` is a **many-to-one** function: it maps every timestamp within a
+bucket to the same boundary value. `snap_range` is its inverse: it expands a
+raw timestamp range outward to the nearest bucket boundaries so the filter
+captures all rows that belong to any touched bucket.
+
+```mermaid
+flowchart LR
+    subgraph timeline["Timeline"]
+        direction LR
+        h08["08:00"]
+        h09["09:00"]
+        h10["10:00"]
+        h11["11:00"]
+        h12["12:00"]
+    end
+
+    subgraph filestats["New files"]
+        fs["min = 09:15<br/>max = 10:55"]
+    end
+
+    subgraph snapresult["snap_range result"]
+        direction TB
+        floor["<b>floor</b>(09:15) = 09:00"]
+        ceil["<b>ceil</b>(10:55) = 11:00"]
+    end
+
+    subgraph filter["WHERE ts >= 09:00 AND ts < 11:00"]
+        direction TB
+        covered["Covers complete buckets<br/><b>[09:00, 10:00)</b> and <b>[10:00, 11:00)</b><br/><br/>All rows in both buckets are<br/>included in the GROUP BY →<br/>MERGE produces correct aggregates"]
+    end
+
+    fs --> floor & ceil
+    floor --> h09
+    ceil --> h11
+    h09 & h10 & h11 --> covered
+
+    style filestats fill:#4a1942,stroke:#6b2d5b,color:#e0e0e0
+    style snapresult fill:#0f3460,stroke:#16213e,color:#e0e0e0
+    style filter fill:#2d6a4f,stroke:#40916c,color:#e0e0e0
+```
+
+The two operations mirror each other exactly:
+
+| | `date_trunc('hour', ts)` | `snap_range('hour')` |
+|---|---|---|
+| **Direction** | timestamp → bucket start | timestamp range → bucket-aligned range |
+| **Operation** | floor to `:00:00` | floor min to `:00:00`, ceil max to next `:00:00` |
+| **Used in** | `GROUP BY` (query) | `WHERE` filter (orchestrator) |
+| **Guarantees** | rows are grouped by hour | filter covers complete hours |
+
+This is why only simple `date_trunc` is allowed: for any `date_trunc('X', col)`,
+the inverse is trivially computable by `snap_range('X')`. Complex expressions
+(e.g. 5-minute bars via arithmetic) break this — the bucket width can't be
+reliably inferred, and the inverse would produce a too-narrow filter that
+corrupts aggregates.
+
 ## Quick start
 
 ```bash
@@ -75,7 +163,6 @@ views:
   - name: ohlcv_1m
     source_table: iceberg.market_data.trades
     filter_column: ts
-    # filter_granularity inferred as "minute" from date_trunc('minute', ts)
     query: |
       SELECT
         symbol,
@@ -89,9 +176,9 @@ views:
     merge_keys: [symbol, minute]
 ```
 
-`filter_granularity` is automatically inferred from `date_trunc('minute', ts)` in
-the query. See [Granularity inference](#granularity-inference) for details and
-when you need to set it explicitly.
+`filter_granularity` is always inferred from `date_trunc('X', col)` in the query.
+Only simple `date_trunc` expressions are supported — complex arithmetic expressions
+are rejected. See [Granularity inference](#granularity-inference) for details.
 
 The orchestrator auto-discovers column types (`DESCRIBE OUTPUT`), creates the
 target table, and starts refreshing. Views can also be managed from the web UI.
@@ -103,7 +190,7 @@ target table, and starts refreshing. Views can also be managed from the web UI.
 | `name` | yes | Unique view name |
 | `source_table` | yes | Fully qualified Iceberg source table |
 | `filter_column` | yes | Column to read min/max stats for (must have Iceberg column stats) |
-| `filter_granularity` | no | `minute`, `hour`, `day`, `week`, or `month`. Auto-inferred from `date_trunc` in query when omitted. Required for complex expressions (see below). |
+| `filter_granularity` | -- | Always inferred from `date_trunc('X', col)` in the query. Supported: `minute`, `hour`, `day`, `week`, `month`, `quarter`, `year`. |
 | `query` | yes | SELECT with `{range_filter}` placeholder in WHERE clause |
 | `merge_keys` | yes | Columns forming the MERGE ON clause (must be unique in output) |
 | `target_table` | no | Defaults to `{catalog}.{schema}.{name}` |
@@ -171,36 +258,29 @@ graph LR
     style W fill:#2d6a4f,stroke:#40916c
 ```
 
-The `filter_granularity: week` setting snaps the file-stats range to complete
+The inferred `filter_granularity` (`week`) snaps the file-stats range to complete
 week boundaries, so the MERGE query reads Mon+Tue+Wed and produces a correct
 weekly bar.
 
 ## Granularity inference
 
-When `filter_granularity` is omitted, the orchestrator parses
-`date_trunc('X', ...)` from the query and uses `X` as the granularity:
+The orchestrator parses `date_trunc('X', col)` from the query and uses `X` as
+the granularity. This is always automatic — there is no manual override.
 
 ```
-date_trunc('minute', ts) AS minute   →  inferred: minute
-date_trunc('hour', ts) AS hour       →  inferred: hour
-date_trunc('week', ts) AS week       →  inferred: week
+date_trunc('minute', ts) AS minute     →  minute
+date_trunc('hour', ts) AS hour         →  hour
+date_trunc('day', ts) AS day           →  day
+date_trunc('week', ts) AS week         →  week
+date_trunc('month', ts) AS month       →  month
+date_trunc('quarter', ts) AS quarter   →  quarter
+date_trunc('year', ts) AS year         →  year
 ```
 
-Inference is **not attempted** when `date_trunc` appears inside arithmetic
-expressions. For example, 5-minute bars use `date_trunc` as a helper but the
-real bucket is 5 minutes:
-
-```sql
--- Inference skipped: date_trunc is part of arithmetic
-date_trunc('minute', minute)
-  - (extract(minute FROM minute) % 5) * INTERVAL '1' MINUTE AS bar
-```
-
-In these cases, set `filter_granularity` explicitly. The value must be at least
-as coarse as the real GROUP BY bucket to avoid data loss:
-
-- **Too fine** (e.g. `minute` for weekly GROUP BY) → **data loss**
-- **Too coarse** (e.g. `month` for minute GROUP BY) → correct but wasteful
+Only simple `date_trunc('X', col)` is allowed. Complex arithmetic expressions
+around `date_trunc` (e.g. 5-minute bars via subtraction) are **rejected** because
+the bucket width cannot be reliably inferred, leading to correctness issues with
+partial-bucket refreshes.
 
 ## Limitations
 

@@ -16,7 +16,7 @@ def make_view(**overrides) -> ViewConfig:
     defaults = dict(
         name="ohlcv_1m",
         source_table="iceberg.market_data.trades",
-        query="SELECT symbol, minute, open FROM t WHERE {range_filter} GROUP BY 1, 2",
+        query="SELECT symbol, date_trunc('day', ts) AS minute, open FROM t WHERE {range_filter} GROUP BY 1, 2",
         merge_keys=("symbol", "minute"),
         filter_column="ts",
         filter_granularity="day",

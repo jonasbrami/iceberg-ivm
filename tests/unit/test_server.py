@@ -20,8 +20,7 @@ CONFIG_YAML = textwrap.dedent("""\
       - name: test_view
         source_table: iceberg.db.trades
         filter_column: ts
-        filter_granularity: day
-        query: "SELECT a, b FROM t WHERE {range_filter} GROUP BY 1"
+        query: "SELECT date_trunc('day', ts) AS d, a FROM t WHERE {range_filter} GROUP BY 1, 2"
         merge_keys: [a]
 """)
 
@@ -75,11 +74,11 @@ def test_create_view(client, setup_state):
         "name": "new_view",
         "source_table": "iceberg.db.t",
         "filter_column": "ts",
-        "filter_granularity": "day",
-        "query": "SELECT x FROM t WHERE {range_filter}",
+        "query": "SELECT date_trunc('day', ts) AS d FROM t WHERE {range_filter} GROUP BY 1",
         "merge_keys": ["x"],
     })
     assert r.status_code == 201
+    assert r.json()["filter_granularity"] == "day"
     assert len(setup_state.config.views) == 2
 
 
@@ -89,8 +88,7 @@ def test_create_view_invalid_name(client):
         "name": "bad-name",
         "source_table": "iceberg.db.t",
         "filter_column": "ts",
-        "filter_granularity": "day",
-        "query": "SELECT x FROM t WHERE {range_filter}",
+        "query": "SELECT date_trunc('day', ts) AS d FROM t WHERE {range_filter} GROUP BY 1",
         "merge_keys": ["x"],
     })
     assert r.status_code == 422
@@ -101,8 +99,7 @@ def test_create_duplicate(client):
         "name": "test_view",
         "source_table": "t",
         "filter_column": "ts",
-        "filter_granularity": "day",
-        "query": "q {range_filter}",
+        "query": "SELECT date_trunc('day', ts) AS d FROM t WHERE {range_filter} GROUP BY 1",
         "merge_keys": ["a"],
     })
     assert r.status_code == 409
@@ -152,8 +149,7 @@ def test_reload_config_on_mtime_change(setup_state, tmp_path):
         "  - name: second_view\n"
         "    source_table: iceberg.db.other\n"
         "    filter_column: ts\n"
-        "    filter_granularity: day\n"
-        '    query: "SELECT x FROM t2 WHERE {range_filter}"\n'
+        '    query: "SELECT date_trunc(\'hour\', ts) AS h FROM t2 WHERE {range_filter} GROUP BY 1"\n'
         "    merge_keys: [x]\n"
     )
     setup_state.config_path.write_text(new_yaml)
@@ -202,19 +198,6 @@ def test_create_view_infers_granularity(client, setup_state):
     assert r.json()["filter_granularity"] == "hour"
 
 
-def test_create_view_explicit_overrides(client, setup_state):
-    r = client.post("/api/views", json={
-        "name": "explicit_view",
-        "source_table": "iceberg.db.t",
-        "filter_column": "ts",
-        "filter_granularity": "day",
-        "query": "SELECT date_trunc('hour', ts) AS h FROM t WHERE {range_filter} GROUP BY 1",
-        "merge_keys": ["h"],
-    })
-    assert r.status_code == 201
-    assert r.json()["filter_granularity"] == "day"
-
-
 def test_create_view_fails_when_cannot_infer(client, setup_state):
     r = client.post("/api/views", json={
         "name": "fail_view",
@@ -224,3 +207,16 @@ def test_create_view_fails_when_cannot_infer(client, setup_state):
         "merge_keys": ["ts"],
     })
     assert r.status_code == 422
+    assert "date_trunc" in r.json()["detail"]
+
+
+def test_create_view_fails_on_complex_expr(client, setup_state):
+    r = client.post("/api/views", json={
+        "name": "complex_view",
+        "source_table": "iceberg.db.t",
+        "filter_column": "ts",
+        "query": "SELECT date_trunc('minute', ts) - INTERVAL '5' MINUTE AS x FROM t WHERE {range_filter} GROUP BY 1",
+        "merge_keys": ["x"],
+    })
+    assert r.status_code == 422
+    assert "complex" in r.json()["detail"]
