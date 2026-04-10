@@ -22,7 +22,8 @@ from trino_mv_orchestrator.config import (
     _validate_qualified_name,
     infer_granularity,
     load_config,
-    save_config,
+    load_views,
+    save_views,
 )
 from trino_mv_orchestrator.detector import RefreshAction, detect_changes
 from trino_mv_orchestrator.executor import execute_full_refresh, execute_incremental_refresh
@@ -94,20 +95,28 @@ class ViewStatus:
 @dataclass
 class AppState:
     config_path: Path = field(default_factory=lambda: Path("config.yaml"))
+    views_path: Path = field(default_factory=lambda: Path("views.yaml"))
     config: Config | None = None
     config_mtime: float = 0
+    views_mtime: float = 0
     view_statuses: dict[str, ViewStatus] = field(default_factory=dict)
     _stop: bool = False
 
 
-# ── Config path bootstrap (set by CLI before uvicorn starts) ──
+# ── Path bootstrap (set by CLI before uvicorn starts) ──
 
 _config_path: Path = Path("config.yaml")
+_views_path: Path = Path("views.yaml")
 
 
 def set_config_path(path: Path) -> None:
     global _config_path
     _config_path = path
+
+
+def set_views_path(path: Path) -> None:
+    global _views_path
+    _views_path = path
 
 
 # ── Dependency injection ──
@@ -134,25 +143,31 @@ def resolve_target_table(view: ViewConfig, cfg: Config) -> str:
 
 def reload_config(s: AppState) -> bool:
     try:
-        mtime = s.config_path.stat().st_mtime
+        config_mtime = s.config_path.stat().st_mtime
     except FileNotFoundError:
         log.warning("config file not found: %s", s.config_path)
         return False
-    if mtime <= s.config_mtime:
+    views_mtime = s.views_path.stat().st_mtime if s.views_path.exists() else 0
+    if config_mtime <= s.config_mtime and views_mtime <= s.views_mtime:
         return False
     try:
         new_cfg = load_config(s.config_path)
-        s.config = new_cfg
-        s.config_mtime = mtime
-        VIEWS_CONFIGURED.set(len(new_cfg.views))
+        new_views = load_views(s.views_path)
+        s.config = Config(trino=new_cfg.trino, views=new_views, server=new_cfg.server)
+        s.config_mtime = config_mtime
+        s.views_mtime = views_mtime
+        VIEWS_CONFIGURED.set(len(new_views))
         CONFIG_RELOADS.inc()
-        log.info("config reloaded from %s: %d views", s.config_path, len(new_cfg.views))
-        for v in new_cfg.views:
+        log.info(
+            "config reloaded from %s + %s: %d views",
+            s.config_path, s.views_path, len(new_views),
+        )
+        for v in new_views:
             if v.name not in s.view_statuses:
                 s.view_statuses[v.name] = ViewStatus(name=v.name)
         return True
     except Exception:
-        log.exception("failed to reload config from %s", s.config_path)
+        log.exception("failed to reload config")
         return False
 
 
@@ -270,7 +285,7 @@ async def lifespan(app: FastAPI):
         s = app.state.s
         log.info("using pre-seeded app state")
     else:
-        s = AppState(config_path=_config_path)
+        s = AppState(config_path=_config_path, views_path=_views_path)
         reload_config(s)
         app.state.s = s
 
@@ -414,9 +429,9 @@ def create_view(
     )
     new_views = list(s.config.views) + [new_view]
     new_cfg = Config(trino=s.config.trino, views=new_views, server=s.config.server)
-    save_config(new_cfg, s.config_path)
+    save_views(new_views, s.views_path)
     s.config = new_cfg
-    s.config_mtime = s.config_path.stat().st_mtime
+    s.views_mtime = s.views_path.stat().st_mtime
     s.view_statuses[body.name] = ViewStatus(name=body.name)
     VIEWS_CONFIGURED.set(len(new_views))
     log.info("created view %r via API", body.name)
@@ -438,9 +453,9 @@ def delete_view(name: str, s: AppState = Depends(get_app_state)):
         raise HTTPException(404, f"view '{name}' not found")
     new_views = [v for v in s.config.views if v.name != name]
     new_cfg = Config(trino=s.config.trino, views=new_views, server=s.config.server)
-    save_config(new_cfg, s.config_path)
+    save_views(new_views, s.views_path)
     s.config = new_cfg
-    s.config_mtime = s.config_path.stat().st_mtime
+    s.views_mtime = s.views_path.stat().st_mtime
     s.view_statuses.pop(name, None)
     VIEWS_CONFIGURED.set(len(new_views))
     log.info("deleted view %r via API", name)
