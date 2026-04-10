@@ -4,25 +4,25 @@ Stores mv.last_source_snapshot — the last processed source snapshot ID.
 """
 from __future__ import annotations
 
+import logging
+
+from trino_mv_orchestrator.detector import system_table
+
+log = logging.getLogger(__name__)
+
 SNAPSHOT_KEY = "mv.last_source_snapshot"
-
-
-def _properties_table(table: str) -> str:
-    """Build reference to the $properties system table."""
-    parts = table.rsplit(".", 1)
-    if len(parts) == 1:
-        return f'"{parts[0]}$properties"'
-    return f'{parts[0]}."{parts[1]}$properties"'
 
 
 def read_last_snapshot(cursor, target_table: str) -> int | None:
     """Read last processed source snapshot ID from target table properties."""
     cursor.execute(
-        f"SELECT value FROM {_properties_table(target_table)} "
+        f"SELECT value FROM {system_table(target_table, 'properties')} "
         f"WHERE key = '{SNAPSHOT_KEY}'"
     )
     row = cursor.fetchone()
-    return int(row[0]) if row else None
+    snapshot_id = int(row[0]) if row else None
+    log.debug("read last_snapshot=%s from %s", snapshot_id, target_table)
+    return snapshot_id
 
 
 def write_last_snapshot(cursor, target_table: str, snapshot_id: int) -> None:
@@ -34,3 +34,4 @@ def write_last_snapshot(cursor, target_table: str, snapshot_id: int) -> None:
         f"ARRAY['{snapshot_id}']"
         f")"
     )
+    log.info("wrote last_snapshot=%d to %s", snapshot_id, target_table)

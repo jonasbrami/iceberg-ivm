@@ -75,7 +75,7 @@ views:
   - name: ohlcv_1m
     source_table: iceberg.market_data.trades
     filter_column: ts
-    filter_granularity: minute
+    # filter_granularity inferred as "minute" from date_trunc('minute', ts)
     query: |
       SELECT
         symbol,
@@ -89,6 +89,10 @@ views:
     merge_keys: [symbol, minute]
 ```
 
+`filter_granularity` is automatically inferred from `date_trunc('minute', ts)` in
+the query. See [Granularity inference](#granularity-inference) for details and
+when you need to set it explicitly.
+
 The orchestrator auto-discovers column types (`DESCRIBE OUTPUT`), creates the
 target table, and starts refreshing. Views can also be managed from the web UI.
 
@@ -99,7 +103,7 @@ target table, and starts refreshing. Views can also be managed from the web UI.
 | `name` | yes | Unique view name |
 | `source_table` | yes | Fully qualified Iceberg source table |
 | `filter_column` | yes | Column to read min/max stats for (must have Iceberg column stats) |
-| `filter_granularity` | yes | `minute`, `hour`, `day`, `week`, or `month` -- must match GROUP BY granularity |
+| `filter_granularity` | no | `minute`, `hour`, `day`, `week`, or `month`. Auto-inferred from `date_trunc` in query when omitted. Required for complex expressions (see below). |
 | `query` | yes | SELECT with `{range_filter}` placeholder in WHERE clause |
 | `merge_keys` | yes | Columns forming the MERGE ON clause (must be unique in output) |
 | `target_table` | no | Defaults to `{catalog}.{schema}.{name}` |
@@ -171,17 +175,39 @@ The `filter_granularity: week` setting snaps the file-stats range to complete
 week boundaries, so the MERGE query reads Mon+Tue+Wed and produces a correct
 weekly bar.
 
+## Granularity inference
+
+When `filter_granularity` is omitted, the orchestrator parses
+`date_trunc('X', ...)` from the query and uses `X` as the granularity:
+
+```
+date_trunc('minute', ts) AS minute   →  inferred: minute
+date_trunc('hour', ts) AS hour       →  inferred: hour
+date_trunc('week', ts) AS week       →  inferred: week
+```
+
+Inference is **not attempted** when `date_trunc` appears inside arithmetic
+expressions. For example, 5-minute bars use `date_trunc` as a helper but the
+real bucket is 5 minutes:
+
+```sql
+-- Inference skipped: date_trunc is part of arithmetic
+date_trunc('minute', minute)
+  - (extract(minute FROM minute) % 5) * INTERVAL '1' MINUTE AS bar
+```
+
+In these cases, set `filter_granularity` explicitly. The value must be at least
+as coarse as the real GROUP BY bucket to avoid data loss:
+
+- **Too fine** (e.g. `minute` for weekly GROUP BY) → **data loss**
+- **Too coarse** (e.g. `month` for minute GROUP BY) → correct but wasteful
+
 ## Limitations
 
 ### Query shape
 
 The query must be a `SELECT ... GROUP BY` over a **single source table** with
 a `{range_filter}` in the WHERE clause.
-
-`filter_granularity` **must match** the GROUP BY time granularity:
-- Too fine (e.g. `minute` for weekly GROUP BY) → **data loss** (reads only
-  the minute range of new files, misses other days in the week)
-- Too coarse (e.g. `month` for minute GROUP BY) → correct but wasteful
 
 ### Not supported
 

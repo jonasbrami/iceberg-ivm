@@ -5,8 +5,6 @@ import json
 import re
 from dataclasses import dataclass
 
-from trino_mv_orchestrator.detector import _system_table
-
 
 @dataclass(frozen=True)
 class ColumnInfo:

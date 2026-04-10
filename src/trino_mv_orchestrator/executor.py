@@ -3,11 +3,29 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime
 
 from trino_mv_orchestrator.config import ViewConfig
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class RefreshResult:
+    """Statistics from a refresh execution."""
+    elapsed: float
+    processed_rows: int = 0
+    processed_bytes: int = 0
+
+
+def _extract_stats(cursor) -> dict:
+    """Extract processedRows/processedBytes from Trino cursor stats."""
+    stats = getattr(cursor, "stats", None) or {}
+    return {
+        "processed_rows": stats.get("processedRows", 0) or 0,
+        "processed_bytes": stats.get("processedBytes", 0) or 0,
+    }
 
 
 def format_ts(ts: datetime) -> str:
@@ -40,7 +58,7 @@ def build_merge_sql(
 
     on_clause = " AND ".join(f"t.{k} = s.{k}" for k in view.merge_keys)
     update_sets = ", ".join(f"{col} = s.{col}" for col in value_columns)
-    all_columns = view.merge_keys + value_columns
+    all_columns = list(view.merge_keys) + value_columns
     insert_cols = ", ".join(all_columns)
     insert_vals = ", ".join(f"s.{col}" for col in all_columns)
 
@@ -53,19 +71,23 @@ def build_merge_sql(
     )
 
 
-def execute_full_refresh(cursor, view: ViewConfig, target_table: str) -> float:
-    """Full refresh: DELETE all + INSERT all. Returns elapsed seconds."""
+def execute_full_refresh(cursor, view: ViewConfig, target_table: str) -> RefreshResult:
+    """Full refresh: DELETE all + INSERT all. Returns RefreshResult."""
     start = time.monotonic()
-    log.info("%s: full refresh — deleting target", view.name)
+    log.info("%s: full refresh — deleting target %s", view.name, target_table)
     cursor.execute(f"DELETE FROM {target_table} WHERE true")
 
     query = view.query.replace("{range_filter}", "true")
-    log.info("%s: full refresh — inserting", view.name)
+    log.info("%s: full refresh — inserting into %s", view.name, target_table)
     cursor.execute(f"INSERT INTO {target_table} {query}")
 
     elapsed = time.monotonic() - start
-    log.info("%s: full refresh complete (%.1fs)", view.name, elapsed)
-    return elapsed
+    stats = _extract_stats(cursor)
+    log.info(
+        "%s: full refresh complete (%.1fs, %d rows, %d bytes)",
+        view.name, elapsed, stats["processed_rows"], stats["processed_bytes"],
+    )
+    return RefreshResult(elapsed=elapsed, **stats)
 
 
 def execute_incremental_refresh(
@@ -74,8 +96,8 @@ def execute_incremental_refresh(
     target_table: str,
     value_columns: list[str],
     filter_range: tuple[datetime, datetime],
-) -> float:
-    """Incremental refresh via atomic MERGE on a time range. Returns elapsed seconds."""
+) -> RefreshResult:
+    """Incremental refresh via atomic MERGE on a time range. Returns RefreshResult."""
     start_time = time.monotonic()
     range_start, range_end = filter_range
 
@@ -86,8 +108,13 @@ def execute_incremental_refresh(
         "%s: incremental refresh — %s in [%s, %s)",
         view.name, view.filter_column, range_start, range_end,
     )
+    log.debug("%s: executing MERGE:\n%s", view.name, merge_sql)
     cursor.execute(merge_sql)
 
     elapsed = time.monotonic() - start_time
-    log.info("%s: incremental refresh complete (%.1fs)", view.name, elapsed)
-    return elapsed
+    stats = _extract_stats(cursor)
+    log.info(
+        "%s: incremental refresh complete (%.1fs, %d rows, %d bytes)",
+        view.name, elapsed, stats["processed_rows"], stats["processed_bytes"],
+    )
+    return RefreshResult(elapsed=elapsed, **stats)

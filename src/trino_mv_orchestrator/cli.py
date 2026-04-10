@@ -25,17 +25,22 @@ def main() -> None:
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-5s %(message)s",
+        format="%(asctime)s %(levelname)-5s %(name)s  %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
     from pathlib import Path
 
     from trino_mv_orchestrator.config import load_config
-    from trino_mv_orchestrator.server import app, state
+    from trino_mv_orchestrator.server import app, set_config_path
 
-    state.config_path = Path(args.config)
-    cfg = load_config(state.config_path)
+    config_path = Path(args.config)
+    set_config_path(config_path)
+
+    # Pre-load config to get the port, then let lifespan do the real init
+    cfg = load_config(config_path)
+    log = logging.getLogger(__name__)
+    log.info("starting trino-mv-orchestrator on port %d", cfg.server.port)
 
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=cfg.server.port, log_level="info")

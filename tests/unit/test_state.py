@@ -1,5 +1,17 @@
 """Tests for state read/write."""
+from trino_mv_orchestrator.detector import system_table
 from trino_mv_orchestrator.state import SNAPSHOT_KEY, read_last_snapshot, write_last_snapshot
+
+
+class TestSystemTableShared:
+    def test_state_uses_detector_system_table(self):
+        """state.py should reuse system_table from detector, not duplicate it."""
+        result = system_table("iceberg.analytics.ohlcv_1m", "properties")
+        assert result == 'iceberg.analytics."ohlcv_1m$properties"'
+
+    def test_unqualified_table(self):
+        result = system_table("ohlcv_1m", "properties")
+        assert result == '"ohlcv_1m$properties"'
 
 
 class MockCursor:

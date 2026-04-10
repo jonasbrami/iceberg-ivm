@@ -1,12 +1,63 @@
 """Configuration loading and validation."""
 from __future__ import annotations
 
+import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
 
+log = logging.getLogger(__name__)
+
 VALID_GRANULARITIES = ("minute", "hour", "day", "week", "month")
+
+_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+_QUALIFIED_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$")
+
+# Regex to extract granularity from date_trunc('X', ...)
+_DATE_TRUNC_RE = re.compile(r"date_trunc\s*\(\s*'(\w+)'\s*,", re.IGNORECASE)
+
+# Detects date_trunc used inside arithmetic (e.g. date_trunc(...) - INTERVAL ...)
+_COMPLEX_EXPR_RE = re.compile(
+    r"date_trunc\s*\(\s*'\w+'\s*,[^)]*\)\s*[-+*/%]"
+    r"|[-+*/%]\s*date_trunc\s*\(\s*'\w+'\s*,",
+    re.IGNORECASE,
+)
+
+
+def infer_granularity(query: str) -> str | None:
+    """Infer filter_granularity from ``date_trunc('X', ...)`` in the query.
+
+    Returns the granularity string if exactly one valid granularity is found
+    in a simple ``date_trunc`` call (not part of arithmetic).  Returns *None*
+    when inference is not possible.
+    """
+    if _COMPLEX_EXPR_RE.search(query):
+        return None
+
+    matches = _DATE_TRUNC_RE.findall(query)
+    if not matches:
+        return None
+
+    granularities = {m.lower() for m in matches}
+    valid = granularities & set(VALID_GRANULARITIES)
+    if len(valid) != 1:
+        return None
+
+    return valid.pop()
+
+
+def _validate_identifier(value: str, field_name: str) -> None:
+    if not _IDENTIFIER_RE.match(value):
+        raise ValueError(f"{field_name}: {value!r} is not a valid SQL identifier")
+
+
+def _validate_qualified_name(value: str, field_name: str) -> None:
+    if not _QUALIFIED_NAME_RE.match(value):
+        raise ValueError(
+            f"{field_name}: {value!r} is not a valid qualified table name"
+        )
 
 
 @dataclass(frozen=True)
@@ -14,7 +65,7 @@ class ViewConfig:
     name: str
     source_table: str
     query: str
-    merge_keys: list[str]
+    merge_keys: tuple[str, ...]
     filter_column: str
     filter_granularity: str = "day"
     target_table: str | None = None
@@ -49,22 +100,40 @@ def _parse_view(raw: dict) -> ViewConfig:
         if key not in raw:
             raise ValueError(f"view missing required field: {key}")
 
+    _validate_identifier(raw["name"], "name")
+    _validate_qualified_name(raw["source_table"], "source_table")
+    _validate_identifier(raw["filter_column"], "filter_column")
+    for key in raw["merge_keys"]:
+        _validate_identifier(str(key), "merge_keys")
+    if raw.get("target_table"):
+        _validate_qualified_name(raw["target_table"], "target_table")
+
     if "{range_filter}" not in raw["query"]:
         raise ValueError(
             f"view '{raw['name']}': query must contain {{range_filter}} placeholder"
         )
 
-    granularity = raw.get("filter_granularity", "day")
-    if granularity not in VALID_GRANULARITIES:
-        raise ValueError(
-            f"filter_granularity must be one of {VALID_GRANULARITIES}, got: {granularity}"
-        )
+    explicit = raw.get("filter_granularity")
+    if explicit is not None:
+        granularity = explicit
+        if granularity not in VALID_GRANULARITIES:
+            raise ValueError(
+                f"filter_granularity must be one of {VALID_GRANULARITIES}, got: {granularity}"
+            )
+    else:
+        granularity = infer_granularity(raw["query"])
+        if granularity is None:
+            raise ValueError(
+                f"view '{raw['name']}': filter_granularity not specified and could "
+                f"not be inferred from query. Add an explicit filter_granularity "
+                f"({', '.join(VALID_GRANULARITIES)})."
+            )
 
     return ViewConfig(
         name=raw["name"],
         source_table=raw["source_table"],
         query=raw["query"],
-        merge_keys=list(raw["merge_keys"]),
+        merge_keys=tuple(raw["merge_keys"]),
         filter_column=raw["filter_column"],
         filter_granularity=granularity,
         target_table=raw.get("target_table"),
@@ -105,7 +174,12 @@ def load_config(path: str | Path) -> Config:
         config_reload_interval_seconds=server_raw.get("config_reload_interval_seconds", 30),
     )
 
-    return Config(trino=trino, views=views, server=server)
+    cfg = Config(trino=trino, views=views, server=server)
+    log.info(
+        "loaded %d view(s) from %s (trino=%s:%d/%s)",
+        len(views), path, trino.host, trino.port, trino.catalog,
+    )
+    return cfg
 
 
 def save_config(cfg: Config, path: str | Path) -> None:
@@ -129,7 +203,7 @@ def save_config(cfg: Config, path: str | Path) -> None:
             "name": v.name,
             "source_table": v.source_table,
             "query": v.query,
-            "merge_keys": v.merge_keys,
+            "merge_keys": list(v.merge_keys),
             "filter_column": v.filter_column,
             "filter_granularity": v.filter_granularity,
             "refresh_interval_seconds": v.refresh_interval_seconds,
@@ -141,3 +215,4 @@ def save_config(cfg: Config, path: str | Path) -> None:
         data["views"].append(vd)
 
     Path(path).write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
+    log.info("saved config with %d view(s) to %s", len(cfg.views), path)

@@ -28,7 +28,7 @@ class ChangeResult:
     filter_range: tuple[datetime, datetime] | None = None  # snapped (start, end)
 
 
-def _system_table(table: str, suffix: str) -> str:
+def system_table(table: str, suffix: str) -> str:
     """Build a reference to an Iceberg system table.
 
     Trino syntax: catalog.schema."table$suffix"
@@ -42,7 +42,7 @@ def _system_table(table: str, suffix: str) -> str:
 def get_current_snapshot(cursor, source_table: str) -> int | None:
     """Get latest snapshot_id from source table. Metadata-only."""
     cursor.execute(
-        f"SELECT snapshot_id FROM {_system_table(source_table, 'snapshots')} "
+        f"SELECT snapshot_id FROM {system_table(source_table, 'snapshots')} "
         f"ORDER BY committed_at DESC LIMIT 1"
     )
     row = cursor.fetchone()
@@ -55,7 +55,7 @@ def get_snapshots_since(cursor, source_table: str, last_snap: int) -> list[dict]
     Snapshot IDs are random longs in Iceberg — not sequential. We find
     the committed_at of last_snap and return everything after it.
     """
-    snaps_table = _system_table(source_table, "snapshots")
+    snaps_table = system_table(source_table, "snapshots")
     cursor.execute(
         f"SELECT snapshot_id, operation FROM {snaps_table} "
         f"WHERE committed_at > ("
@@ -79,7 +79,7 @@ def get_new_files_column_range(
     snap_list = ", ".join(str(s) for s in snapshot_ids)
     cursor.execute(
         f"SELECT readable_metrics "
-        f"FROM {_system_table(source_table, 'all_entries')} "
+        f"FROM {system_table(source_table, 'all_entries')} "
         f"WHERE snapshot_id IN ({snap_list}) "
         f"AND status = 1"  # ADDED data files
     )
@@ -123,6 +123,7 @@ def _parse_ts(value: str) -> datetime:
         except ValueError:
             continue
     # Last resort: just parse date
+    log.warning("date-only parse fallback for %r — no time component matched", value)
     return datetime.strptime(value[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
 
 
@@ -183,22 +184,30 @@ def detect_changes(
     """
     current_snap = get_current_snapshot(cursor, source_table)
     if current_snap is None:
+        log.debug("%s: no snapshots found", source_table)
         return ChangeResult(action=RefreshAction.NO_CHANGE)
 
     if current_snap == last_snapshot:
+        log.debug("%s: snapshot unchanged (%d)", source_table, current_snap)
         return ChangeResult(action=RefreshAction.NO_CHANGE, current_snapshot=current_snap)
 
     # First run → full refresh
     if last_snapshot is None:
+        log.info("%s: first run (no last_snapshot) → full refresh", source_table)
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=current_snap)
 
     # Get intermediate snapshots
     snapshots = get_snapshots_since(cursor, source_table, last_snapshot)
     if not snapshots:
+        log.debug("%s: no new snapshots since %d", source_table, last_snapshot)
         return ChangeResult(action=RefreshAction.NO_CHANGE, current_snapshot=current_snap)
 
+    ops = [s["operation"] for s in snapshots]
+    log.debug("%s: %d new snapshots, operations: %s", source_table, len(snapshots), ops)
+
     # Non-append operations → full refresh
-    if any(s["operation"] in NON_APPEND_OPS for s in snapshots):
+    if any(op in NON_APPEND_OPS for op in ops):
+        log.info("%s: non-append operations %s → full refresh", source_table, ops)
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=current_snap)
 
     # Read column range from new files
@@ -206,6 +215,7 @@ def detect_changes(
     col_range = get_new_files_column_range(cursor, source_table, snap_ids, filter_column)
     if col_range is None:
         # New snapshots but no data files (e.g. compaction-only)
+        log.debug("%s: new snapshots but no data files (compaction?)", source_table)
         return ChangeResult(action=RefreshAction.NO_CHANGE, current_snapshot=current_snap)
 
     min_val, max_val = col_range

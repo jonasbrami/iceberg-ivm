@@ -2,7 +2,14 @@
 from datetime import datetime, timezone
 
 from trino_mv_orchestrator.config import ViewConfig
-from trino_mv_orchestrator.executor import build_merge_sql, build_range_filter
+from trino_mv_orchestrator.executor import (
+    RefreshResult,
+    build_merge_sql,
+    build_range_filter,
+    execute_full_refresh,
+    execute_incremental_refresh,
+    format_ts,
+)
 
 
 def make_view(**overrides) -> ViewConfig:
@@ -10,7 +17,7 @@ def make_view(**overrides) -> ViewConfig:
         name="ohlcv_1m",
         source_table="iceberg.market_data.trades",
         query="SELECT symbol, minute, open FROM t WHERE {range_filter} GROUP BY 1, 2",
-        merge_keys=["symbol", "minute"],
+        merge_keys=("symbol", "minute"),
         filter_column="ts",
         filter_granularity="day",
     )
@@ -43,3 +50,80 @@ class TestBuildMergeSql:
         assert "WHEN NOT MATCHED THEN INSERT" in sql
         assert "ts >= X" in sql
         assert "{range_filter}" not in sql
+
+
+class TestFormatTs:
+    def test_microsecond_precision(self):
+        ts = datetime(2026, 4, 8, 10, 30, 45, 123456, tzinfo=timezone.utc)
+        assert format_ts(ts) == "2026-04-08 10:30:45.123456"
+
+
+class MockCursorWithStats:
+    """Cursor mock that exposes Trino query stats."""
+    def __init__(self, stats: dict | None = None):
+        self._stats = stats or {}
+        self.executed = []
+
+    def execute(self, sql: str):
+        self.executed.append(sql)
+
+    @property
+    def stats(self):
+        return self._stats
+
+    def fetchone(self):
+        return None
+
+    def fetchall(self):
+        return []
+
+
+class TestRefreshResult:
+    def test_dataclass_fields(self):
+        r = RefreshResult(elapsed=1.5, processed_rows=100, processed_bytes=4096)
+        assert r.elapsed == 1.5
+        assert r.processed_rows == 100
+        assert r.processed_bytes == 4096
+
+    def test_defaults(self):
+        r = RefreshResult(elapsed=0.5)
+        assert r.processed_rows == 0
+        assert r.processed_bytes == 0
+
+
+class TestExecuteFullRefresh:
+    def test_returns_refresh_result_with_stats(self):
+        cursor = MockCursorWithStats(stats={
+            "processedRows": 5000,
+            "processedBytes": 128000,
+        })
+        view = make_view()
+        result = execute_full_refresh(cursor, view, "iceberg.out.mv")
+        assert isinstance(result, RefreshResult)
+        assert result.elapsed > 0
+        assert result.processed_rows == 5000
+        assert result.processed_bytes == 128000
+
+    def test_returns_zero_stats_when_missing(self):
+        cursor = MockCursorWithStats(stats={})
+        view = make_view()
+        result = execute_full_refresh(cursor, view, "iceberg.out.mv")
+        assert result.processed_rows == 0
+        assert result.processed_bytes == 0
+
+
+class TestExecuteIncrementalRefresh:
+    def test_returns_refresh_result_with_stats(self):
+        cursor = MockCursorWithStats(stats={
+            "processedRows": 200,
+            "processedBytes": 8192,
+        })
+        view = make_view()
+        start = datetime(2026, 4, 8, 0, 0, tzinfo=timezone.utc)
+        end = datetime(2026, 4, 9, 0, 0, tzinfo=timezone.utc)
+        result = execute_incremental_refresh(
+            cursor, view, "iceberg.out.mv", ["open"], (start, end),
+        )
+        assert isinstance(result, RefreshResult)
+        assert result.processed_rows == 200
+        assert result.processed_bytes == 8192

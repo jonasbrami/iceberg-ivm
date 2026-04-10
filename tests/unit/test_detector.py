@@ -114,6 +114,12 @@ class TestParseTs:
         dt = _parse_ts("2026-04-08")
         assert dt.day == 8
 
+    def test_date_only_logs_warning(self, caplog):
+        import logging
+        with caplog.at_level(logging.WARNING, logger="trino_mv_orchestrator.detector"):
+            _parse_ts("2026-04-08")
+        assert any("date-only" in r.message for r in caplog.records)
+
 
 # ── get_current_snapshot ──
 

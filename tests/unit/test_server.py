@@ -1,80 +1,226 @@
 """Tests for the FastAPI server endpoints."""
 import textwrap
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
 from trino_mv_orchestrator.config import load_config
-from trino_mv_orchestrator.server import app, state, ViewStatus
+from trino_mv_orchestrator.server import AppState, ViewStatus, app, get_app_state
+
+
+CONFIG_YAML = textwrap.dedent("""\
+    trino:
+      host: localhost
+      port: 8080
+      catalog: iceberg
+      schema: analytics
+      user: test
+    views:
+      - name: test_view
+        source_table: iceberg.db.trades
+        filter_column: ts
+        filter_granularity: day
+        query: "SELECT a, b FROM t WHERE {range_filter} GROUP BY 1"
+        merge_keys: [a]
+""")
 
 
 @pytest.fixture(autouse=True)
-def reset_state(tmp_path):
+def setup_state(tmp_path):
+    """Pre-seed AppState on app.state so lifespan skips init and refresh loop exits immediately."""
     cfg_path = tmp_path / "config.yaml"
-    cfg_path.write_text(textwrap.dedent("""\
-        trino:
-          host: localhost
-          port: 8080
-          catalog: iceberg
-          schema: analytics
-          user: test
-        views:
-          - name: test_view
-            source_table: iceberg.db.trades
-            filter_column: ts
-            query: "SELECT a, b FROM t WHERE {range_filter} GROUP BY 1"
-            merge_keys: [a]
-    """))
-    state.config_path = cfg_path
-    state.config = load_config(cfg_path)
-    state.config_mtime = cfg_path.stat().st_mtime
-    state.view_statuses = {"test_view": ViewStatus(name="test_view", last_action="skip", total_refreshes=3)}
-    state._stop = False
-    yield
-    state.config = None
-    state.view_statuses = {}
+    cfg_path.write_text(CONFIG_YAML)
+    s = AppState(config_path=cfg_path)
+    s.config = load_config(cfg_path)
+    s.config_mtime = cfg_path.stat().st_mtime
+    s.view_statuses = {
+        "test_view": ViewStatus(name="test_view", last_action="skip", total_refreshes=3),
+    }
+    s._stop = True  # Prevents refresh loop from running
+    app.state.s = s
+    yield s
+    if hasattr(app.state, "s"):
+        del app.state.s
 
 
-client = TestClient(app, raise_server_exceptions=False)
+@pytest.fixture()
+def client():
+    return TestClient(app, raise_server_exceptions=False)
 
 
-def test_health():
-    assert client.get("/health").json()["views"] == 1
+# ── Health & metrics ──
 
-def test_metrics():
+def test_health(client):
+    r = client.get("/health")
+    assert r.status_code == 200
+    assert r.json()["views"] == 1
+
+
+def test_metrics(client):
     assert "mv_views_configured" in client.get("/metrics").text
 
-def test_list_views():
+
+# ── CRUD ──
+
+def test_list_views(client):
     views = client.get("/api/views").json()
     assert len(views) == 1
     assert views[0]["filter_column"] == "ts"
+    assert views[0]["status"]["total_refreshes"] == 3
 
-def test_create_view():
+
+def test_create_view(client, setup_state):
     r = client.post("/api/views", json={
-        "name": "new", "source_table": "t", "filter_column": "ts",
-        "query": "SELECT x FROM t WHERE {range_filter}", "merge_keys": ["x"],
+        "name": "new_view",
+        "source_table": "iceberg.db.t",
+        "filter_column": "ts",
+        "filter_granularity": "day",
+        "query": "SELECT x FROM t WHERE {range_filter}",
+        "merge_keys": ["x"],
     })
     assert r.status_code == 201
-    assert len(state.config.views) == 2
+    assert len(setup_state.config.views) == 2
 
-def test_create_duplicate():
-    assert client.post("/api/views", json={
-        "name": "test_view", "source_table": "t", "filter_column": "ts",
-        "query": "q {range_filter}", "merge_keys": ["a"],
-    }).status_code == 409
 
-def test_delete_view():
+def test_create_view_invalid_name(client):
+    """SQL injection via view name should be rejected."""
+    r = client.post("/api/views", json={
+        "name": "bad-name",
+        "source_table": "iceberg.db.t",
+        "filter_column": "ts",
+        "filter_granularity": "day",
+        "query": "SELECT x FROM t WHERE {range_filter}",
+        "merge_keys": ["x"],
+    })
+    assert r.status_code == 422
+
+
+def test_create_duplicate(client):
+    r = client.post("/api/views", json={
+        "name": "test_view",
+        "source_table": "t",
+        "filter_column": "ts",
+        "filter_granularity": "day",
+        "query": "q {range_filter}",
+        "merge_keys": ["a"],
+    })
+    assert r.status_code == 409
+
+
+def test_delete_view(client, setup_state):
     assert client.delete("/api/views/test_view").status_code == 204
-    assert len(state.config.views) == 0
+    assert len(setup_state.config.views) == 0
 
-def test_delete_not_found():
+
+def test_delete_not_found(client):
     assert client.delete("/api/views/nope").status_code == 404
 
-@patch("trino_mv_orchestrator.server.refresh_view")
-def test_trigger_refresh(mock):
-    assert client.post("/api/views/test_view/refresh").status_code == 200
-    mock.assert_called_once()
 
-def test_ui():
-    assert "Materialized Views" in client.get("/").text
+# ── Trigger refresh ──
+
+@patch("trino_mv_orchestrator.server.refresh_view")
+def test_trigger_refresh(mock_refresh, client):
+    r = client.post("/api/views/test_view/refresh")
+    assert r.status_code == 200
+    mock_refresh.assert_called_once()
+
+
+def test_trigger_refresh_not_found(client):
+    r = client.post("/api/views/nope/refresh")
+    assert r.status_code == 404
+
+
+# ── UI ──
+
+def test_ui(client):
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "Materialized Views" in r.text
+
+
+# ── Config reload ──
+
+def test_reload_config_on_mtime_change(setup_state, tmp_path):
+    from trino_mv_orchestrator.server import reload_config
+
+    # Initial state
+    assert len(setup_state.config.views) == 1
+
+    # Write new config with an extra view (must be indented under views:)
+    new_yaml = CONFIG_YAML + (
+        "  - name: second_view\n"
+        "    source_table: iceberg.db.other\n"
+        "    filter_column: ts\n"
+        "    filter_granularity: day\n"
+        '    query: "SELECT x FROM t2 WHERE {range_filter}"\n'
+        "    merge_keys: [x]\n"
+    )
+    setup_state.config_path.write_text(new_yaml)
+
+    # Force mtime to be newer
+    reloaded = reload_config(setup_state)
+    assert reloaded is True
+    assert len(setup_state.config.views) == 2
+    assert "second_view" in setup_state.view_statuses
+
+
+def test_reload_config_no_change(setup_state):
+    from trino_mv_orchestrator.server import reload_config
+
+    reloaded = reload_config(setup_state)
+    assert reloaded is False
+
+
+# ── Metrics presence ──
+
+def test_new_metrics_defined():
+    """Verify the enhanced metrics are importable."""
+    from trino_mv_orchestrator.server import (
+        DETECTION_DURATION,
+        REFRESH_BYTES,
+        REFRESH_ROWS,
+        SOURCE_SNAPSHOT,
+    )
+    assert REFRESH_BYTES is not None
+    assert REFRESH_ROWS is not None
+    assert DETECTION_DURATION is not None
+    assert SOURCE_SNAPSHOT is not None
+
+
+# ── Granularity inference via API ──
+
+def test_create_view_infers_granularity(client, setup_state):
+    r = client.post("/api/views", json={
+        "name": "auto_view",
+        "source_table": "iceberg.db.t",
+        "filter_column": "ts",
+        "query": "SELECT date_trunc('hour', ts) AS h FROM t WHERE {range_filter} GROUP BY 1",
+        "merge_keys": ["h"],
+    })
+    assert r.status_code == 201
+    assert r.json()["filter_granularity"] == "hour"
+
+
+def test_create_view_explicit_overrides(client, setup_state):
+    r = client.post("/api/views", json={
+        "name": "explicit_view",
+        "source_table": "iceberg.db.t",
+        "filter_column": "ts",
+        "filter_granularity": "day",
+        "query": "SELECT date_trunc('hour', ts) AS h FROM t WHERE {range_filter} GROUP BY 1",
+        "merge_keys": ["h"],
+    })
+    assert r.status_code == 201
+    assert r.json()["filter_granularity"] == "day"
+
+
+def test_create_view_fails_when_cannot_infer(client, setup_state):
+    r = client.post("/api/views", json={
+        "name": "fail_view",
+        "source_table": "iceberg.db.t",
+        "filter_column": "ts",
+        "query": "SELECT ts FROM t WHERE {range_filter}",
+        "merge_keys": ["ts"],
+    })
+    assert r.status_code == 422
