@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Trino MV Orchestrator</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <style>
+    [x-cloak] { display: none !important; }
+    .fade-in { animation: fadeIn 0.2s ease-in; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+<div x-data="app()" x-init="init()" class="max-w-5xl mx-auto px-6 py-10">
+
+  <!-- Header -->
+  <div class="flex items-center justify-between mb-10">
+    <div>
+      <h1 class="text-2xl font-semibold tracking-tight">Materialized Views</h1>
+      <p class="text-sm text-gray-500 mt-1">Trino / Iceberg incremental refresh orchestrator</p>
+    </div>
+    <button @click="showForm = true; editingView = null; resetForm()"
+            class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-sm font-medium rounded-lg transition">
+      + New View
+    </button>
+  </div>
+
+  <!-- Views list -->
+  <div class="space-y-3">
+    <template x-for="view in views" :key="view.name">
+      <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 fade-in">
+        <div class="flex items-start justify-between">
+          <div class="flex-1 min-w-0">
+            <div class="flex items-center gap-3">
+              <h2 class="text-lg font-medium" x-text="view.name"></h2>
+              <span x-show="view.status?.last_action === 'skip'"
+                    class="text-xs px-2 py-0.5 rounded-full bg-gray-800 text-gray-400">idle</span>
+              <span x-show="view.status?.last_action === 'incremental'"
+                    class="text-xs px-2 py-0.5 rounded-full bg-emerald-900 text-emerald-300">incremental</span>
+              <span x-show="view.status?.last_action === 'full'"
+                    class="text-xs px-2 py-0.5 rounded-full bg-amber-900 text-amber-300">full</span>
+              <span x-show="view.status?.last_action === 'pending'"
+                    class="text-xs px-2 py-0.5 rounded-full bg-gray-800 text-gray-500">pending</span>
+              <span x-show="view.status?.last_error"
+                    class="text-xs px-2 py-0.5 rounded-full bg-red-900 text-red-300">error</span>
+            </div>
+            <p class="text-sm text-gray-500 mt-1">
+              <span x-text="view.source_table"></span>
+              <span class="text-gray-700 mx-1">&rarr;</span>
+              <span x-text="view.target_table || '(auto)'"></span>
+            </p>
+          </div>
+          <div class="flex items-center gap-2 ml-4 shrink-0">
+            <button @click="triggerRefresh(view.name)"
+                    class="text-xs px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg transition"
+                    :class="{'opacity-50 pointer-events-none': refreshing[view.name]}">
+              <span x-show="!refreshing[view.name]">Refresh</span>
+              <span x-show="refreshing[view.name]">...</span>
+            </button>
+            <button @click="editView(view)"
+                    class="text-xs px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg transition">
+              Edit
+            </button>
+            <button @click="deleteView(view.name)"
+                    class="text-xs px-3 py-1.5 bg-gray-800 hover:bg-red-900 rounded-lg transition">
+              Delete
+            </button>
+          </div>
+        </div>
+
+        <!-- Stats row -->
+        <div x-show="view.status" class="flex gap-6 mt-3 text-xs text-gray-500">
+          <div>
+            <span class="text-gray-600">Refreshes:</span>
+            <span x-text="view.status?.total_refreshes || 0"></span>
+          </div>
+          <div>
+            <span class="text-gray-600">Duration:</span>
+            <span x-text="view.status?.last_duration ? view.status.last_duration.toFixed(1) + 's' : '-'"></span>
+          </div>
+          <div x-show="view.status?.last_range">
+            <span class="text-gray-600">Range:</span>
+            <span x-text="view.status?.last_range || '-'"></span>
+          </div>
+          <div>
+            <span class="text-gray-600">Interval:</span>
+            <span x-text="view.refresh_interval_seconds + 's'"></span>
+          </div>
+          <div x-show="view.status?.last_refresh">
+            <span class="text-gray-600">Last:</span>
+            <span x-text="view.status?.last_refresh ? timeAgo(view.status.last_refresh) : '-'"></span>
+          </div>
+          <div>
+            <span class="text-gray-600">Errors:</span>
+            <span x-text="view.status?.total_errors || 0"
+                  :class="{'text-red-400': view.status?.total_errors > 0}"></span>
+          </div>
+        </div>
+
+        <!-- Error message -->
+        <div x-show="view.status?.last_error"
+             class="mt-3 text-xs text-red-400 bg-red-950 border border-red-900 rounded-lg p-3 font-mono break-all">
+          <span x-text="view.status?.last_error"></span>
+        </div>
+
+        <!-- Query preview -->
+        <details class="mt-3">
+          <summary class="text-xs text-gray-600 cursor-pointer hover:text-gray-400 transition">query</summary>
+          <pre class="mt-2 text-xs text-gray-400 bg-gray-950 border border-gray-800 rounded-lg p-3 overflow-x-auto"><code x-text="view.query"></code></pre>
+        </details>
+      </div>
+    </template>
+
+    <div x-show="views.length === 0" class="text-center py-20 text-gray-600">
+      No views configured. Click <strong>+ New View</strong> to get started.
+    </div>
+  </div>
+
+  <!-- Modal: Create / Edit view -->
+  <div x-show="showForm" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4"
+       @keydown.escape.window="showForm = false">
+    <div @click.outside="showForm = false"
+         class="bg-gray-900 border border-gray-800 rounded-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto p-6 fade-in">
+      <h2 class="text-lg font-semibold mb-6" x-text="editingView ? 'Edit View' : 'New View'"></h2>
+
+      <div class="space-y-4">
+        <div>
+          <label class="block text-xs text-gray-500 mb-1.5">Name</label>
+          <input x-model="form.name" type="text" placeholder="ohlcv_1m"
+                 :disabled="editingView !== null"
+                 class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm
+                        focus:outline-none focus:border-blue-600 disabled:opacity-50">
+        </div>
+
+        <div>
+          <label class="block text-xs text-gray-500 mb-1.5">Source Table</label>
+          <input x-model="form.source_table" type="text" placeholder="iceberg.market_data.trades"
+                 class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm
+                        focus:outline-none focus:border-blue-600">
+        </div>
+
+        <div>
+          <label class="block text-xs text-gray-500 mb-1.5">Query (use {range_filter} placeholder)</label>
+          <textarea x-model="form.query" rows="10" placeholder="SELECT symbol, date_trunc('minute', ts) AS minute, ...
+FROM iceberg.market_data.trades
+WHERE {range_filter}
+GROUP BY 1, 2"
+                    class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm font-mono
+                           focus:outline-none focus:border-blue-600 resize-y"></textarea>
+        </div>
+
+        <div class="grid grid-cols-2 gap-4">
+          <div>
+            <label class="block text-xs text-gray-500 mb-1.5">Filter Column</label>
+            <input x-model="form.filter_column" type="text" placeholder="ts"
+                   class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm
+                          focus:outline-none focus:border-blue-600">
+          </div>
+          <div>
+            <label class="block text-xs text-gray-500 mb-1.5">Filter Granularity</label>
+            <select x-model="form.filter_granularity"
+                    class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm
+                           focus:outline-none focus:border-blue-600">
+              <option value="minute">minute</option>
+              <option value="hour">hour</option>
+              <option value="day">day</option>
+              <option value="week">week</option>
+              <option value="month">month</option>
+            </select>
+          </div>
+        </div>
+
+        <div>
+          <label class="block text-xs text-gray-500 mb-1.5">Merge Keys (comma-separated)</label>
+          <input x-model="form.merge_keys_str" type="text" placeholder="symbol, minute"
+                 class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm
+                        focus:outline-none focus:border-blue-600">
+        </div>
+
+        <div class="grid grid-cols-2 gap-4">
+          <div>
+            <label class="block text-xs text-gray-500 mb-1.5">Target Table <span class="text-gray-700">(optional)</span></label>
+            <input x-model="form.target_table" type="text" placeholder="auto-generated"
+                   class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm
+                          focus:outline-none focus:border-blue-600">
+          </div>
+          <div>
+            <label class="block text-xs text-gray-500 mb-1.5">Target Partitioning <span class="text-gray-700">(optional)</span></label>
+            <input x-model="form.target_partitioning" type="text" placeholder="inherits from source"
+                   class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm
+                          focus:outline-none focus:border-blue-600">
+          </div>
+        </div>
+
+        <div>
+          <label class="block text-xs text-gray-500 mb-1.5">Refresh Interval (seconds)</label>
+          <input x-model.number="form.refresh_interval_seconds" type="number" min="1"
+                 class="w-32 bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm
+                        focus:outline-none focus:border-blue-600">
+        </div>
+      </div>
+
+      <!-- Error -->
+      <div x-show="formError" class="mt-4 text-sm text-red-400" x-text="formError"></div>
+
+      <!-- Actions -->
+      <div class="flex justify-end gap-3 mt-6">
+        <button @click="showForm = false"
+                class="px-4 py-2 text-sm text-gray-400 hover:text-gray-200 transition">Cancel</button>
+        <button @click="submitForm()"
+                class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-sm font-medium rounded-lg transition">
+          <span x-text="editingView ? 'Save' : 'Create'"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+function app() {
+  return {
+    views: [],
+    showForm: false,
+    editingView: null,
+    formError: '',
+    refreshing: {},
+    form: {
+      name: '', source_table: '', query: '', merge_keys_str: '',
+      filter_column: '', filter_granularity: 'day',
+      target_table: '', target_partitioning: '', refresh_interval_seconds: 60,
+    },
+
+    async init() {
+      await this.loadViews();
+      setInterval(() => this.loadViews(), 5000);
+    },
+
+    async loadViews() {
+      try {
+        const res = await fetch('/api/views');
+        this.views = await res.json();
+      } catch (e) { console.error('Failed to load views:', e); }
+    },
+
+    resetForm() {
+      this.form = {
+        name: '', source_table: '', query: '', merge_keys_str: '',
+        target_table: '', target_partitioning: '', refresh_interval_seconds: 60,
+      };
+      this.formError = '';
+    },
+
+    editView(view) {
+      this.editingView = view.name;
+      this.form = {
+        name: view.name,
+        source_table: view.source_table,
+        query: view.query,
+        merge_keys_str: view.merge_keys.join(', '),
+        filter_column: view.filter_column || '',
+        filter_granularity: view.filter_granularity || 'day',
+        target_table: view.target_table || '',
+        target_partitioning: view.target_partitioning || '',
+        refresh_interval_seconds: view.refresh_interval_seconds,
+      };
+      this.formError = '';
+      this.showForm = true;
+    },
+
+    async submitForm() {
+      this.formError = '';
+      const keys = this.form.merge_keys_str.split(',').map(s => s.trim()).filter(Boolean);
+      if (!this.form.name || !this.form.source_table || !this.form.query || keys.length === 0 || !this.form.filter_column) {
+        this.formError = 'Name, source table, query, filter column, and merge keys are required.';
+        return;
+      }
+      if (!this.form.query.includes('{range_filter}')) {
+        this.formError = 'Query must contain {range_filter} placeholder.';
+        return;
+      }
+
+      const body = {
+        name: this.form.name,
+        source_table: this.form.source_table,
+        query: this.form.query,
+        merge_keys: keys,
+        filter_column: this.form.filter_column,
+        filter_granularity: this.form.filter_granularity,
+        target_table: this.form.target_table || null,
+        target_partitioning: this.form.target_partitioning || null,
+        refresh_interval_seconds: this.form.refresh_interval_seconds,
+      };
+
+      try {
+        if (this.editingView) {
+          await fetch(`/api/views/${this.editingView}`, { method: 'DELETE' });
+          const res = await fetch('/api/views', {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+          });
+          if (!res.ok) { const e = await res.json(); throw new Error(e.detail); }
+        } else {
+          const res = await fetch('/api/views', {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+          });
+          if (!res.ok) { const e = await res.json(); throw new Error(e.detail); }
+        }
+        this.showForm = false;
+        await this.loadViews();
+      } catch (e) {
+        this.formError = e.message;
+      }
+    },
+
+    async deleteView(name) {
+      if (!confirm(`Delete view "${name}"?`)) return;
+      await fetch(`/api/views/${name}`, { method: 'DELETE' });
+      await this.loadViews();
+    },
+
+    async triggerRefresh(name) {
+      this.refreshing[name] = true;
+      try {
+        await fetch(`/api/views/${name}/refresh`, { method: 'POST' });
+        await this.loadViews();
+      } finally {
+        this.refreshing[name] = false;
+      }
+    },
+
+    timeAgo(ts) {
+      const diff = Math.floor(Date.now() / 1000 - ts);
+      if (diff < 60) return diff + 's ago';
+      if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+      return Math.floor(diff / 3600) + 'h ago';
+    },
+  };
+}
+</script>
+</body>
+</html>

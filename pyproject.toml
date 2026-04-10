@@ -1,0 +1,38 @@
+[project]
+name = "trino-mv-orchestrator"
+version = "0.1.0"
+description = "Metadata-driven incremental materialized view orchestrator for Trino/Iceberg"
+readme = "README.md"
+authors = [
+    { name = "Jonas Brami", email = "jonasbrami@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "trino",
+    "pyyaml",
+    "fastapi>=0.135.3",
+    "uvicorn>=0.44.0",
+    "prometheus-client>=0.25.0",
+]
+
+[project.scripts]
+trino-mv-orchestrator = "trino_mv_orchestrator.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.1,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: marks tests that require a running Trino instance",
+]
+addopts = "-n auto --dist loadgroup"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest",
+    "pytest-mock",
+    "pytest-xdist>=3.8.0",
+]
