@@ -71,15 +71,15 @@ def build_merge_sql(
     )
 
 
-def execute_full_refresh(cursor, view: ViewConfig, target_table: str) -> RefreshResult:
+async def execute_full_refresh(cursor, view: ViewConfig, target_table: str) -> RefreshResult:
     """Full refresh: DELETE all + INSERT all. Returns RefreshResult."""
     start = time.monotonic()
     log.info("%s: full refresh — deleting target %s", view.name, target_table)
-    cursor.execute(f"DELETE FROM {target_table} WHERE true")
+    await cursor.execute(f"DELETE FROM {target_table} WHERE true")
 
     query = view.query.replace("{range_filter}", "true")
     log.info("%s: full refresh — inserting into %s", view.name, target_table)
-    cursor.execute(f"INSERT INTO {target_table} {query}")
+    await cursor.execute(f"INSERT INTO {target_table} {query}")
 
     elapsed = time.monotonic() - start
     stats = _extract_stats(cursor)
@@ -90,7 +90,7 @@ def execute_full_refresh(cursor, view: ViewConfig, target_table: str) -> Refresh
     return RefreshResult(elapsed=elapsed, **stats)
 
 
-def execute_incremental_refresh(
+async def execute_incremental_refresh(
     cursor,
     view: ViewConfig,
     target_table: str,
@@ -109,7 +109,7 @@ def execute_incremental_refresh(
         view.name, view.filter_column, range_start, range_end,
     )
     log.debug("%s: executing MERGE:\n%s", view.name, merge_sql)
-    cursor.execute(merge_sql)
+    await cursor.execute(merge_sql)
 
     elapsed = time.monotonic() - start_time
     stats = _extract_stats(cursor)

@@ -12,11 +12,12 @@ class ColumnInfo:
     type: str
 
 
-def discover_source_tables(cursor, query: str) -> list[str]:
+async def discover_source_tables(cursor, query: str) -> list[str]:
     """Use EXPLAIN (TYPE IO, FORMAT JSON) to find all source tables in a query."""
     safe_query = query.replace("{range_filter}", "true")
-    cursor.execute(f"EXPLAIN (TYPE IO, FORMAT JSON) {safe_query}")
-    explain_json = json.loads(cursor.fetchone()[0])
+    await cursor.execute(f"EXPLAIN (TYPE IO, FORMAT JSON) {safe_query}")
+    row = await cursor.fetchone()
+    explain_json = json.loads(row[0])
 
     tables = []
     for info in explain_json.get("inputTableColumnInfos", []):
@@ -27,24 +28,25 @@ def discover_source_tables(cursor, query: str) -> list[str]:
     return tables
 
 
-def discover_columns(cursor, query: str) -> list[ColumnInfo]:
+async def discover_columns(cursor, query: str) -> list[ColumnInfo]:
     """Use PREPARE + DESCRIBE OUTPUT to get column names and types without executing."""
     safe_query = query.replace("{range_filter}", "true")
     stmt_name = "__mv_introspect"
-    cursor.execute(f"PREPARE {stmt_name} FROM {safe_query}")
-    cursor.execute(f"DESCRIBE OUTPUT {stmt_name}")
-    columns = [ColumnInfo(name=row[0], type=row[4]) for row in cursor.fetchall()]
-    cursor.execute(f"DEALLOCATE PREPARE {stmt_name}")
+    await cursor.execute(f"PREPARE {stmt_name} FROM {safe_query}")
+    await cursor.execute(f"DESCRIBE OUTPUT {stmt_name}")
+    columns = [ColumnInfo(name=row[0], type=row[4]) for row in await cursor.fetchall()]
+    await cursor.execute(f"DEALLOCATE PREPARE {stmt_name}")
     return columns
 
 
-def discover_source_partitioning(cursor, source_table: str) -> str | None:
+async def discover_source_partitioning(cursor, source_table: str) -> str | None:
     """Extract the partitioning spec from SHOW CREATE TABLE.
 
     Returns the ARRAY[...] string, or None if not partitioned.
     """
-    cursor.execute(f"SHOW CREATE TABLE {source_table}")
-    create_sql = cursor.fetchone()[0]
+    await cursor.execute(f"SHOW CREATE TABLE {source_table}")
+    row = await cursor.fetchone()
+    create_sql = row[0]
     match = re.search(r"partitioning\s*=\s*(ARRAY\[[^\]]+\])", create_sql)
     return match.group(1) if match else None
 

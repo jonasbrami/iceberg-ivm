@@ -13,21 +13,21 @@ log = logging.getLogger(__name__)
 SNAPSHOT_KEY = "mv.last_source_snapshot"
 
 
-def read_last_snapshot(cursor, target_table: str) -> int | None:
+async def read_last_snapshot(cursor, target_table: str) -> int | None:
     """Read last processed source snapshot ID from target table properties."""
-    cursor.execute(
+    await cursor.execute(
         f"SELECT value FROM {system_table(target_table, 'properties')} "
         f"WHERE key = '{SNAPSHOT_KEY}'"
     )
-    row = cursor.fetchone()
+    row = await cursor.fetchone()
     snapshot_id = int(row[0]) if row else None
     log.debug("read last_snapshot=%s from %s", snapshot_id, target_table)
     return snapshot_id
 
 
-def write_last_snapshot(cursor, target_table: str, snapshot_id: int) -> None:
+async def write_last_snapshot(cursor, target_table: str, snapshot_id: int) -> None:
     """Write last processed source snapshot ID into target table properties."""
-    cursor.execute(
+    await cursor.execute(
         f"ALTER TABLE {target_table} SET PROPERTIES "
         f"extra_properties = MAP("
         f"ARRAY['{SNAPSHOT_KEY}'], "
