@@ -109,9 +109,9 @@
   </style>
 </head>
 
-<body class="bg-[#07070c] text-[#d8d8ec] min-h-screen antialiased font-sans">
+<body x-data="app()" x-init="init()" class="bg-[#07070c] text-[#d8d8ec] min-h-screen antialiased font-sans">
 
-<div x-data="app()" x-init="init()" class="max-w-[880px] mx-auto px-6 py-12">
+<div class="max-w-[880px] mx-auto px-6 py-12">
 
   <!-- ── Header ──────────────────────────────────────────────── -->
   <header class="flex items-center justify-between mb-10">

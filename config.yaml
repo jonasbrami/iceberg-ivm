@@ -1,52 +1,39 @@
 server:
   port: 8000
   config_reload_interval_seconds: 30
-
 trino:
-  host: localhost
-  port: 18080
+  host: trino
+  port: 8080
   catalog: iceberg
   schema: analytics
   user: demo
-
 views:
-  - name: ohlcv_1m
-    source_table: iceberg.market_data.trades
-    query: |
-      SELECT
-        symbol,
-        date_trunc('minute', ts) AS minute,
-        min_by(price, ts) AS open,
-        max(price) AS high,
-        min(price) AS low,
-        max_by(price, ts) AS close,
-        sum(quantity) AS volume,
-        count(*) AS trade_count
-      FROM iceberg.market_data.trades
-      WHERE {range_filter}
-      GROUP BY 1, 2
-    merge_keys: [symbol, minute]
-    target_table: iceberg.analytics.ohlcv_1m
-    target_partitioning: "ARRAY['day(minute)']"
-    refresh_interval_seconds: 30
-
-  - name: ohlcv_5m
-    source_table: iceberg.analytics.ohlcv_1m
-    query: |
-      SELECT
-        symbol,
-        date_trunc('minute', minute)
-          - (extract(minute FROM minute) % 5) * INTERVAL '1' MINUTE AS bar,
-        min_by(open, minute) AS open,
-        max(high) AS high,
-        min(low) AS low,
-        max_by(close, minute) AS close,
-        sum(volume) AS volume,
-        sum(trade_count) AS trade_count
-      FROM iceberg.analytics.ohlcv_1m
-      WHERE {range_filter}
-      GROUP BY 1, 2
-    merge_keys: [symbol, bar]
-    target_table: iceberg.analytics.ohlcv_5m
-    target_partitioning: "ARRAY['day(bar)']"
-    refresh_interval_seconds: 60
+- name: ohlcv_1m
+  source_table: iceberg.market_data.trades
+  query: "SELECT\n  symbol,\n  date_trunc('minute', ts) AS minute,\n  min_by(price,\
+    \ ts) AS open,\n  max(price) AS high,\n  min(price) AS low,\n  max_by(price, ts)\
+    \ AS close,\n  sum(quantity) AS volume,\n  count(*) AS trade_count\nFROM iceberg.market_data.trades\n\
+    WHERE {range_filter}\nGROUP BY 1, 2\n"
+  merge_keys:
+  - symbol
+  - minute
+  filter_column: ts
+  filter_granularity: minute
+  refresh_interval_seconds: 30
+  target_table: iceberg.analytics.ohlcv_1m
+  target_partitioning: ARRAY['day(minute)']
+- name: ohlcv_5m
+  source_table: iceberg.analytics.ohlcv_1m
+  query: "SELECT\n  symbol,\n  date_trunc('minute', minute)\n    - (extract(minute\
+    \ FROM minute) % 5) * INTERVAL '1' MINUTE AS bar,\n  min_by(open, minute) AS open,\n\
+    \  max(high) AS high,\n  min(low) AS low,\n  max_by(close, minute) AS close,\n\
+    \  sum(volume) AS volume,\n  sum(trade_count) AS trade_count\nFROM iceberg.analytics.ohlcv_1m\n\
+    WHERE {range_filter}\nGROUP BY 1, 2\n"
+  merge_keys:
+  - symbol
+  - bar
+  filter_column: minute
+  filter_granularity: minute
+  refresh_interval_seconds: 60
+  target_table: iceberg.analytics.ohlcv_5m
+  target_partitioning: ARRAY['day(bar)']
