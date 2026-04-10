@@ -49,3 +49,16 @@ services:
       interval: 5s
       retries: 30
       start_period: 30s
+
+  orchestrator:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    depends_on:
+      trino:
+        condition: service_healthy
+    volumes:
+      - ../config.yaml:/app/config.yaml
+    ports:
+      - "8000:8000"
+    command: ["trino-mv-orchestrator", "-c", "/app/config.yaml"]
