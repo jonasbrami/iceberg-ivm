@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import trino
+import aiotrino
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
@@ -118,10 +118,10 @@ def get_app_state(request: Request) -> AppState:
 
 # ── Core logic ──
 
-def get_trino_connection(s: AppState) -> trino.dbapi.Connection:
+def get_trino_connection(s: AppState) -> aiotrino.dbapi.Connection:
     cfg = s.config
     log.debug("connecting to Trino at %s:%s", cfg.trino.host, cfg.trino.port)
-    return trino.dbapi.connect(
+    return aiotrino.dbapi.connect(
         host=cfg.trino.host, port=cfg.trino.port,
         catalog=cfg.trino.catalog, schema=cfg.trino.schema,
         user=cfg.trino.user,
@@ -156,9 +156,9 @@ def reload_config(s: AppState) -> bool:
         return False
 
 
-def refresh_view(s: AppState, view: ViewConfig) -> None:
+async def refresh_view(s: AppState, view: ViewConfig) -> None:
     conn = get_trino_connection(s)
-    cursor = conn.cursor()
+    cursor = await conn.cursor()
     vs = s.view_statuses.setdefault(view.name, ViewStatus(name=view.name))
 
     try:
@@ -166,19 +166,19 @@ def refresh_view(s: AppState, view: ViewConfig) -> None:
         source_labels = _parse_table_labels(view.source_table)
 
         # Auto-discover columns and create target
-        columns = discover_columns(cursor, view.query)
-        target_partitioning = view.target_partitioning or discover_source_partitioning(cursor, view.source_table)
+        columns = await discover_columns(cursor, view.query)
+        target_partitioning = view.target_partitioning or await discover_source_partitioning(cursor, view.source_table)
         create_sql = build_create_table_sql(target_table, columns, target_partitioning)
-        cursor.execute(create_sql)
+        await cursor.execute(create_sql)
 
         value_columns = [c.name for c in columns if c.name not in view.merge_keys]
 
         # Read state
-        last_snap = read_last_snapshot(cursor, target_table)
+        last_snap = await read_last_snapshot(cursor, target_table)
 
         # Detect changes via file-level column stats
         detect_start = time.monotonic()
-        result = detect_changes(
+        result = await detect_changes(
             cursor, view.source_table,
             view.filter_column, view.filter_granularity,
             last_snap,
@@ -199,19 +199,19 @@ def refresh_view(s: AppState, view: ViewConfig) -> None:
             return
 
         if result.action == RefreshAction.FULL_REFRESH:
-            refresh_result = execute_full_refresh(cursor, view, target_table)
+            refresh_result = await execute_full_refresh(cursor, view, target_table)
             vs.last_action = "full"
             vs.last_range = None
             REFRESH_TOTAL.labels(view=view.name, type="full").inc()
         else:
-            refresh_result = execute_incremental_refresh(
+            refresh_result = await execute_incremental_refresh(
                 cursor, view, target_table, value_columns, result.filter_range,
             )
             vs.last_action = "incremental"
             vs.last_range = f"[{result.filter_range[0]}, {result.filter_range[1]})"
             REFRESH_TOTAL.labels(view=view.name, type="incremental").inc()
 
-        write_last_snapshot(cursor, target_table, result.current_snapshot)
+        await write_last_snapshot(cursor, target_table, result.current_snapshot)
 
         vs.last_refresh = time.time()
         vs.last_duration = refresh_result.elapsed
@@ -231,7 +231,7 @@ def refresh_view(s: AppState, view: ViewConfig) -> None:
         REFRESH_ERRORS.labels(view=view.name).inc()
         log.exception("%s: refresh failed", view.name)
     finally:
-        conn.close()
+        await conn.close()
 
 
 async def refresh_loop(s: AppState) -> None:
@@ -253,9 +253,7 @@ async def refresh_loop(s: AppState) -> None:
                 last = last_refresh_times.get(view.name, 0)
                 if now - last >= view.refresh_interval_seconds:
                     log.debug("%s: scheduling refresh (%.0fs since last)", view.name, now - last)
-                    await asyncio.get_event_loop().run_in_executor(
-                        None, refresh_view, s, view,
-                    )
+                    await refresh_view(s, view)
                     last_refresh_times[view.name] = time.time()
 
         await asyncio.sleep(1)
@@ -454,7 +452,7 @@ async def trigger_refresh(name: str, s: AppState = Depends(get_app_state)):
     if not view:
         raise HTTPException(404, f"view '{name}' not found")
     log.info("manual refresh triggered for %r", name)
-    await asyncio.get_event_loop().run_in_executor(None, refresh_view, s, view)
+    await refresh_view(s, view)
     vs = s.view_statuses.get(name)
     return {
         "status": "ok",

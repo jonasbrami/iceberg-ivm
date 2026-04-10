@@ -119,7 +119,7 @@ def test_delete_not_found(client):
 
 # ── Trigger refresh ──
 
-@patch("trino_mv_orchestrator.server.refresh_view")
+@patch("trino_mv_orchestrator.server.refresh_view", new_callable=AsyncMock)
 def test_trigger_refresh(mock_refresh, client):
     r = client.post("/api/views/test_view/refresh")
     assert r.status_code == 200

@@ -1,38 +1,38 @@
 """Integration test fixtures: Trino connection and table setup/teardown."""
 from __future__ import annotations
 
+import asyncio
 import os
-import time
 
-import pytest
-import trino
+import aiotrino
+import pytest_asyncio
 
 
 TRINO_HOST = os.environ.get("TRINO_HOST", "localhost")
 TRINO_PORT = int(os.environ.get("TRINO_PORT", "18080"))
 
 
-def wait_for_trino(host: str, port: int, timeout: int = 120) -> None:
+async def wait_for_trino(host: str, port: int, timeout: int = 120) -> None:
     """Block until Trino is ready to accept queries."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
         try:
-            conn = trino.dbapi.connect(host=host, port=port, user="test")
-            cur = conn.cursor()
-            cur.execute("SELECT 1")
-            cur.fetchone()
-            conn.close()
+            conn = aiotrino.dbapi.connect(host=host, port=port, user="test")
+            cur = await conn.cursor()
+            await cur.execute("SELECT 1")
+            await cur.fetchone()
+            await conn.close()
             return
         except Exception:
-            time.sleep(2)
+            await asyncio.sleep(2)
     raise TimeoutError(f"Trino at {host}:{port} not ready after {timeout}s")
 
 
-@pytest.fixture(scope="session")
-def trino_conn():
+@pytest_asyncio.fixture(scope="session")
+async def trino_conn():
     """Session-scoped Trino connection. Requires docker-compose up."""
-    wait_for_trino(TRINO_HOST, TRINO_PORT)
-    conn = trino.dbapi.connect(
+    await wait_for_trino(TRINO_HOST, TRINO_PORT)
+    conn = aiotrino.dbapi.connect(
         host=TRINO_HOST,
         port=TRINO_PORT,
         catalog="iceberg",
@@ -40,13 +40,13 @@ def trino_conn():
         user="test",
     )
     yield conn
-    conn.close()
+    await conn.close()
 
 
-@pytest.fixture(autouse=True)
-def clean_tables(trino_conn):
+@pytest_asyncio.fixture(autouse=True)
+async def clean_tables(trino_conn):
     """Drop test tables before and after each test."""
-    cursor = trino_conn.cursor()
+    cursor = await trino_conn.cursor()
     tables = [
         "iceberg.test_schema.trades",
         "iceberg.test_schema.ohlcv_1m",
@@ -55,13 +55,13 @@ def clean_tables(trino_conn):
     ]
     for t in tables:
         try:
-            cursor.execute(f"DROP TABLE IF EXISTS {t}")
+            await cursor.execute(f"DROP TABLE IF EXISTS {t}")
         except Exception:
             pass
 
     # Ensure test schema exists
     try:
-        cursor.execute("CREATE SCHEMA IF NOT EXISTS iceberg.test_schema")
+        await cursor.execute("CREATE SCHEMA IF NOT EXISTS iceberg.test_schema")
     except Exception:
         pass
 
@@ -69,6 +69,6 @@ def clean_tables(trino_conn):
 
     for t in tables:
         try:
-            cursor.execute(f"DROP TABLE IF EXISTS {t}")
+            await cursor.execute(f"DROP TABLE IF EXISTS {t}")
         except Exception:
             pass
