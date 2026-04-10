@@ -4,21 +4,31 @@ from pathlib import Path
 
 import pytest
 
-from trino_mv_orchestrator.config import infer_granularity, load_config, save_config
+from trino_mv_orchestrator.config import ViewConfig, infer_granularity, load_config, load_views, save_views
 
-def write_yaml(tmp_path: Path, content: str) -> Path:
+
+def write_config(tmp_path: Path, content: str) -> Path:
     p = tmp_path / "config.yaml"
     p.write_text(textwrap.dedent(content))
     return p
 
-VALID_CONFIG = """\
+
+def write_views(tmp_path: Path, content: str) -> Path:
+    p = tmp_path / "views.yaml"
+    p.write_text(textwrap.dedent(content))
+    return p
+
+
+STATIC_CONFIG = """\
 trino:
   host: localhost
   port: 8080
   catalog: iceberg
   schema: analytics
   user: test
+"""
 
+VALID_VIEWS = """\
 views:
   - name: ohlcv_1m
     source_table: iceberg.market_data.trades
@@ -29,78 +39,120 @@ views:
     refresh_interval_seconds: 30
 """
 
+
+# ── load_config (static config only) ──
+
 def test_load_valid(tmp_path):
-    cfg = load_config(write_yaml(tmp_path, VALID_CONFIG))
+    cfg = load_config(write_config(tmp_path, STATIC_CONFIG))
     assert cfg.trino.host == "localhost"
-    assert len(cfg.views) == 1
-    v = cfg.views[0]
+    assert cfg.views == []
+
+
+def test_missing_trino(tmp_path):
+    with pytest.raises(ValueError, match="missing 'trino'"):
+        load_config(write_config(tmp_path, "server:\n  port: 8000\n"))
+
+
+def test_defaults(tmp_path):
+    cfg = load_config(write_config(tmp_path, STATIC_CONFIG))
+    assert cfg.views == []
+    assert cfg.server.port == 8000
+
+
+# ── load_views ──
+
+def test_load_views_valid(tmp_path):
+    views = load_views(write_views(tmp_path, VALID_VIEWS))
+    assert len(views) == 1
+    v = views[0]
     assert v.filter_column == "ts"
     assert v.filter_granularity == "day"
     assert v.merge_keys == ("symbol", "minute")
     assert isinstance(v.merge_keys, tuple)
 
-def test_missing_trino(tmp_path):
-    with pytest.raises(ValueError, match="missing 'trino'"):
-        load_config(write_yaml(tmp_path, "views:\n  - name: x\n    source_table: t\n    filter_column: ts\n    query: \"q {range_filter}\"\n    merge_keys: [a]\n"))
 
-def test_missing_views(tmp_path):
-    with pytest.raises(ValueError, match="missing 'views'"):
-        load_config(write_yaml(tmp_path, "trino:\n  host: x\n  port: 1\n  catalog: c\n  schema: s\n  user: u\n"))
+def test_load_views_missing_file(tmp_path):
+    assert load_views(tmp_path / "nonexistent.yaml") == []
+
+
+def test_view_defaults(tmp_path):
+    minimal = "views:\n  - name: v\n    source_table: t\n    filter_column: ts\n    filter_granularity: day\n    query: \"q {range_filter}\"\n    merge_keys: [a]\n"
+    views = load_views(write_views(tmp_path, minimal))
+    assert views[0].filter_granularity == "day"
+    assert views[0].refresh_interval_seconds == 60
+
 
 def test_missing_filter_column(tmp_path):
-    bad = VALID_CONFIG.replace("    filter_column: ts\n", "")
+    bad = VALID_VIEWS.replace("    filter_column: ts\n", "")
     with pytest.raises(ValueError, match="filter_column"):
-        load_config(write_yaml(tmp_path, bad))
+        load_views(write_views(tmp_path, bad))
+
 
 def test_invalid_granularity(tmp_path):
-    bad = VALID_CONFIG.replace("filter_granularity: day", "filter_granularity: century")
+    bad = VALID_VIEWS.replace("filter_granularity: day", "filter_granularity: century")
     with pytest.raises(ValueError, match="filter_granularity"):
-        load_config(write_yaml(tmp_path, bad))
+        load_views(write_views(tmp_path, bad))
+
 
 def test_missing_placeholder(tmp_path):
-    bad = VALID_CONFIG.replace("{range_filter}", "1=1")
+    bad = VALID_VIEWS.replace("{range_filter}", "1=1")
     with pytest.raises(ValueError, match="range_filter"):
-        load_config(write_yaml(tmp_path, bad))
+        load_views(write_views(tmp_path, bad))
 
-def test_defaults(tmp_path):
-    minimal = "trino:\n  host: x\n  port: 1\n  catalog: c\n  schema: s\n  user: u\nviews:\n  - name: v\n    source_table: t\n    filter_column: ts\n    filter_granularity: day\n    query: \"q {range_filter}\"\n    merge_keys: [a]\n"
-    cfg = load_config(write_yaml(tmp_path, minimal))
-    assert cfg.views[0].filter_granularity == "day"
-    assert cfg.views[0].refresh_interval_seconds == 60
-    assert cfg.server.port == 8000
 
 def test_invalid_view_name(tmp_path):
-    bad = VALID_CONFIG.replace("name: ohlcv_1m", "name: drop-table")
+    bad = VALID_VIEWS.replace("name: ohlcv_1m", "name: drop-table")
     with pytest.raises(ValueError, match="valid SQL identifier"):
-        load_config(write_yaml(tmp_path, bad))
+        load_views(write_views(tmp_path, bad))
+
 
 def test_invalid_source_table(tmp_path):
-    bad = VALID_CONFIG.replace("source_table: iceberg.market_data.trades", "source_table: x;DROP")
+    bad = VALID_VIEWS.replace("source_table: iceberg.market_data.trades", "source_table: x;DROP")
     with pytest.raises(ValueError, match="valid qualified table name"):
-        load_config(write_yaml(tmp_path, bad))
+        load_views(write_views(tmp_path, bad))
+
 
 def test_invalid_filter_column(tmp_path):
-    bad = VALID_CONFIG.replace("filter_column: ts", "filter_column: ts OR")
+    bad = VALID_VIEWS.replace("filter_column: ts", "filter_column: ts OR")
     with pytest.raises(ValueError, match="valid SQL identifier"):
-        load_config(write_yaml(tmp_path, bad))
+        load_views(write_views(tmp_path, bad))
+
 
 def test_invalid_merge_key(tmp_path):
-    bad = VALID_CONFIG.replace("merge_keys: [symbol, minute]", "merge_keys: [symbol, 1bad]")
+    bad = VALID_VIEWS.replace("merge_keys: [symbol, minute]", "merge_keys: [symbol, 1bad]")
     with pytest.raises(ValueError, match="valid SQL identifier"):
-        load_config(write_yaml(tmp_path, bad))
+        load_views(write_views(tmp_path, bad))
+
 
 def test_valid_qualified_table_names(tmp_path):
-    """Qualified names with dots should be accepted."""
-    cfg = load_config(write_yaml(tmp_path, VALID_CONFIG))
-    assert cfg.views[0].source_table == "iceberg.market_data.trades"
+    views = load_views(write_views(tmp_path, VALID_VIEWS))
+    assert views[0].source_table == "iceberg.market_data.trades"
 
-def test_save_and_reload(tmp_path):
-    cfg = load_config(write_yaml(tmp_path, VALID_CONFIG))
-    out = tmp_path / "out.yaml"
-    save_config(cfg, out)
-    cfg2 = load_config(out)
-    assert cfg2.views[0].filter_column == cfg.views[0].filter_column
-    assert cfg2.views[0].filter_granularity == cfg.views[0].filter_granularity
+
+# ── save_views / load_views round-trip ──
+
+def test_save_views_and_reload(tmp_path):
+    views = [ViewConfig(
+        name="ohlcv_1m",
+        source_table="iceberg.market_data.trades",
+        query="SELECT * FROM t WHERE {range_filter} GROUP BY 1",
+        merge_keys=("symbol", "minute"),
+        filter_column="ts",
+        filter_granularity="day",
+        refresh_interval_seconds=30,
+    )]
+    views_path = tmp_path / "views.yaml"
+    save_views(views, views_path)
+    loaded = load_views(views_path)
+    assert loaded[0].filter_column == views[0].filter_column
+    assert loaded[0].filter_granularity == views[0].filter_granularity
+    assert loaded[0].merge_keys == views[0].merge_keys
+
+
+def test_save_views_creates_parent_dirs(tmp_path):
+    views_path = tmp_path / "data" / "views.yaml"
+    save_views([], views_path)
+    assert views_path.exists()
 
 
 # ── infer_granularity ──
@@ -135,34 +187,34 @@ def test_infer_multiple_different_returns_none():
     assert infer_granularity(q) is None
 
 
-# ── config-level inference ──
+# ── views-level inference ──
 
-TRINO_BLOCK = "trino:\n  host: x\n  port: 1\n  catalog: c\n  schema: s\n  user: u\n"
-
-def test_load_infers_granularity(tmp_path):
-    yaml = TRINO_BLOCK + (
+def test_load_views_infers_granularity(tmp_path):
+    views_yaml = (
         "views:\n  - name: v\n    source_table: t\n    filter_column: ts\n"
         "    query: \"SELECT date_trunc('minute', ts) AS m FROM t WHERE {range_filter} GROUP BY 1\"\n"
         "    merge_keys: [m]\n"
     )
-    cfg = load_config(write_yaml(tmp_path, yaml))
-    assert cfg.views[0].filter_granularity == "minute"
+    views = load_views(write_views(tmp_path, views_yaml))
+    assert views[0].filter_granularity == "minute"
 
-def test_load_explicit_overrides_inference(tmp_path):
-    yaml = TRINO_BLOCK + (
+
+def test_load_views_explicit_overrides_inference(tmp_path):
+    views_yaml = (
         "views:\n  - name: v\n    source_table: t\n    filter_column: ts\n"
         "    filter_granularity: day\n"
         "    query: \"SELECT date_trunc('minute', ts) AS m FROM t WHERE {range_filter} GROUP BY 1\"\n"
         "    merge_keys: [m]\n"
     )
-    cfg = load_config(write_yaml(tmp_path, yaml))
-    assert cfg.views[0].filter_granularity == "day"
+    views = load_views(write_views(tmp_path, views_yaml))
+    assert views[0].filter_granularity == "day"
 
-def test_load_fails_when_cannot_infer(tmp_path):
-    yaml = TRINO_BLOCK + (
+
+def test_load_views_fails_when_cannot_infer(tmp_path):
+    views_yaml = (
         "views:\n  - name: v\n    source_table: t\n    filter_column: ts\n"
         "    query: \"SELECT ts FROM t WHERE {range_filter}\"\n"
         "    merge_keys: [ts]\n"
     )
     with pytest.raises(ValueError, match="could not be inferred"):
-        load_config(write_yaml(tmp_path, yaml))
+        load_views(write_views(tmp_path, views_yaml))
