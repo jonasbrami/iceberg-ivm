@@ -129,10 +129,14 @@ def get_app_state(request: Request) -> AppState:
 def get_trino_connection(s: AppState) -> aiotrino.dbapi.Connection:
     cfg = s.config
     log.debug("connecting to Trino at %s:%s", cfg.trino.host, cfg.trino.port)
+    # Pin every session to UTC so Trino's `date_trunc` on TIMESTAMP WITH
+    # TIME ZONE columns agrees with the Python-side snap_range math. See
+    # DESIGN.md "Timezone assumption" for the full rationale.
     return aiotrino.dbapi.connect(
         host=cfg.trino.host, port=cfg.trino.port,
         catalog=cfg.trino.catalog, schema=cfg.trino.schema,
         user=cfg.trino.user,
+        timezone="UTC",
     )
 
 
@@ -210,6 +214,15 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
         if result.action == RefreshAction.NO_CHANGE:
             vs.last_action = "skip"
             REFRESH_TOTAL.labels(view=view.name, type="skip").inc()
+            # Advance state past empty-append or compaction-only
+            # snapshots so we don't re-detect them every cycle. The
+            # unchanged-snapshot case (current_snapshot == last_snap)
+            # is a true no-op and doesn't need a write.
+            if (
+                result.current_snapshot is not None
+                and result.current_snapshot != last_snap
+            ):
+                await write_last_snapshot(cursor, target_table, result.current_snapshot)
             return
 
         if result.action == RefreshAction.FULL_REFRESH:

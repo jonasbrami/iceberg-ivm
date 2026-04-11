@@ -124,6 +124,66 @@ clobber existing properties) -- confirmed via `IcebergMetadata.java:2660`:
 
 ## Key design decisions
 
+### Timezone assumption
+
+Every Trino session the orchestrator opens is pinned to `UTC` via the
+aiotrino `timezone` connection parameter. This is a hard requirement,
+not a convenience — without it the detector and the user's GROUP BY can
+disagree on bucket boundaries and silently corrupt incremental
+aggregates.
+
+**Why it matters.** The detector computes the snapped time range in
+Python from `readable_metrics` (which Trino returns as ISO-8601 strings
+with UTC offsets) and ships a plain
+`ts >= TIMESTAMP 'A' AND ts < TIMESTAMP 'B'` filter to the MERGE. The
+filter selects rows by instant, which is unambiguous. The trap is how
+those rows are grouped: for a `TIMESTAMP WITH TIME ZONE` column,
+`date_trunc('day' | 'week' | 'month' | …, ts)` operates in the **session
+timezone**, not UTC. If the session tz is not UTC, the bucket Trino
+assigns to a row differs from the bucket Python computed.
+
+Concrete walk-through with session tz = `America/New_York` (UTC−5),
+granularity `day`, a new row at `2026-01-15 02:00:00 UTC`:
+
+- Python's `snap_range` floors to `2026-01-15 00:00 UTC` and ceils to
+  `2026-01-16 00:00 UTC`. The MERGE filter is
+  `[2026-01-15 00:00 UTC, 2026-01-16 00:00 UTC)`.
+- The MERGE reads all rows in that 24-hour UTC window, then the
+  `GROUP BY date_trunc('day', ts)` collapses them into **NY-day**
+  buckets: `[00:00 UTC, 05:00 UTC)` belong to NY day **2026-01-14**
+  (which we never intended to touch), and `[05:00 UTC, 24:00 UTC)`
+  belong to NY day **2026-01-15** (missing its final 5 hours,
+  `[24:00 UTC, 29:00 UTC)`).
+- Both buckets get aggregated from a partial slice, and
+  `WHEN MATCHED THEN UPDATE` overwrites previously-correct values with
+  wrong ones. Silent corruption.
+
+The same offset-straddling failure mode applies at week/month/quarter/
+year — anywhere a "midnight" boundary differs between UTC and session
+tz.
+
+**Fix.** Pin `timezone='UTC'` on every `aiotrino.dbapi.connect(...)` in
+`server.get_trino_connection`. `date_trunc` on tz-aware columns then
+operates in UTC, aligning with `snap_range` by construction.
+
+### Append-only source assumption
+
+The orchestrator assumes source tables are append-only. The only
+legitimate Iceberg snapshot operations are:
+
+- `append` — real new data, drives incremental refresh.
+- `replace` — compaction rewrote files; no data changed. The detector
+  advances state past the snapshot but does not run a refresh. Files
+  added by `replace` snapshots are deliberately excluded from the
+  `$all_entries` min/max scan (they're just rewritten rows and would
+  uselessly expand the range).
+
+Anything else (`overwrite`, `delete`, or an unknown future op name)
+raises `UnexpectedOperationError` and surfaces in the view status. The
+old behavior — treating every non-append as a full refresh — was wrong
+under this assumption because compactions triggered needless full
+rewrites.
+
 ### Why not dbt?
 
 Discussed during the conversation. dbt's `incremental_strategy='merge'`

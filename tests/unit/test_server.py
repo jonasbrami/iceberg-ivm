@@ -192,6 +192,90 @@ def test_reload_config_no_change(setup_state):
     assert reloaded is False
 
 
+# ── Trino connection ──
+
+def test_get_trino_connection_pins_timezone_to_utc(setup_state):
+    """All Trino sessions must be pinned to UTC.
+
+    `date_trunc('day' | 'week' | 'month', ts)` on a TIMESTAMP WITH TIME
+    ZONE column operates in the session timezone; if the session isn't
+    UTC, Trino's bucket boundaries will disagree with the Python-side
+    `snap_range` math and the MERGE will recompute partial buckets with
+    wrong aggregates. Pinning to UTC makes the two sides agree by
+    construction.
+    """
+    from trino_mv_orchestrator.server import get_trino_connection
+
+    captured = {}
+    def fake_connect(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    with patch("trino_mv_orchestrator.server.aiotrino.dbapi.connect",
+               side_effect=fake_connect):
+        get_trino_connection(setup_state)
+
+    assert captured.get("timezone") == "UTC", (
+        f"Trino connection was opened without timezone=UTC; got {captured}"
+    )
+
+
+# ── State advance on NO_CHANGE ──
+
+async def test_refresh_view_advances_state_on_empty_append_no_change(setup_state):
+    """When the detector reports NO_CHANGE but current_snapshot has
+    advanced (empty-append or compaction-only snapshots), state must
+    still be written — otherwise the view re-detects the same
+    snapshots forever.
+
+    Covers fix 7b: without the fix, write_last_snapshot is only called
+    on FULL/INCREMENTAL branches.
+    """
+    from trino_mv_orchestrator import server as server_mod
+    from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
+    from trino_mv_orchestrator.introspect import ColumnInfo
+
+    view = setup_state.config.views[0]
+    write_calls: list[int] = []
+
+    class FakeConn:
+        async def cursor(self): return FakeCursor()
+        async def close(self): pass
+
+    class FakeCursor:
+        stats = {}
+        async def execute(self, sql): pass
+        async def fetchone(self): return None
+        async def fetchall(self): return []
+
+    async def fake_write(cursor, target, snap_id):
+        write_calls.append(snap_id)
+
+    async def fake_read(cursor, target): return 100
+
+    async def fake_detect(*args, **kwargs):
+        # current_snapshot advanced to 200 but no data changed.
+        return ChangeResult(action=RefreshAction.NO_CHANGE, current_snapshot=200)
+
+    async def fake_discover_columns(cursor, query):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+
+    async def fake_discover_partitioning(cursor, src): return None
+
+    with patch.object(server_mod, "get_trino_connection", lambda s: FakeConn()), \
+         patch.object(server_mod, "discover_columns", fake_discover_columns), \
+         patch.object(server_mod, "discover_source_partitioning", fake_discover_partitioning), \
+         patch.object(server_mod, "read_last_snapshot", fake_read), \
+         patch.object(server_mod, "write_last_snapshot", fake_write), \
+         patch.object(server_mod, "detect_changes", fake_detect):
+        await server_mod.refresh_view(setup_state, view)
+
+    assert write_calls == [200], (
+        f"expected write_last_snapshot(200), got {write_calls}. "
+        f"view status: {setup_state.view_statuses[view.name]!r}"
+    )
+
+
 # ── Metrics presence ──
 
 def test_new_metrics_defined():
