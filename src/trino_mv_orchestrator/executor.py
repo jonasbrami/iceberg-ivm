@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 from trino_mv_orchestrator.config import ViewConfig
 
@@ -39,11 +39,22 @@ def build_range_filter(filter_column: str, start: datetime, end: datetime) -> st
     Produces: filter_column >= TIMESTAMP 'start' AND filter_column < TIMESTAMP 'end'
     This is a plain column range predicate that Trino pushes down to Iceberg
     partition pruning.
+
+    If the inputs are tz-aware, they are first converted to UTC so the
+    emitted ``… UTC`` literal represents the correct instant. (Without
+    this step, a wall-clock value in a non-UTC zone would get stamped
+    verbatim and Trino would reinterpret it as UTC, silently shifting
+    the range by the offset.)
     """
-    tz = " UTC" if start.tzinfo else ""
+    if start.tzinfo is not None:
+        start = start.astimezone(timezone.utc)
+        end = end.astimezone(timezone.utc)
+        suffix = " UTC"
+    else:
+        suffix = ""
     return (
-        f"{filter_column} >= TIMESTAMP '{format_ts(start)}{tz}' AND "
-        f"{filter_column} < TIMESTAMP '{format_ts(end)}{tz}'"
+        f"{filter_column} >= TIMESTAMP '{format_ts(start)}{suffix}' AND "
+        f"{filter_column} < TIMESTAMP '{format_ts(end)}{suffix}'"
     )
 
 

@@ -2,7 +2,10 @@
 from datetime import datetime, timedelta, timezone
 
 from trino_mv_orchestrator.detector import (
+    ExpiredSnapshotError,
+    MissingFilterColumnError,
     RefreshAction,
+    UnexpectedOperationError,
     _parse_ts,
     detect_changes,
     get_current_snapshot,
@@ -17,8 +20,10 @@ class MockCursor:
         self._results = results
         self._idx = 0
         self._rows = []
+        self.executed_sql: list[str] = []
 
     async def execute(self, sql: str):
+        self.executed_sql.append(sql)
         if self._idx < len(self._results):
             self._rows = list(self._results[self._idx])
         else:
@@ -281,15 +286,25 @@ class TestParseTs:
         dt = _parse_ts("2026-04-08T10:30:45.123456")
         assert dt.hour == 10 and dt.minute == 30
 
-    def test_date_only(self):
-        dt = _parse_ts("2026-04-08")
-        assert dt.day == 8
+    def test_raises_on_unparseable(self):
+        """Unrecognized formats must raise, not fall back to date-only.
 
-    def test_date_only_logs_warning(self, caplog):
-        import logging
-        with caplog.at_level(logging.WARNING, logger="trino_mv_orchestrator.detector"):
-            _parse_ts("2026-04-08")
-        assert any("date-only" in r.message for r in caplog.records)
+        The old date-only fallback could silently shift a snapped range
+        by up to 24 hours (floor to midnight UTC), corrupting incremental
+        recomputation ranges.
+        """
+        with pytest.raises(ValueError, match="unparseable"):
+            _parse_ts("not-a-timestamp")
+
+    def test_raises_on_nanosecond_precision(self):
+        """9-digit fractional seconds exceed strptime's %f (6-digit max).
+
+        Today this silently falls back to date-only, losing the time
+        component. After the fix we raise rather than produce a wrong
+        range.
+        """
+        with pytest.raises(ValueError):
+            _parse_ts("2026-04-08T10:30:45.123456789+00:00")
 
 
 # ── get_current_snapshot ──
@@ -302,6 +317,39 @@ class TestGetCurrentSnapshot:
         assert await get_current_snapshot(MockCursor([[]]), "db.t") is None
 
 
+# ── get_snapshots_since ──
+
+class TestGetSnapshotsSince:
+    async def test_raises_on_missing_last_snap(self):
+        """If last_snap is no longer in $snapshots (Iceberg expired it),
+        the orchestrator must fail loudly rather than silently return []."""
+        # First execute is the committed_at lookup for last_snap: empty.
+        cursor = MockCursor([[]])
+        with pytest.raises(ExpiredSnapshotError):
+            await get_snapshots_since(cursor, "db.t", last_snap=999)
+
+    async def test_sql_uses_snapshot_id_tiebreak(self):
+        """The committed_at > (...) comparison must tiebreak with snapshot_id,
+        otherwise sibling snapshots sharing a millisecond-precision
+        committed_at with last_snap would be dropped.
+
+        We assert the shape of the generated SQL (two-query split, with the
+        second query referencing snapshot_id in its predicate).
+        """
+        cursor = MockCursor([
+            [(1_700_000_000_000,)],           # committed_at of last_snap
+            [(200, "append"), (300, "append")],
+        ])
+        await get_snapshots_since(cursor, "db.t", last_snap=100)
+        assert len(cursor.executed_sql) == 2, (
+            "expected two queries (committed_at lookup + later snapshots), "
+            f"got {cursor.executed_sql}"
+        )
+        second = cursor.executed_sql[1]
+        assert "snapshot_id" in second
+        assert "100" in second  # last_snap appears in the tiebreak clause
+
+
 # ── get_new_files_column_range ──
 
 class TestGetNewFilesColumnRange:
@@ -312,12 +360,51 @@ class TestGetNewFilesColumnRange:
         ]])
         result = await get_new_files_column_range(cursor, "db.t", [100, 200], "ts")
         assert result is not None
-        assert "09:00:00" in result[0]
-        assert "15:00:00" in result[1]
+        lo, hi = result
+        assert lo == datetime(2026, 4, 8, 9, 0, tzinfo=timezone.utc)
+        assert hi == datetime(2026, 4, 8, 15, 0, tzinfo=timezone.utc)
 
     async def test_no_data_files(self):
         cursor = MockCursor([[]])
         assert await get_new_files_column_range(cursor, "db.t", [100], "ts") is None
+
+    async def test_raises_when_filter_column_absent_from_metrics(self):
+        """File rows exist, but none contain the filter_column in their
+        per-column metrics. That's a configuration error (typo'd column
+        name, schema drift) — must fail loudly instead of silently
+        returning None and freezing the view.
+        """
+        cursor = MockCursor([[
+            ({"other_col": {"lower_bound": "1", "upper_bound": "2"}},),
+            ({"other_col": {"lower_bound": "3", "upper_bound": "4"}},),
+        ]])
+        with pytest.raises(MissingFilterColumnError):
+            await get_new_files_column_range(cursor, "db.t", [1], "ts")
+
+    async def test_min_max_ignores_lex_order(self):
+        """Two files whose chronological order disagrees with lex order.
+
+        The first row's lower_bound is "2026-04-08T09:00:00.000000+00:00".
+        The second row's lower_bound is "2026-04-08T08:00:00.000000-01:00",
+        which is the SAME instant (09:00 UTC). Its upper_bound is
+        "2026-04-08T09:30:00.000000-01:00" = 10:30 UTC, which is LATER
+        chronologically than the first row's upper_bound (10:00 UTC) —
+        but LEXICOGRAPHICALLY its string is EARLIER because "08..." < "09...".
+
+        After the fix, get_new_files_column_range returns datetimes and
+        computes min/max on the instants, not the strings.
+        """
+        cursor = MockCursor([[
+            ({"ts": {"lower_bound": "2026-04-08T09:00:00.000000+00:00",
+                     "upper_bound": "2026-04-08T10:00:00.000000+00:00"}},),
+            ({"ts": {"lower_bound": "2026-04-08T08:00:00.000000-01:00",
+                     "upper_bound": "2026-04-08T09:30:00.000000-01:00"}},),
+        ]])
+        result = await get_new_files_column_range(cursor, "db.t", [1, 2], "ts")
+        assert result is not None
+        lo, hi = result
+        assert lo == datetime(2026, 4, 8, 9, 0, tzinfo=timezone.utc)
+        assert hi == datetime(2026, 4, 8, 10, 30, tzinfo=timezone.utc)
 
 
 # ── detect_changes ──
@@ -334,18 +421,11 @@ class TestDetectChanges:
         assert r.action == RefreshAction.FULL_REFRESH
         assert r.current_snapshot == 200
 
-    async def test_full_refresh_on_overwrite(self):
-        cursor = MockCursor([
-            [(200,)],              # get_current_snapshot
-            [(200, "overwrite")],  # get_snapshots_since
-        ])
-        r = await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
-        assert r.action == RefreshAction.FULL_REFRESH
-
     async def test_incremental_with_range(self):
         cursor = MockCursor([
-            [(200,)],              # get_current_snapshot
-            [(200, "append")],     # get_snapshots_since
+            [(200,)],                    # get_current_snapshot
+            [(1_700_000_000_000,)],      # committed_at lookup for last_snap
+            [(200, "append")],           # snapshots strictly since last_snap
             # get_new_files_column_range — readable_metrics per file
             [({"ts": {"lower_bound": "2026-04-08T10:00:00+00:00", "upper_bound": "2026-04-08T15:30:00+00:00"}},)],
         ])
@@ -360,6 +440,7 @@ class TestDetectChanges:
     async def test_incremental_week_granularity(self):
         cursor = MockCursor([
             [(200,)],
+            [(1_700_000_000_000,)],      # committed_at lookup
             [(200, "append")],
             [({"ts": {"lower_bound": "2026-04-08T10:00:00+00:00", "upper_bound": "2026-04-08T15:00:00+00:00"}},)],
         ])
@@ -373,8 +454,63 @@ class TestDetectChanges:
     async def test_no_data_files_in_new_snapshots(self):
         cursor = MockCursor([
             [(200,)],
+            [(1_700_000_000_000,)],      # committed_at lookup
             [(200, "append")],
             [],  # no entries from $all_entries
         ])
         r = await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
         assert r.action == RefreshAction.NO_CHANGE
+
+    async def test_compaction_only_no_change_advances_state(self):
+        """Only `replace` (compaction) snapshots since last_snap: no data
+        changed, just files rewritten. Detector should return NO_CHANGE
+        with the advanced current_snapshot and must NOT issue the
+        $all_entries file-range query.
+        """
+        cursor = MockCursor([
+            [(200,)],                          # current_snapshot
+            [(1_700_000_000_000,)],            # committed_at lookup
+            [(200, "replace")],                # compaction-only
+            # no $all_entries query should follow
+        ])
+        r = await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
+        assert r.action == RefreshAction.NO_CHANGE
+        assert r.current_snapshot == 200
+        # Exactly 3 queries: current_snapshot, committed_at lookup,
+        # snapshots-since. No file-range query.
+        assert len(cursor.executed_sql) == 3, cursor.executed_sql
+        assert not any("all_entries" in s for s in cursor.executed_sql)
+
+    async def test_mixed_append_and_replace_uses_only_append_snapshots(self):
+        """When the new-snapshot set contains both an append and a
+        compaction, the file-range query must scope to the append
+        snapshot only. Compaction-added files contain the same rows
+        rewritten and would uselessly expand the range.
+        """
+        cursor = MockCursor([
+            [(51,)],                                                 # current_snapshot
+            [(1_700_000_000_000,)],                                  # committed_at lookup
+            [(50, "append"), (51, "replace")],                       # both ops
+            [({"ts": {"lower_bound": "2026-04-08T09:00:00+00:00",
+                      "upper_bound": "2026-04-08T10:00:00+00:00"}},)],
+        ])
+        r = await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
+        assert r.action == RefreshAction.INCREMENTAL
+        file_query = next(s for s in cursor.executed_sql if "all_entries" in s)
+        assert "IN (50)" in file_query, (
+            f"expected file-range query to scope to append snapshot 50 only, "
+            f"got: {file_query}"
+        )
+        assert "51" not in file_query
+
+    async def test_unexpected_operation_raises(self):
+        """`overwrite`, `delete`, and any unknown op violate the
+        append-only assumption and must raise, not silently trigger a
+        FULL_REFRESH (which was the old behavior)."""
+        cursor = MockCursor([
+            [(200,)],
+            [(1_700_000_000_000,)],
+            [(200, "overwrite")],
+        ])
+        with pytest.raises(UnexpectedOperationError):
+            await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)

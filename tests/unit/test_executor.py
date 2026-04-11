@@ -1,5 +1,5 @@
 """Tests for the refresh executor SQL generation."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from trino_mv_orchestrator.config import ViewConfig
 from trino_mv_orchestrator.executor import (
@@ -37,6 +37,24 @@ class TestBuildRangeFilter:
         f = build_range_filter("ts", datetime(2026, 1, 1, tzinfo=timezone.utc), datetime(2026, 1, 2, tzinfo=timezone.utc))
         assert "date_trunc" not in f
         assert "CAST" not in f
+
+    def test_converts_non_utc_to_utc(self):
+        """A non-UTC tz-aware datetime must be converted to the UTC instant
+        before being stamped as a `... UTC` literal.
+
+        The old code ran strftime without %z and tacked on " UTC",
+        emitting the wall-clock value mislabeled as UTC — a silent instant
+        shift of (offset) hours.
+        """
+        paris = timezone(timedelta(hours=2))
+        start = datetime(2026, 4, 8, 10, 0, 0, tzinfo=paris)  # = 08:00 UTC
+        end = datetime(2026, 4, 8, 11, 0, 0, tzinfo=paris)    # = 09:00 UTC
+        f = build_range_filter("ts", start, end)
+        assert "TIMESTAMP '2026-04-08 08:00:00.000000 UTC'" in f
+        assert "TIMESTAMP '2026-04-08 09:00:00.000000 UTC'" in f
+        # And the mislabeled wall-clock should not appear.
+        assert "10:00:00.000000 UTC" not in f
+        assert "11:00:00.000000 UTC" not in f
 
 
 class TestBuildMergeSql:

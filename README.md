@@ -301,7 +301,16 @@ a `{range_filter}` in the WHERE clause.
 
 ### Assumptions
 
-- **Append-only sources** (trades, logs, events)
+- **Append-only sources** (trades, logs, events). Only Iceberg `append` and
+  `replace` (compaction) snapshot operations are allowed. `replace` is
+  skipped — files were rewritten but no data changed. Any other operation
+  (`overwrite`, `delete`) fails loudly.
+- **UTC session timezone.** The orchestrator pins every Trino session to
+  `UTC` so that `date_trunc('day' | 'week' | …, ts)` on `TIMESTAMP WITH
+  TIME ZONE` columns aligns with the Python-side `snap_range` bucket math.
+  Without this pin, a non-UTC session would produce bucket boundaries
+  that disagree with the computed filter range and silently corrupt
+  incremental aggregates. See [DESIGN.md](DESIGN.md#timezone-assumption).
 - **Iceberg v2** (required for MERGE)
 - Source files have column-level min/max statistics (default in Parquet)
 
