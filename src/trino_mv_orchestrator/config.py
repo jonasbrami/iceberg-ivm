@@ -10,7 +10,7 @@ import yaml
 
 log = logging.getLogger(__name__)
 
-VALID_GRANULARITIES = ("minute", "hour", "day", "week", "month", "quarter", "year")
+VALID_GRANULARITIES = frozenset(("minute", "hour", "day", "week", "month", "quarter", "year"))
 
 _IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 _QUALIFIED_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$")
@@ -47,7 +47,7 @@ def infer_granularity(query: str) -> str:
         )
 
     granularities = {m.lower() for m in matches}
-    valid = granularities & set(VALID_GRANULARITIES)
+    valid = granularities & VALID_GRANULARITIES
     if len(valid) != 1:
         raise ValueError(
             f"could not infer a single granularity from query; "
@@ -104,9 +104,9 @@ class Config:
 
 
 def _parse_view(raw: dict) -> ViewConfig:
-    for key in ("name", "source_table", "query", "merge_keys", "filter_column"):
-        if key not in raw:
-            raise ValueError(f"view missing required field: {key}")
+    missing = {"name", "source_table", "query", "merge_keys", "filter_column"} - raw.keys()
+    if missing:
+        raise ValueError(f"view missing required fields: {sorted(missing)}")
 
     _validate_identifier(raw["name"], "name")
     _validate_qualified_name(raw["source_table"], "source_table")
@@ -147,9 +147,9 @@ def load_config(path: str | Path) -> Config:
         raise ValueError("config missing 'trino' section")
 
     trino_raw = raw["trino"]
-    for key in ("host", "port", "catalog", "schema", "user"):
-        if key not in trino_raw:
-            raise ValueError(f"trino config missing required field: {key}")
+    missing = {"host", "port", "catalog", "schema", "user"} - trino_raw.keys()
+    if missing:
+        raise ValueError(f"trino config missing required fields: {sorted(missing)}")
 
     trino = TrinoConfig(
         host=trino_raw["host"],

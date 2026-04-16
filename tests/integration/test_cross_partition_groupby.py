@@ -142,6 +142,72 @@ class TestWeeklyBarsCrossPartition:
         assert rows[1][1] == 50.0   # Week 2 new
 
 
+class TestLateArrivingData:
+    """Out-of-order ingestion: a row whose timestamp is *earlier* than
+    data already processed in a previous refresh cycle.
+
+    This is the canonical streaming case the orchestrator exists for.
+    The detector reads the late row's min/max from $all_entries, snaps
+    to the bucket containing the late timestamp, and the MERGE
+    recomputes that historical bucket from complete source data.
+    """
+
+    async def test_late_row_recomputes_old_weekly_bucket(self, trino_conn):
+        """Setup: process week of Apr 6 (Mon+Tue), then process week of
+        Apr 13. Then a Wednesday-Apr-8 row arrives late — it belongs to
+        the *first* week, which has already been written.
+
+        Expected: the Apr-6 week bar is recomputed to include the late
+        row (volume goes 300 → 350, trade_count goes 2 → 3) WITHOUT
+        touching the Apr-13 week bar.
+        """
+        cursor = await trino_conn.cursor()
+        await cursor.execute(CREATE_SOURCE)
+
+        # Week 1: Mon + Tue. Full refresh.
+        await insert_trades(cursor, "2026-04-06", [("AAPL", "10:00:00", 150.0, 100)])
+        await insert_trades(cursor, "2026-04-07", [("AAPL", "10:00:00", 160.0, 200)])
+        result, value_cols = await setup_and_full_refresh(cursor, WEEKLY_VIEW, WEEKLY_TARGET)
+        last_snap = result.current_snapshot
+
+        # Week 2: Mon. Incremental refresh — advances state past week 1.
+        await insert_trades(cursor, "2026-04-13", [("AAPL", "10:00:00", 200.0, 50)])
+        result = await detect_changes(cursor, SOURCE_TABLE, "ts", "week", last_snap)
+        assert result.action == RefreshAction.INCREMENTAL
+        await execute_incremental_refresh(cursor, WEEKLY_VIEW, WEEKLY_TARGET, value_cols, result.filter_range)
+        await write_last_snapshot(cursor, WEEKLY_TARGET, result.current_snapshot)
+        last_snap = result.current_snapshot
+
+        # Sanity: target now has both weekly bars
+        await cursor.execute(f"SELECT week, volume FROM {WEEKLY_TARGET} WHERE symbol = 'AAPL' ORDER BY week")
+        rows = await cursor.fetchall()
+        assert len(rows) == 2
+        assert rows[0][1] == 300.0
+        assert rows[1][1] == 50.0
+
+        # LATE-ARRIVING row: Wednesday Apr 8 — belongs to week 1, which
+        # has already been processed and persisted.
+        await insert_trades(cursor, "2026-04-08", [("AAPL", "10:00:00", 155.0, 50)])
+
+        result = await detect_changes(cursor, SOURCE_TABLE, "ts", "week", last_snap)
+        assert result.action == RefreshAction.INCREMENTAL
+        # The detector must snap back to week 1 — Mon Apr 6 to Mon Apr 13.
+        start, end = result.filter_range
+        assert start.day == 6, f"late row should re-open week of Apr 6, got start={start}"
+        assert end.day == 13,  f"late row should not extend into week 2, got end={end}"
+
+        await execute_incremental_refresh(cursor, WEEKLY_VIEW, WEEKLY_TARGET, value_cols, result.filter_range)
+
+        # Week 1 is recomputed (now 350); week 2 is untouched (still 50).
+        await cursor.execute(f"SELECT week, volume, trade_count FROM {WEEKLY_TARGET} WHERE symbol = 'AAPL' ORDER BY week")
+        rows = await cursor.fetchall()
+        assert len(rows) == 2, f"expected 2 weekly bars, got {len(rows)}"
+        assert rows[0][1] == 350.0, f"week 1 volume should be 350 (late row included), got {rows[0][1]}"
+        assert rows[0][2] == 3,     f"week 1 trade_count should be 3, got {rows[0][2]}"
+        assert rows[1][1] == 50.0,  f"week 2 should be untouched, got {rows[1][1]}"
+        assert rows[1][2] == 1,     f"week 2 trade_count should be 1, got {rows[1][2]}"
+
+
 class TestMonthlyBarsCrossPartition:
     """Monthly bars from daily-partitioned source."""
 
