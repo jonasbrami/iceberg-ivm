@@ -5,6 +5,7 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -68,13 +69,9 @@ SOURCE_SNAPSHOT = Gauge(
 
 
 def _parse_table_labels(table: str) -> dict[str, str]:
-    """Split a qualified table name into Prometheus label dict."""
-    parts = table.split(".")
-    if len(parts) == 3:
-        return {"catalog": parts[0], "schema": parts[1], "table": parts[2]}
-    if len(parts) == 2:
-        return {"catalog": "", "schema": parts[0], "table": parts[1]}
-    return {"catalog": "", "schema": "", "table": table}
+    """Split a qualified table name into a Prometheus label dict."""
+    parts = (["", ""] + table.split("."))[-3:]
+    return dict(zip(("catalog", "schema", "table"), parts))
 
 
 # ── Application state ──
@@ -368,6 +365,16 @@ class ViewResponse(BaseModel):
     status: dict | None = None
 
 
+def _view_to_response(v: ViewConfig, vs: ViewStatus | None) -> ViewResponse:
+    return ViewResponse(
+        name=v.name, source_table=v.source_table, query=v.query,
+        merge_keys=v.merge_keys, filter_column=v.filter_column,
+        target_table=v.target_table, target_partitioning=v.target_partitioning,
+        refresh_interval_seconds=v.refresh_interval_seconds,
+        status=dataclasses.asdict(vs) if vs else None,
+    )
+
+
 # ── Form schema (drives the UI dynamically) ──
 
 VIEW_FORM_SCHEMA: list[dict] = [
@@ -415,22 +422,7 @@ def metrics():
 def list_views(s: AppState = Depends(get_app_state)) -> list[ViewResponse]:
     if not s.config:
         return []
-    result = []
-    for v in s.config.views:
-        vs = s.view_statuses.get(v.name)
-        result.append(ViewResponse(
-            name=v.name, source_table=v.source_table, query=v.query,
-            merge_keys=v.merge_keys, filter_column=v.filter_column,
-            target_table=v.target_table, target_partitioning=v.target_partitioning,
-            refresh_interval_seconds=v.refresh_interval_seconds,
-            status={
-                "last_refresh": vs.last_refresh, "last_duration": vs.last_duration,
-                "last_action": vs.last_action, "last_range": vs.last_range,
-                "last_error": vs.last_error, "total_refreshes": vs.total_refreshes,
-                "total_errors": vs.total_errors,
-            } if vs else None,
-        ))
-    return result
+    return [_view_to_response(v, s.view_statuses.get(v.name)) for v in s.config.views]
 
 
 @app.post("/api/views", status_code=201)
@@ -448,12 +440,7 @@ def create_view(
     except ValueError as exc:
         raise HTTPException(422, str(exc))
 
-    new_view = ViewConfig(
-        name=body.name, source_table=body.source_table, query=body.query,
-        merge_keys=body.merge_keys, filter_column=body.filter_column,
-        target_table=body.target_table, target_partitioning=body.target_partitioning,
-        refresh_interval_seconds=body.refresh_interval_seconds,
-    )
+    new_view = ViewConfig(**body.model_dump())
     new_views = list(s.config.views) + [new_view]
     new_cfg = Config(trino=s.config.trino, views=new_views, server=s.config.server)
     save_views(new_views, s.views_path)
@@ -463,12 +450,7 @@ def create_view(
     VIEWS_CONFIGURED.set(len(new_views))
     log.info("created view %r via API", body.name)
 
-    return ViewResponse(
-        name=body.name, source_table=body.source_table, query=body.query,
-        merge_keys=body.merge_keys, filter_column=body.filter_column,
-        target_table=body.target_table, target_partitioning=body.target_partitioning,
-        refresh_interval_seconds=body.refresh_interval_seconds,
-    )
+    return _view_to_response(new_view, s.view_statuses[body.name])
 
 
 @app.delete("/api/views/{name}", status_code=204)

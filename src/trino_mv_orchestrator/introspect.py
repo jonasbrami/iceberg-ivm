@@ -19,13 +19,10 @@ async def discover_source_tables(cursor, query: str) -> list[str]:
     row = await cursor.fetchone()
     explain_json = json.loads(row[0])
 
-    tables = []
-    for info in explain_json.get("inputTableColumnInfos", []):
-        t = info["table"]
-        fqn = f"{t['catalog']}.{t['schemaTable']['schema']}.{t['schemaTable']['table']}"
-        if fqn not in tables:
-            tables.append(fqn)
-    return tables
+    return list(dict.fromkeys(
+        f"{i['table']['catalog']}.{i['table']['schemaTable']['schema']}.{i['table']['schemaTable']['table']}"
+        for i in explain_json.get("inputTableColumnInfos", [])
+    ))
 
 
 async def discover_columns(cursor, query: str) -> list[ColumnInfo]:

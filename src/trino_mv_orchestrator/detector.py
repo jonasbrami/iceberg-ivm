@@ -197,25 +197,26 @@ async def get_new_files_column_range(
 
 
 def _parse_ts(value: str) -> datetime:
-    """Parse an Iceberg timestamp string to a Python datetime.
+    """Parse an Iceberg readable_metrics timestamp to a datetime.
 
-    Iceberg readable_metrics returns ISO-ish strings like
-    ``2026-04-08T10:00:41.385604+00:00``. We try the four common Trino
-    output shapes. If none matches we raise — silently falling back to
-    date-only parsing could drop the time component and shift a snapped
-    incremental range by up to 24 hours, corrupting the MERGE.
+    Sub-microsecond precision is silently truncated to microseconds —
+    snap_range floors to minute or coarser, so it cannot affect which
+    bucket a row belongs to.
     """
-    for fmt in (
-        "%Y-%m-%dT%H:%M:%S.%f%z",
-        "%Y-%m-%dT%H:%M:%S%z",
-        "%Y-%m-%dT%H:%M:%S.%f",
-        "%Y-%m-%dT%H:%M:%S",
-    ):
-        try:
-            return datetime.strptime(value, fmt)
-        except ValueError:
-            continue
-    raise ValueError(f"unparseable timestamp: {value!r}")
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as e:
+        raise ValueError(f"unparseable timestamp: {value!r}") from e
+
+
+def midnight(dt: datetime) -> datetime:
+    return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _add_months(dt: datetime, n: int) -> datetime:
+    # dt is assumed to be the first of a month; add n months with year rollover.
+    idx = (dt.year * 12 + dt.month - 1) + n
+    return dt.replace(year=idx // 12, month=(idx % 12) + 1)
 
 
 def snap_range(
@@ -233,40 +234,23 @@ def snap_range(
         start = min_ts.replace(minute=0, second=0, microsecond=0)
         end = max_ts.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     elif granularity == "day":
-        start = min_ts.replace(hour=0, minute=0, second=0, microsecond=0)
-        end = max_ts.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        start = midnight(min_ts)
+        end = midnight(max_ts) + timedelta(days=1)
     elif granularity == "week":
         # ISO week: Monday = 0
-        start = (min_ts - timedelta(days=min_ts.weekday())).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        end = (max_ts - timedelta(days=max_ts.weekday())).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        ) + timedelta(weeks=1)
+        start = midnight(min_ts - timedelta(days=min_ts.weekday()))
+        end = midnight(max_ts - timedelta(days=max_ts.weekday())) + timedelta(weeks=1)
     elif granularity == "month":
-        start = min_ts.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        # First day of next month after max_ts
-        if max_ts.month == 12:
-            end = max_ts.replace(year=max_ts.year + 1, month=1, day=1,
-                                 hour=0, minute=0, second=0, microsecond=0)
-        else:
-            end = max_ts.replace(month=max_ts.month + 1, day=1,
-                                 hour=0, minute=0, second=0, microsecond=0)
+        start = midnight(min_ts).replace(day=1)
+        end = _add_months(midnight(max_ts).replace(day=1), 1)
     elif granularity == "quarter":
         q_start = ((min_ts.month - 1) // 3) * 3 + 1
-        start = min_ts.replace(month=q_start, day=1, hour=0, minute=0, second=0, microsecond=0)
+        start = midnight(min_ts).replace(month=q_start, day=1)
         q_start_max = ((max_ts.month - 1) // 3) * 3 + 1
-        next_q = q_start_max + 3
-        if next_q > 12:
-            end = max_ts.replace(year=max_ts.year + 1, month=next_q - 12, day=1,
-                                 hour=0, minute=0, second=0, microsecond=0)
-        else:
-            end = max_ts.replace(month=next_q, day=1,
-                                 hour=0, minute=0, second=0, microsecond=0)
+        end = _add_months(midnight(max_ts).replace(month=q_start_max, day=1), 3)
     elif granularity == "year":
-        start = min_ts.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-        end = max_ts.replace(year=max_ts.year + 1, month=1, day=1,
-                             hour=0, minute=0, second=0, microsecond=0)
+        start = midnight(min_ts).replace(month=1, day=1)
+        end = midnight(max_ts).replace(year=max_ts.year + 1, month=1, day=1)
     else:
         raise ValueError(f"unsupported granularity: {granularity}")
 

@@ -3,6 +3,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+from pathlib import Path
+
+import uvicorn
+
+from trino_mv_orchestrator.config import load_config
+from trino_mv_orchestrator.server import app, set_config_path, set_views_path
 
 
 def main() -> None:
@@ -34,11 +40,6 @@ def main() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    from pathlib import Path
-
-    from trino_mv_orchestrator.config import load_config
-    from trino_mv_orchestrator.server import app, set_config_path, set_views_path
-
     config_path = Path(args.config)
     set_config_path(config_path)
     set_views_path(Path(args.views))
@@ -48,7 +49,6 @@ def main() -> None:
     log = logging.getLogger(__name__)
     log.info("starting trino-mv-orchestrator on port %d", cfg.server.port)
 
-    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=cfg.server.port, log_level="info")
 
 
