@@ -286,18 +286,27 @@ partial-bucket refreshes.
 
 ### Query shape
 
-The query must be a `SELECT ... GROUP BY` over a **single source table** with
-a `{range_filter}` in the WHERE clause.
+The query **must** be a `SELECT ... GROUP BY` over a **single source table**
+with a `{range_filter}` in the WHERE clause. Anything else is unsupported.
 
 ### Not supported
 
-- **Joins** -- change detection tracks one source table only
-- **Non-time GROUP BY** -- `GROUP BY symbol` with no time component degrades
-  to near-full-refresh on every change
-- **Source deletes/overwrites** -- detected via `$snapshots`, triggers full
-  refresh (correct but expensive)
+- **Joins.** The query must reference exactly one source table. Change
+  detection only inspects `view.source_table`; if a query joined a second
+  table, updates to that other table would never trigger a refresh and the
+  MV would silently go stale. Joins are not validated against today — do
+  not configure a view whose query contains a JOIN.
+- **Queries without `GROUP BY`.** The orchestrator's correctness model is
+  built around `date_trunc('X', col)` defining the aggregation buckets.
+  A query without a `GROUP BY` (or one whose GROUP BY has no `date_trunc`)
+  is rejected at config load by the granularity-inference check.
+- **Non-time GROUP BY** -- `GROUP BY symbol` with no time component is
+  rejected for the same reason: there is no granularity to snap to.
+- **Source deletes/overwrites** -- detected via `$snapshots`, raises
+  `UnexpectedOperationError` (the project assumes append-only sources).
 - **Missing column stats** -- if the source writer disables Iceberg column
-  statistics, the detector can't determine the affected range
+  statistics, the detector can't determine the affected range and raises
+  `MissingFilterColumnError`.
 
 ### Assumptions
 

@@ -153,6 +153,96 @@ class TestSnapRange:
         assert e == datetime(2028, 1, 1, tzinfo=timezone.utc)
 
 
+class TestSnapRangeBoundaryExact:
+    """A row whose timestamp lands exactly on a bucket boundary belongs to
+    the bucket *starting* at that boundary, never the previous one. The
+    snapped range must therefore include that bucket — i.e. end must be
+    strictly greater than the boundary timestamp.
+
+    These cases catch off-by-one regressions where ceil_excl mistakenly
+    returns the boundary itself instead of the next boundary.
+    """
+
+    def test_min_and_max_both_at_minute_boundary(self):
+        ts = datetime(2026, 4, 8, 10, 0, 0, 0, tzinfo=timezone.utc)
+        s, e = snap_range(ts, ts, "minute")
+        # The single point belongs to the minute starting at ts
+        assert s == ts
+        assert e == ts + timedelta(minutes=1)
+
+    def test_max_at_hour_boundary_advances_end(self):
+        # min mid-hour, max exactly on the next hour boundary.
+        # The max row sits in the [11:00, 12:00) bucket → end must be 12:00.
+        s, e = snap_range(
+            datetime(2026, 4, 8, 10, 30, tzinfo=timezone.utc),
+            datetime(2026, 4, 8, 11, 0, tzinfo=timezone.utc),
+            "hour",
+        )
+        assert s == datetime(2026, 4, 8, 10, 0, tzinfo=timezone.utc)
+        assert e == datetime(2026, 4, 8, 12, 0, tzinfo=timezone.utc)
+
+    def test_both_at_day_boundary(self):
+        d = datetime(2026, 4, 8, 0, 0, 0, 0, tzinfo=timezone.utc)
+        s, e = snap_range(d, d, "day")
+        assert s == d
+        assert e == d + timedelta(days=1)
+
+    def test_max_exactly_at_next_day_midnight(self):
+        # min on Apr 8, max exactly Apr 9 00:00 → max row belongs to Apr 9
+        s, e = snap_range(
+            datetime(2026, 4, 8, 10, 0, tzinfo=timezone.utc),
+            datetime(2026, 4, 9, 0, 0, 0, 0, tzinfo=timezone.utc),
+            "day",
+        )
+        assert s == datetime(2026, 4, 8, tzinfo=timezone.utc)
+        assert e == datetime(2026, 4, 10, tzinfo=timezone.utc)
+
+    def test_both_at_week_start(self):
+        # 2026-04-06 is a Monday — exact week boundary
+        mon = datetime(2026, 4, 6, 0, 0, 0, 0, tzinfo=timezone.utc)
+        s, e = snap_range(mon, mon, "week")
+        assert s == mon
+        assert e == mon + timedelta(days=7)
+
+    def test_max_at_next_week_start(self):
+        # min mid-week, max on next Monday 00:00 → max belongs to next week
+        s, e = snap_range(
+            datetime(2026, 4, 8, 10, 0, tzinfo=timezone.utc),     # Wed week 1
+            datetime(2026, 4, 13, 0, 0, tzinfo=timezone.utc),     # Mon week 2
+            "week",
+        )
+        assert s == datetime(2026, 4, 6, tzinfo=timezone.utc)     # Mon week 1
+        assert e == datetime(2026, 4, 20, tzinfo=timezone.utc)    # Mon week 3
+
+    def test_both_at_month_start(self):
+        m = datetime(2026, 4, 1, 0, 0, 0, 0, tzinfo=timezone.utc)
+        s, e = snap_range(m, m, "month")
+        assert s == m
+        assert e == datetime(2026, 5, 1, tzinfo=timezone.utc)
+
+    def test_max_at_next_month_start_year_boundary(self):
+        # max exactly on Jan 1 next year → max belongs to January
+        s, e = snap_range(
+            datetime(2026, 12, 15, tzinfo=timezone.utc),
+            datetime(2027, 1, 1, 0, 0, 0, 0, tzinfo=timezone.utc),
+            "month",
+        )
+        assert s == datetime(2026, 12, 1, tzinfo=timezone.utc)
+        assert e == datetime(2027, 2, 1, tzinfo=timezone.utc)
+
+    def test_both_at_quarter_start(self):
+        q = datetime(2026, 4, 1, 0, 0, 0, 0, tzinfo=timezone.utc)  # Q2 start
+        s, e = snap_range(q, q, "quarter")
+        assert s == q
+        assert e == datetime(2026, 7, 1, tzinfo=timezone.utc)      # Q3 start
+
+    def test_both_at_year_start(self):
+        y = datetime(2026, 1, 1, 0, 0, 0, 0, tzinfo=timezone.utc)
+        s, e = snap_range(y, y, "year")
+        assert s == y
+        assert e == datetime(2027, 1, 1, tzinfo=timezone.utc)
+
+
 # ── snap_range is the inverse of date_trunc ──
 
 def _py_date_trunc(granularity: str, ts: datetime) -> datetime:
@@ -296,15 +386,15 @@ class TestParseTs:
         with pytest.raises(ValueError, match="unparseable"):
             _parse_ts("not-a-timestamp")
 
-    def test_raises_on_nanosecond_precision(self):
-        """9-digit fractional seconds exceed strptime's %f (6-digit max).
+    def test_truncates_sub_microsecond_precision(self):
+        """9-digit fractional seconds are truncated to 6 (microseconds).
 
-        Today this silently falls back to date-only, losing the time
-        component. After the fix we raise rather than produce a wrong
-        range.
+        snap_range floors to minute or coarser, so dropping the last
+        three digits cannot shift the bucket a row belongs to —
+        truncation is correctness-safe.
         """
-        with pytest.raises(ValueError):
-            _parse_ts("2026-04-08T10:30:45.123456789+00:00")
+        dt = _parse_ts("2026-04-08T10:30:45.123456789+00:00")
+        assert dt == datetime(2026, 4, 8, 10, 30, 45, 123456, tzinfo=timezone.utc)
 
 
 # ── get_current_snapshot ──
