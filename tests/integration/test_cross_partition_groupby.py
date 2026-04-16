@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import pytest
 
-from trino_mv_orchestrator.config import ViewConfig, infer_granularity
+from trino_mv_orchestrator.config import ViewConfig
 from trino_mv_orchestrator.detector import RefreshAction, detect_changes
 from trino_mv_orchestrator.executor import execute_full_refresh, execute_incremental_refresh
 from trino_mv_orchestrator.introspect import discover_columns, build_create_table_sql
+from trino_mv_orchestrator.query_parser import parse_view_query
 from trino_mv_orchestrator.state import write_last_snapshot
 
 pytestmark = [pytest.mark.integration, pytest.mark.xdist_group("integration")]
@@ -27,30 +28,30 @@ CREATE TABLE {SOURCE_TABLE} (
 """
 
 WEEKLY_VIEW = ViewConfig(
-    name="test_weekly", source_table=SOURCE_TABLE, filter_column="ts",
+    name="test_weekly",
     query=f"""
         SELECT symbol, date_trunc('week', ts) AS week,
                min_by(price, ts) AS open, max(price) AS high,
                min(price) AS low, max_by(price, ts) AS close,
                sum(quantity) AS volume, count(*) AS trade_count
-        FROM {SOURCE_TABLE} WHERE {{range_filter}} GROUP BY 1, 2
+        FROM {SOURCE_TABLE} GROUP BY 1, 2
     """,
-    merge_keys=["symbol", "week"],
     target_table=WEEKLY_TARGET, target_partitioning="ARRAY['day(week)']",
 )
+WEEKLY_PARSED = parse_view_query(WEEKLY_VIEW.query)
 
 MONTHLY_VIEW = ViewConfig(
-    name="test_monthly", source_table=SOURCE_TABLE, filter_column="ts",
+    name="test_monthly",
     query=f"""
         SELECT symbol, date_trunc('month', ts) AS month,
                min_by(price, ts) AS open, max(price) AS high,
                min(price) AS low, max_by(price, ts) AS close,
                sum(quantity) AS volume, count(*) AS trade_count
-        FROM {SOURCE_TABLE} WHERE {{range_filter}} GROUP BY 1, 2
+        FROM {SOURCE_TABLE} GROUP BY 1, 2
     """,
-    merge_keys=["symbol", "month"],
     target_table=MONTHLY_TARGET, target_partitioning="ARRAY['day(month)']",
 )
+MONTHLY_PARSED = parse_view_query(MONTHLY_VIEW.query)
 
 
 async def insert_trades(cursor, day, trades):
@@ -61,12 +62,12 @@ async def insert_trades(cursor, day, trades):
         )
 
 
-async def setup_and_full_refresh(cursor, view, target):
+async def setup_and_full_refresh(cursor, view, parsed, target):
     cols = await discover_columns(cursor, view.query)
-    value_cols = [c.name for c in cols if c.name not in view.merge_keys]
+    value_cols = [c.name for c in cols if c.name not in parsed.merge_keys]
     await cursor.execute(build_create_table_sql(target, cols, view.target_partitioning))
     await execute_full_refresh(cursor, view, target)
-    result = await detect_changes(cursor, SOURCE_TABLE, "ts", infer_granularity(view.query), last_snapshot=None)
+    result = await detect_changes(cursor, SOURCE_TABLE, "ts", parsed.granularity, last_snapshot=None)
     await write_last_snapshot(cursor, target, result.current_snapshot)
     return result, value_cols
 
@@ -87,7 +88,7 @@ class TestWeeklyBarsCrossPartition:
         await insert_trades(cursor, "2026-04-06", [("AAPL", "10:00:00", 150.0, 100)])
         await insert_trades(cursor, "2026-04-07", [("AAPL", "10:00:00", 160.0, 200)])
 
-        result, value_cols = await setup_and_full_refresh(cursor, WEEKLY_VIEW, WEEKLY_TARGET)
+        result, value_cols = await setup_and_full_refresh(cursor, WEEKLY_VIEW, WEEKLY_PARSED, WEEKLY_TARGET)
         last_snap = result.current_snapshot
 
         # Verify full refresh is correct
@@ -106,7 +107,11 @@ class TestWeeklyBarsCrossPartition:
         assert start.day == 6   # Monday
         assert end.day == 13    # Next Monday (exclusive)
 
-        await execute_incremental_refresh(cursor, WEEKLY_VIEW, WEEKLY_TARGET, value_cols, result.filter_range)
+        await execute_incremental_refresh(
+            cursor, WEEKLY_VIEW, WEEKLY_TARGET,
+            WEEKLY_PARSED.filter_column, WEEKLY_PARSED.merge_keys,
+            value_cols, result.filter_range,
+        )
 
         await cursor.execute(f"SELECT volume, trade_count, high, low FROM {WEEKLY_TARGET} WHERE symbol = 'AAPL'")
         row = await cursor.fetchone()
@@ -122,7 +127,7 @@ class TestWeeklyBarsCrossPartition:
 
         # Week 1: Mon Apr 6
         await insert_trades(cursor, "2026-04-06", [("AAPL", "10:00:00", 150.0, 100)])
-        result, value_cols = await setup_and_full_refresh(cursor, WEEKLY_VIEW, WEEKLY_TARGET)
+        result, value_cols = await setup_and_full_refresh(cursor, WEEKLY_VIEW, WEEKLY_PARSED, WEEKLY_TARGET)
 
         # Week 2: Mon Apr 13
         await insert_trades(cursor, "2026-04-13", [("AAPL", "10:00:00", 200.0, 50)])
@@ -133,7 +138,11 @@ class TestWeeklyBarsCrossPartition:
         assert start.day == 13  # Monday of week 2
         assert end.day == 20    # Next Monday
 
-        await execute_incremental_refresh(cursor, WEEKLY_VIEW, WEEKLY_TARGET, value_cols, result.filter_range)
+        await execute_incremental_refresh(
+            cursor, WEEKLY_VIEW, WEEKLY_TARGET,
+            WEEKLY_PARSED.filter_column, WEEKLY_PARSED.merge_keys,
+            value_cols, result.filter_range,
+        )
 
         await cursor.execute(f"SELECT week, volume FROM {WEEKLY_TARGET} WHERE symbol = 'AAPL' ORDER BY week")
         rows = await cursor.fetchall()
@@ -167,14 +176,18 @@ class TestLateArrivingData:
         # Week 1: Mon + Tue. Full refresh.
         await insert_trades(cursor, "2026-04-06", [("AAPL", "10:00:00", 150.0, 100)])
         await insert_trades(cursor, "2026-04-07", [("AAPL", "10:00:00", 160.0, 200)])
-        result, value_cols = await setup_and_full_refresh(cursor, WEEKLY_VIEW, WEEKLY_TARGET)
+        result, value_cols = await setup_and_full_refresh(cursor, WEEKLY_VIEW, WEEKLY_PARSED, WEEKLY_TARGET)
         last_snap = result.current_snapshot
 
         # Week 2: Mon. Incremental refresh — advances state past week 1.
         await insert_trades(cursor, "2026-04-13", [("AAPL", "10:00:00", 200.0, 50)])
         result = await detect_changes(cursor, SOURCE_TABLE, "ts", "week", last_snap)
         assert result.action == RefreshAction.INCREMENTAL
-        await execute_incremental_refresh(cursor, WEEKLY_VIEW, WEEKLY_TARGET, value_cols, result.filter_range)
+        await execute_incremental_refresh(
+            cursor, WEEKLY_VIEW, WEEKLY_TARGET,
+            WEEKLY_PARSED.filter_column, WEEKLY_PARSED.merge_keys,
+            value_cols, result.filter_range,
+        )
         await write_last_snapshot(cursor, WEEKLY_TARGET, result.current_snapshot)
         last_snap = result.current_snapshot
 
@@ -196,7 +209,11 @@ class TestLateArrivingData:
         assert start.day == 6, f"late row should re-open week of Apr 6, got start={start}"
         assert end.day == 13,  f"late row should not extend into week 2, got end={end}"
 
-        await execute_incremental_refresh(cursor, WEEKLY_VIEW, WEEKLY_TARGET, value_cols, result.filter_range)
+        await execute_incremental_refresh(
+            cursor, WEEKLY_VIEW, WEEKLY_TARGET,
+            WEEKLY_PARSED.filter_column, WEEKLY_PARSED.merge_keys,
+            value_cols, result.filter_range,
+        )
 
         # Week 1 is recomputed (now 350); week 2 is untouched (still 50).
         await cursor.execute(f"SELECT week, volume, trade_count FROM {WEEKLY_TARGET} WHERE symbol = 'AAPL' ORDER BY week")
@@ -219,7 +236,7 @@ class TestMonthlyBarsCrossPartition:
         await insert_trades(cursor, "2026-04-01", [("AAPL", "10:00:00", 100.0, 10)])
         await insert_trades(cursor, "2026-04-15", [("AAPL", "10:00:00", 200.0, 20)])
 
-        result, value_cols = await setup_and_full_refresh(cursor, MONTHLY_VIEW, MONTHLY_TARGET)
+        result, value_cols = await setup_and_full_refresh(cursor, MONTHLY_VIEW, MONTHLY_PARSED, MONTHLY_TARGET)
 
         # Add Apr 20
         await insert_trades(cursor, "2026-04-20", [("AAPL", "10:00:00", 150.0, 5)])
@@ -230,7 +247,11 @@ class TestMonthlyBarsCrossPartition:
         assert start.month == 4 and start.day == 1
         assert end.month == 5 and end.day == 1
 
-        await execute_incremental_refresh(cursor, MONTHLY_VIEW, MONTHLY_TARGET, value_cols, result.filter_range)
+        await execute_incremental_refresh(
+            cursor, MONTHLY_VIEW, MONTHLY_TARGET,
+            MONTHLY_PARSED.filter_column, MONTHLY_PARSED.merge_keys,
+            value_cols, result.filter_range,
+        )
 
         await cursor.execute(f"SELECT volume, trade_count FROM {MONTHLY_TARGET} WHERE symbol = 'AAPL'")
         row = await cursor.fetchone()

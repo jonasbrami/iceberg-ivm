@@ -8,53 +8,12 @@ from pathlib import Path
 
 import yaml
 
-log = logging.getLogger(__name__)
+from trino_mv_orchestrator.query_parser import parse_view_query
 
-VALID_GRANULARITIES = frozenset(("minute", "hour", "day", "week", "month", "quarter", "year"))
+log = logging.getLogger(__name__)
 
 _IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 _QUALIFIED_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$")
-
-# Regex to extract granularity from date_trunc('X', ...)
-_DATE_TRUNC_RE = re.compile(r"date_trunc\s*\(\s*'(\w+)'\s*,", re.IGNORECASE)
-
-# Detects date_trunc used inside arithmetic (e.g. date_trunc(...) - INTERVAL ...)
-_COMPLEX_EXPR_RE = re.compile(
-    r"date_trunc\s*\(\s*'\w+'\s*,[^)]*\)\s*[-+*/%]"
-    r"|[-+*/%]\s*date_trunc\s*\(\s*'\w+'\s*,",
-    re.IGNORECASE,
-)
-
-
-def infer_granularity(query: str) -> str:
-    """Infer filter_granularity from ``date_trunc('X', ...)`` in the query.
-
-    Returns the granularity string if exactly one valid granularity is found
-    in a simple ``date_trunc`` call (not part of arithmetic).  Raises
-    ``ValueError`` when inference is not possible.
-    """
-    if _COMPLEX_EXPR_RE.search(query):
-        raise ValueError(
-            "complex date_trunc expressions are not supported; "
-            "use date_trunc('X', col) directly in GROUP BY"
-        )
-
-    matches = _DATE_TRUNC_RE.findall(query)
-    if not matches:
-        raise ValueError(
-            "query must contain a date_trunc('X', col) expression "
-            "for automatic granularity inference"
-        )
-
-    granularities = {m.lower() for m in matches}
-    valid = granularities & VALID_GRANULARITIES
-    if len(valid) != 1:
-        raise ValueError(
-            f"could not infer a single granularity from query; "
-            f"found: {granularities}"
-        )
-
-    return valid.pop()
 
 
 def _validate_identifier(value: str, field_name: str) -> None:
@@ -72,10 +31,7 @@ def _validate_qualified_name(value: str, field_name: str) -> None:
 @dataclass(frozen=True)
 class ViewConfig:
     name: str
-    source_table: str
     query: str
-    merge_keys: tuple[str, ...]
-    filter_column: str
     target_table: str | None = None
     target_partitioning: str | None = None
     refresh_interval_seconds: int = 60
@@ -104,33 +60,21 @@ class Config:
 
 
 def _parse_view(raw: dict) -> ViewConfig:
-    missing = {"name", "source_table", "query", "merge_keys", "filter_column"} - raw.keys()
+    missing = {"name", "query"} - raw.keys()
     if missing:
         raise ValueError(f"view missing required fields: {sorted(missing)}")
 
     _validate_identifier(raw["name"], "name")
-    _validate_qualified_name(raw["source_table"], "source_table")
-    _validate_identifier(raw["filter_column"], "filter_column")
-    for key in raw["merge_keys"]:
-        _validate_identifier(str(key), "merge_keys")
     if raw.get("target_table"):
         _validate_qualified_name(raw["target_table"], "target_table")
 
-    if "{range_filter}" not in raw["query"]:
-        raise ValueError(
-            f"view '{raw['name']}': query must contain {{range_filter}} placeholder"
-        )
-
-    # Validate the query contains a simple date_trunc (raises on bad queries).
-    # The result is derived at refresh time — not stored on the view.
-    infer_granularity(raw["query"])
+    # Full query validation — source_table, filter_column, granularity,
+    # merge_keys are all derived here at load time.  Raises on any violation.
+    parse_view_query(raw["query"])
 
     return ViewConfig(
         name=raw["name"],
-        source_table=raw["source_table"],
         query=raw["query"],
-        merge_keys=tuple(raw["merge_keys"]),
-        filter_column=raw["filter_column"],
         target_table=raw.get("target_table"),
         target_partitioning=raw.get("target_partitioning"),
         refresh_interval_seconds=raw.get("refresh_interval_seconds", 60),
@@ -204,10 +148,7 @@ def save_views(views: list[ViewConfig], path: str | Path) -> None:
     for v in views:
         vd: dict = {
             "name": v.name,
-            "source_table": v.source_table,
             "query": v.query,
-            "merge_keys": list(v.merge_keys),
-            "filter_column": v.filter_column,
             "refresh_interval_seconds": v.refresh_interval_seconds,
         }
         if v.target_table:

@@ -161,8 +161,6 @@ trino:
 
 views:
   - name: ohlcv_1m
-    source_table: iceberg.market_data.trades
-    filter_column: ts
     query: |
       SELECT
         symbol,
@@ -171,28 +169,25 @@ views:
         min(price) AS low, max_by(price, ts) AS close,
         sum(quantity) AS volume, count(*) AS trade_count
       FROM iceberg.market_data.trades
-      WHERE {range_filter}
-      GROUP BY 1, 2
-    merge_keys: [symbol, minute]
+      GROUP BY symbol, date_trunc('minute', ts)
 ```
 
-`filter_granularity` is always inferred from `date_trunc('X', col)` in the query.
-Only simple `date_trunc` expressions are supported — complex arithmetic expressions
-are rejected. See [Granularity inference](#granularity-inference) for details.
+The operator writes *exactly* what they would put after
+`CREATE MATERIALIZED VIEW … AS`. The orchestrator parses the query and derives
+`source_table`, `filter_column`, `filter_granularity`, and `merge_keys` from it.
+At refresh time the time-range `WHERE` predicate is AST-injected automatically —
+there is no `{range_filter}` placeholder.
 
-The orchestrator auto-discovers column types (`DESCRIBE OUTPUT`), creates the
-target table, and starts refreshing. Views can also be managed from the web UI.
+The orchestrator also auto-discovers column types (`DESCRIBE OUTPUT`), creates
+the target table, and starts refreshing. Views can also be managed from the web
+UI.
 
 ### Configuration reference
 
 | Field | Required | Description |
 |---|---|---|
 | `name` | yes | Unique view name |
-| `source_table` | yes | Fully qualified Iceberg source table |
-| `filter_column` | yes | Column to read min/max stats for (must have Iceberg column stats) |
-| `filter_granularity` | -- | Always inferred from `date_trunc('X', col)` in the query. Supported: `minute`, `hour`, `day`, `week`, `month`, `quarter`, `year`. |
-| `query` | yes | SELECT with `{range_filter}` placeholder in WHERE clause |
-| `merge_keys` | yes | Columns forming the MERGE ON clause (must be unique in output) |
+| `query` | yes | The full SELECT — exactly what you would write after `CREATE MATERIALIZED VIEW … AS`. `source_table`, `filter_column`, `filter_granularity`, and `merge_keys` are derived from this |
 | `target_table` | no | Defaults to `{catalog}.{schema}.{name}` |
 | `target_partitioning` | no | Defaults to source table's partitioning |
 | `refresh_interval_seconds` | no | Defaults to 60 |
@@ -262,49 +257,65 @@ The inferred `filter_granularity` (`week`) snaps the file-stats range to complet
 week boundaries, so the MERGE query reads Mon+Tue+Wed and produces a correct
 weekly bar.
 
-## Granularity inference
+## Query parsing
 
-The orchestrator parses `date_trunc('X', col)` from the query and uses `X` as
-the granularity. This is always automatic — there is no manual override.
+At config-load time the orchestrator parses every view query with an AST-based
+parser (`sqlparse`). It derives:
 
+- `source_table` — from the FROM clause
+- `filter_column` — the bare column inside `date_trunc('X', col)`
+- `filter_granularity` — the `'X'` literal (one of `minute`, `hour`, `day`,
+  `week`, `month`, `quarter`, `year`)
+- `merge_keys` — resolved from the GROUP BY list against the projection
+  (positional `GROUP BY 1, 2` refs are handled too)
+
+At refresh time the orchestrator AST-injects the time-range `WHERE` predicate
+directly into the query:
+
+```sql
+-- operator writes:
+SELECT symbol, date_trunc('week', ts) AS week, sum(qty) AS volume
+FROM iceberg.md.trades
+WHERE color = 'red'
+GROUP BY 1, 2
+
+-- orchestrator runs:
+MERGE INTO iceberg.md.trades_weekly AS t USING (
+  SELECT symbol, date_trunc('week', ts) AS week, sum(qty) AS volume
+  FROM iceberg.md.trades
+  WHERE color = 'red'
+    AND ts >= TIMESTAMP '2026-04-06 00:00:00.000000 UTC'
+    AND ts < TIMESTAMP '2026-04-13 00:00:00.000000 UTC'
+  GROUP BY 1, 2
+) AS s ON t.symbol = s.symbol AND t.week = s.week …
 ```
-date_trunc('minute', ts) AS minute     →  minute
-date_trunc('hour', ts) AS hour         →  hour
-date_trunc('day', ts) AS day           →  day
-date_trunc('week', ts) AS week         →  week
-date_trunc('month', ts) AS month       →  month
-date_trunc('quarter', ts) AS quarter   →  quarter
-date_trunc('year', ts) AS year         →  year
-```
-
-Only simple `date_trunc('X', col)` is allowed. Complex arithmetic expressions
-around `date_trunc` (e.g. 5-minute bars via subtraction) are **rejected** because
-the bucket width cannot be reliably inferred, leading to correctness issues with
-partial-bucket refreshes.
 
 ## Limitations
 
 ### Query shape
 
-The query **must** be a `SELECT ... GROUP BY` over a **single source table**
-with a `{range_filter}` in the WHERE clause. Anything else is unsupported.
+The query must be a `SELECT … GROUP BY` over a **single source table**. The
+parser enforces this at load time and rejects anything else with a clear error.
 
 ### Not supported
 
 - **Joins.** The query must reference exactly one source table. Change
-  detection only inspects `view.source_table`; if a query joined a second
-  table, updates to that other table would never trigger a refresh and the
-  MV would silently go stale. Joins are not validated against today — do
-  not configure a view whose query contains a JOIN.
-- **Queries without `GROUP BY`.** The orchestrator's correctness model is
-  built around `date_trunc('X', col)` defining the aggregation buckets.
-  A query without a `GROUP BY` (or one whose GROUP BY has no `date_trunc`)
-  is rejected at config load by the granularity-inference check.
-- **Non-time GROUP BY** -- `GROUP BY symbol` with no time component is
-  rejected for the same reason: there is no granularity to snap to.
-- **Source deletes/overwrites** -- detected via `$snapshots`, raises
+  detection only inspects the parsed source table; if a query joined a second
+  table, updates to that other table would never trigger a refresh and the MV
+  would silently go stale. Parser rejects queries containing `JOIN`.
+- **Set operations** (`UNION` / `INTERSECT` / `EXCEPT`) — rejected at parse.
+- **CTEs** (`WITH …`) — rejected at parse.
+- **Subqueries in FROM** — rejected at parse.
+- **Queries without `GROUP BY`** — rejected at parse. The correctness model
+  is built around `date_trunc('X', col)` defining aggregation buckets.
+- **`date_trunc` wrapped in arithmetic** (e.g. 5-minute bars via
+  `date_trunc(...) - INTERVAL ...`) — rejected at parse because the bucket
+  width cannot be reliably inferred.
+- **Projection columns without an alias on computed expressions** — rejected
+  so the target-table columns have stable names.
+- **Source deletes/overwrites** — detected via `$snapshots`, raises
   `UnexpectedOperationError` (the project assumes append-only sources).
-- **Missing column stats** -- if the source writer disables Iceberg column
+- **Missing column stats** — if the source writer disables Iceberg column
   statistics, the detector can't determine the affected range and raises
   `MissingFilterColumnError`.
 

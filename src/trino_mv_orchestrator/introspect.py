@@ -1,7 +1,6 @@
 """Auto-discover query column types and source table partitioning."""
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 
@@ -12,24 +11,10 @@ class ColumnInfo:
     type: str
 
 
-async def discover_source_tables(cursor, query: str) -> list[str]:
-    """Use EXPLAIN (TYPE IO, FORMAT JSON) to find all source tables in a query."""
-    safe_query = query.replace("{range_filter}", "true")
-    await cursor.execute(f"EXPLAIN (TYPE IO, FORMAT JSON) {safe_query}")
-    row = await cursor.fetchone()
-    explain_json = json.loads(row[0])
-
-    return list(dict.fromkeys(
-        f"{i['table']['catalog']}.{i['table']['schemaTable']['schema']}.{i['table']['schemaTable']['table']}"
-        for i in explain_json.get("inputTableColumnInfos", [])
-    ))
-
-
 async def discover_columns(cursor, query: str) -> list[ColumnInfo]:
     """Use PREPARE + DESCRIBE OUTPUT to get column names and types without executing."""
-    safe_query = query.replace("{range_filter}", "true")
     stmt_name = "__mv_introspect"
-    await cursor.execute(f"PREPARE {stmt_name} FROM {safe_query}")
+    await cursor.execute(f"PREPARE {stmt_name} FROM {query}")
     await cursor.execute(f"DESCRIBE OUTPUT {stmt_name}")
     columns = [ColumnInfo(name=row[0], type=row[4]) for row in await cursor.fetchall()]
     await cursor.execute(f"DEALLOCATE PREPARE {stmt_name}")

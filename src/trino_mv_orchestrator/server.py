@@ -20,7 +20,6 @@ from trino_mv_orchestrator.config import (
     ViewConfig,
     _validate_identifier,
     _validate_qualified_name,
-    infer_granularity,
     load_config,
     load_views,
     save_views,
@@ -32,6 +31,7 @@ from trino_mv_orchestrator.introspect import (
     discover_columns,
     discover_source_partitioning,
 )
+from trino_mv_orchestrator.query_parser import parse_view_query
 from trino_mv_orchestrator.state import read_last_snapshot, write_last_snapshot
 
 log = logging.getLogger(__name__)
@@ -177,16 +177,22 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
     vs = s.view_statuses.setdefault(view.name, ViewStatus(name=view.name))
 
     try:
+        # Derive source_table, filter_column, granularity, merge_keys
+        # from the query AST.  Cheap: sqlparse is O(μs) on a one-screen query.
+        parsed = parse_view_query(view.query)
         target_table = resolve_target_table(view, s.config)
-        source_labels = _parse_table_labels(view.source_table)
+        source_labels = _parse_table_labels(parsed.source_table)
 
         # Auto-discover columns and create target
         columns = await discover_columns(cursor, view.query)
-        target_partitioning = view.target_partitioning or await discover_source_partitioning(cursor, view.source_table)
+        target_partitioning = (
+            view.target_partitioning
+            or await discover_source_partitioning(cursor, parsed.source_table)
+        )
         create_sql = build_create_table_sql(target_table, columns, target_partitioning)
         await cursor.execute(create_sql)
 
-        value_columns = [c.name for c in columns if c.name not in view.merge_keys]
+        value_columns = [c.name for c in columns if c.name not in parsed.merge_keys]
 
         # Read state
         last_snap = await read_last_snapshot(cursor, target_table)
@@ -194,8 +200,8 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
         # Detect changes via file-level column stats
         detect_start = time.monotonic()
         result = await detect_changes(
-            cursor, view.source_table,
-            view.filter_column, infer_granularity(view.query),
+            cursor, parsed.source_table,
+            parsed.filter_column, parsed.granularity,
             last_snap,
         )
         detect_elapsed = time.monotonic() - detect_start
@@ -229,7 +235,9 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
             REFRESH_TOTAL.labels(view=view.name, type="full").inc()
         else:
             refresh_result = await execute_incremental_refresh(
-                cursor, view, target_table, value_columns, result.filter_range,
+                cursor, view, target_table,
+                parsed.filter_column, parsed.merge_keys,
+                value_columns, result.filter_range,
             )
             vs.last_action = "incremental"
             vs.last_range = f"[{result.filter_range[0]}, {result.filter_range[1]})"
@@ -318,31 +326,15 @@ app = FastAPI(title="trino-mv-orchestrator", lifespan=lifespan)
 
 class ViewCreate(BaseModel):
     name: str
-    source_table: str
     query: str
-    merge_keys: tuple[str, ...]
-    filter_column: str
     target_table: str | None = None
     target_partitioning: str | None = None
     refresh_interval_seconds: int = 60
 
-    @field_validator("name", "filter_column")
+    @field_validator("name")
     @classmethod
-    def validate_identifier(cls, v: str) -> str:
-        _validate_identifier(v, "field")
-        return v
-
-    @field_validator("source_table")
-    @classmethod
-    def validate_source_table(cls, v: str) -> str:
-        _validate_qualified_name(v, "source_table")
-        return v
-
-    @field_validator("merge_keys")
-    @classmethod
-    def validate_merge_keys(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-        for key in v:
-            _validate_identifier(key, "merge_keys")
+    def validate_name(cls, v: str) -> str:
+        _validate_identifier(v, "name")
         return v
 
     @field_validator("target_table")
@@ -354,11 +346,17 @@ class ViewCreate(BaseModel):
 
 
 class ViewResponse(BaseModel):
+    """View as returned by the API.
+
+    ``source_table``, ``filter_column``, and ``merge_keys`` are *derived* from
+    the query AST — they appear in the response so the UI can render a source →
+    target card, but they are not accepted on ``POST``.
+    """
     name: str
-    source_table: str
     query: str
-    merge_keys: tuple[str, ...]
+    source_table: str
     filter_column: str
+    merge_keys: tuple[str, ...]
     target_table: str | None = None
     target_partitioning: str | None = None
     refresh_interval_seconds: int = 60
@@ -366,9 +364,12 @@ class ViewResponse(BaseModel):
 
 
 def _view_to_response(v: ViewConfig, vs: ViewStatus | None) -> ViewResponse:
+    parsed = parse_view_query(v.query)
     return ViewResponse(
-        name=v.name, source_table=v.source_table, query=v.query,
-        merge_keys=v.merge_keys, filter_column=v.filter_column,
+        name=v.name, query=v.query,
+        source_table=parsed.source_table,
+        filter_column=parsed.filter_column,
+        merge_keys=parsed.merge_keys,
         target_table=v.target_table, target_partitioning=v.target_partitioning,
         refresh_interval_seconds=v.refresh_interval_seconds,
         status=dataclasses.asdict(vs) if vs else None,
@@ -380,15 +381,23 @@ def _view_to_response(v: ViewConfig, vs: ViewStatus | None) -> ViewResponse:
 VIEW_FORM_SCHEMA: list[dict] = [
     {"name": "name", "label": "Name", "type": "string", "required": True,
      "placeholder": "ohlcv_1m", "disabled_on_edit": True},
-    {"name": "source_table", "label": "Source Table", "type": "string", "required": True,
-     "placeholder": "iceberg.market_data.trades"},
     {"name": "query", "label": "Query", "type": "text", "required": True,
-     "placeholder": "SELECT symbol, date_trunc('minute', ts) AS minute, ...\nFROM iceberg.market_data.trades\nWHERE {range_filter}\nGROUP BY 1, 2",
-     "help": "include {range_filter} placeholder", "rows": 8},
-    {"name": "filter_column", "label": "Filter Column", "type": "string", "required": True,
-     "placeholder": "ts"},
-    {"name": "merge_keys", "label": "Merge Keys", "type": "array", "required": True,
-     "placeholder": "symbol, minute", "help": "comma-separated"},
+     "placeholder": (
+         "SELECT symbol,\n"
+         "       date_trunc('minute', ts) AS minute,\n"
+         "       min_by(price, ts) AS open,\n"
+         "       max(price)        AS high,\n"
+         "       min(price)        AS low,\n"
+         "       max_by(price, ts) AS close\n"
+         "FROM iceberg.market_data.trades\n"
+         "GROUP BY symbol, date_trunc('minute', ts)"
+     ),
+     "help": (
+         "exactly what you would write after CREATE MATERIALIZED VIEW … AS. "
+         "source table, filter column, granularity and merge keys are "
+         "derived automatically from the query."
+     ),
+     "rows": 10},
     {"name": "target_table", "label": "Target Table", "type": "string", "required": False,
      "placeholder": "auto-generated", "group": "target"},
     {"name": "target_partitioning", "label": "Partitioning", "type": "string", "required": False,
@@ -434,9 +443,10 @@ def create_view(
     if any(v.name == body.name for v in s.config.views):
         raise HTTPException(409, f"view '{body.name}' already exists")
 
-    # Validate query contains a simple date_trunc (raises on bad queries)
+    # Validate the query — raises on any violation.  Rejected queries never
+    # make it into saved state.
     try:
-        infer_granularity(body.query)
+        parse_view_query(body.query)
     except ValueError as exc:
         raise HTTPException(422, str(exc))
 

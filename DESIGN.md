@@ -293,15 +293,16 @@ Week uses ISO week (Monday = start). Month handles year boundaries.
 ```sql
 MERGE INTO target AS t
 USING (
-  <user query with {range_filter} replaced by range>
+  <user query with the time-range WHERE predicate AST-injected by query_parser.inject_range_filter>
 ) AS s
 ON t.key1 = s.key1 AND t.key2 = s.key2
 WHEN MATCHED THEN UPDATE SET val1 = s.val1, val2 = s.val2, ...
 WHEN NOT MATCHED THEN INSERT (key1, key2, val1, val2, ...) VALUES (...)
 ```
 
-`value_columns` = all query output columns minus `merge_keys`. Discovered
-automatically via `DESCRIBE OUTPUT`.
+`merge_keys` are derived from the GROUP BY list (resolved against projection
+aliases). `value_columns` = all query output columns minus `merge_keys`,
+discovered via `DESCRIBE OUTPUT`.
 
 ### Snapshot ID comparison
 

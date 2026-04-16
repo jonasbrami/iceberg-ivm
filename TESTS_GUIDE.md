@@ -37,40 +37,58 @@ Covers `cli.py:main()`. Three tests, all use `monkeypatch` to replace `uvicorn.r
 | `test_custom_config_path` | `-c custom.yaml` is honoured and the file is loaded |
 | `test_verbose_sets_debug` | `-v` flips uvicorn log level to `debug` |
 
-### `test_config.py` — YAML loading + view validation + granularity inference
+### `test_config.py` — YAML loading + identifier validation
 
-Covers `config.py`. The biggest unit test file because **a malformed config must fail at load time, not at refresh time**.
+Covers `config.py`. Query-shape validation lives in `test_query_parser.py`; this file focuses on the YAML envelope (identifier checks, defaults, round-trip).
 
 **Loading & defaults**
 - `test_load_valid` — happy-path config round-trip
 - `test_missing_trino` — `trino:` section is required
 - `test_defaults` — server port and reload interval defaults applied
-- `test_load_views_valid` — view list loads with all fields
+- `test_load_views_valid` — view list loads with only `name` + `query`
 - `test_load_views_missing_file` — clear error if `views.yaml` doesn't exist
-- `test_view_defaults` — `target_table` defaults to `{catalog}.{schema}.{name}`, `refresh_interval_seconds` defaults to 60
+- `test_view_defaults` — `refresh_interval_seconds` defaults to 60
 
-**Validation — every shape that should fail loudly**
-- `test_missing_filter_column` — view without `filter_column` rejected
-- `test_missing_placeholder` — query without `{range_filter}` rejected (otherwise the MERGE would scan everything)
+**Validation — identifier shape**
+- `test_missing_query` / `test_missing_name` — required fields
 - `test_invalid_view_name` — non-identifier view names rejected (would break SQL generation)
-- `test_invalid_source_table` / `test_invalid_filter_column` / `test_invalid_merge_key` — same identifier-shape checks
-- `test_valid_qualified_table_names` — `catalog.schema.table` accepted
+- `test_invalid_target_table` — `catalog.schema.table` shape enforced on the optional override
+- `test_legacy_range_filter_placeholder_rejected` — any `{range_filter}` in a loaded query is rejected with a migration-pointing error
+- `test_duplicate_view_names_rejected` — two views with the same name rejected
 
 **Round-trip persistence**
-- `test_save_views_and_reload` — `save_views` then `load_config` preserves every field
+- `test_save_views_and_reload` — `save_views` then `load_views` preserves every field
 - `test_save_views_creates_parent_dirs` — writing to a fresh path makes the directory
 
-**Granularity inference (`infer_granularity`)** — the function that parses `date_trunc('X', col)` out of the user's query so `snap_range` knows which bucket to snap to.
-- One positive test per granularity: `minute`, `hour`, `day`, `week`, `month`, `quarter`, `year` (and `test_infer_case_insensitive`)
-- `test_infer_no_date_trunc_raises` — query without `date_trunc` rejected
-- `test_infer_complex_expr_raises` — `date_trunc('hour', ts + interval '1' hour)` rejected (we only support a plain column)
-- `test_infer_invalid_granularity_raises` — `date_trunc('fortnight', ts)` rejected
-- `test_infer_multiple_same` — multiple identical `date_trunc` calls OK
-- `test_infer_multiple_different_raises` — mixing `'hour'` and `'day'` rejected (ambiguous)
+### `test_query_parser.py` — AST-based query parsing
 
-**End-to-end view loading with inference**
-- `test_load_views_accepts_minute` / `_quarter` / `_year` — inference plumbed through `load_views`
-- `test_load_views_fails_when_cannot_infer` and `_fails_on_complex_expr` — failures surface at config load, not later
+Covers `query_parser.py`. This is where the orchestrator now decides whether a view query is supported.
+
+**Happy path** — every shape the parser extracts correctly:
+- `test_full_shape` — end-to-end ParsedView from a typical SELECT
+- `test_every_granularity` — parametric over all seven: minute/hour/day/week/month/quarter/year
+- `test_qualified_table_name` — `cat.sch.tbl` survives round-trip
+- `test_group_by_expression_matches_projection` — `GROUP BY date_trunc(...)` resolves to the aliased projection entry
+- `test_group_by_positional` — `GROUP BY 1, 2` resolves via projection index
+- `test_bare_column_alias_is_its_own_name` — `GROUP BY d` referencing an aliased projection entry
+
+**Rejections** — every shape the parser must refuse:
+- `test_no_date_trunc` — required for granularity inference
+- `test_date_trunc_in_arithmetic` / `test_date_trunc_multiplied` — structural Operation-parent check
+- `test_multiple_granularities` / `test_date_trunc_on_different_columns` — only one filter column/granularity per view
+- `test_date_trunc_inside_string_literal_is_not_matched` / `test_date_trunc_inside_line_comment_is_not_matched` / `test_date_trunc_inside_block_comment_is_not_matched` — where the regex-based predecessor would false-match
+- `test_join_rejected` / `test_union_rejected` / `test_with_cte_rejected` / `test_subquery_in_from_rejected` — unsupported query shapes
+- `test_no_group_by_rejected` — correctness model requires it
+- `test_legacy_range_filter_placeholder_rejected` — explicit migration error for old views
+- `test_projection_function_without_alias_rejected` — every computed column needs `AS name`
+- `test_multi_statement_rejected` / `test_empty_query_rejected` / `test_invalid_granularity_rejected` — sundry hygiene
+
+**`inject_range_filter`** — the refresh-time WHERE injection:
+- `test_appends_onto_existing_where` — AND-joins onto the operator's WHERE
+- `test_inserts_new_where_when_absent` — adds one when the query had none
+- `test_places_before_having` / `_order_by` / `_limit` — WHERE lands in the right structural position
+- `test_naive_datetime_omits_utc_suffix` / `test_tz_aware_non_utc_converted_to_utc` — timezone handling
+- `test_result_parses_as_valid_query` — round-trip: inject, re-parse, same ParsedView
 
 ### `test_detector.py` — change detection
 
@@ -151,7 +169,7 @@ Covers `executor.py`.
 
 #### `TestBuildMergeSql`
 
-- `test_structure` — generated MERGE has `MERGE INTO target AS t`, the right `ON` clause from `merge_keys`, both `WHEN MATCHED UPDATE` and `WHEN NOT MATCHED INSERT`, the substituted range filter, and no leftover `{range_filter}` placeholder.
+- `test_structure` — generated MERGE has `MERGE INTO target AS t`, the right `ON` clause from merge keys, both `WHEN MATCHED UPDATE` and `WHEN NOT MATCHED INSERT`, and the full injected source query.
 
 #### `TestFormatTs`
 
@@ -179,7 +197,7 @@ Covers `introspect.py`.
 
 #### `TestDiscoverColumns` (PREPARE + DESCRIBE OUTPUT)
 
-- `test_basic` — runs PREPARE/DESCRIBE/DEALLOCATE, returns `[ColumnInfo(name, type), ...]`, replaces `{range_filter}` with `true` for the PREPARE
+- `test_basic` — runs PREPARE/DESCRIBE/DEALLOCATE, returns `[ColumnInfo(name, type), ...]`, passes the query verbatim (no placeholder substitution)
 
 #### `TestDiscoverSourceTables` (parses EXPLAIN JSON)
 
@@ -249,7 +267,6 @@ pytest tests/integration
 Source is `iceberg.test_schema.trades` partitioned by `day(ts)`. Target is a 1-minute OHLCV view.
 
 #### `TestIntrospection`
-- `test_discover_source_tables` — `discover_source_tables(query)` returns the actual source name when run against real Trino
 - `test_discover_columns` — `discover_columns(query)` returns 8 columns matching the SELECT list
 
 #### `TestFullRefresh`

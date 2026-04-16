@@ -1,12 +1,10 @@
 """Tests for the introspection module."""
-import json
 
 from trino_mv_orchestrator.introspect import (
     ColumnInfo,
     build_create_table_sql,
     discover_columns,
     discover_source_partitioning,
-    discover_source_tables,
 )
 
 
@@ -90,46 +88,16 @@ class TestDiscoverColumns:
             ],
             [],  # DEALLOCATE
         ])
-        columns = await discover_columns(cursor, "SELECT symbol, minute, open FROM t WHERE {range_filter}")
+        columns = await discover_columns(
+            cursor,
+            "SELECT symbol, minute, open FROM t GROUP BY 1, 2, 3",
+        )
         assert len(columns) == 3
         assert columns[0] == ColumnInfo(name="symbol", type="varchar")
         assert columns[1] == ColumnInfo(name="minute", type="timestamp(6)")
         assert columns[2] == ColumnInfo(name="open", type="double")
-        # Verify {range_filter} was replaced for the PREPARE
-        assert "true" in cursor.executed[0]
-        assert "{range_filter}" not in cursor.executed[0]
-
-
-# ── discover_source_tables ──
-
-class TestDiscoverSourceTables:
-    async def test_single_source(self):
-        explain_json = json.dumps({
-            "inputTableColumnInfos": [
-                {
-                    "table": {
-                        "catalog": "iceberg",
-                        "schemaTable": {"schema": "market_data", "table": "trades"},
-                    },
-                    "columns": [],
-                }
-            ]
-        })
-        cursor = MockCursor([[(explain_json,)]])
-        tables = await discover_source_tables(cursor, "SELECT * FROM t WHERE {range_filter}")
-        assert tables == ["iceberg.market_data.trades"]
-
-    async def test_multiple_sources_deduped(self):
-        explain_json = json.dumps({
-            "inputTableColumnInfos": [
-                {"table": {"catalog": "c", "schemaTable": {"schema": "s", "table": "t1"}}, "columns": []},
-                {"table": {"catalog": "c", "schemaTable": {"schema": "s", "table": "t1"}}, "columns": []},
-                {"table": {"catalog": "c", "schemaTable": {"schema": "s", "table": "t2"}}, "columns": []},
-            ]
-        })
-        cursor = MockCursor([[(explain_json,)]])
-        tables = await discover_source_tables(cursor, "SELECT * FROM t WHERE {range_filter}")
-        assert tables == ["c.s.t1", "c.s.t2"]
+        # The query is passed to PREPARE verbatim — no placeholder substitution.
+        assert "SELECT symbol, minute, open FROM t GROUP BY 1, 2, 3" in cursor.executed[0]
 
 
 # ── build_create_table_sql ──

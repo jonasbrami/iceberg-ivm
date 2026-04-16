@@ -4,9 +4,10 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 
 from trino_mv_orchestrator.config import ViewConfig
+from trino_mv_orchestrator.query_parser import inject_range_filter
 
 log = logging.getLogger(__name__)
 
@@ -28,54 +29,26 @@ def _extract_stats(cursor) -> dict:
     }
 
 
-def format_ts(ts: datetime) -> str:
-    """Format a datetime for a Trino TIMESTAMP literal."""
-    return ts.strftime("%Y-%m-%d %H:%M:%S.%f")
-
-
-def build_range_filter(filter_column: str, start: datetime, end: datetime) -> str:
-    """Build a WHERE clause from a snapped time range.
-
-    Produces: filter_column >= TIMESTAMP 'start' AND filter_column < TIMESTAMP 'end'
-    This is a plain column range predicate that Trino pushes down to Iceberg
-    partition pruning.
-
-    If the inputs are tz-aware, they are first converted to UTC so the
-    emitted ``… UTC`` literal represents the correct instant. (Without
-    this step, a wall-clock value in a non-UTC zone would get stamped
-    verbatim and Trino would reinterpret it as UTC, silently shifting
-    the range by the offset.)
-    """
-    if start.tzinfo is not None:
-        start = start.astimezone(timezone.utc)
-        end = end.astimezone(timezone.utc)
-        suffix = " UTC"
-    else:
-        suffix = ""
-    return (
-        f"{filter_column} >= TIMESTAMP '{format_ts(start)}{suffix}' AND "
-        f"{filter_column} < TIMESTAMP '{format_ts(end)}{suffix}'"
-    )
-
-
 def build_merge_sql(
-    view: ViewConfig,
     target_table: str,
-    range_filter: str,
+    source_query: str,
+    merge_keys: tuple[str, ...] | list[str],
     value_columns: list[str],
 ) -> str:
-    """Build an atomic MERGE statement for incremental refresh."""
-    query_with_filter = view.query.replace("{range_filter}", range_filter)
+    """Build an atomic MERGE statement for incremental refresh.
 
-    on_clause = " AND ".join(f"t.{k} = s.{k}" for k in view.merge_keys)
+    ``source_query`` is the view query with the time-range WHERE predicate
+    already injected (via ``inject_range_filter``).
+    """
+    on_clause = " AND ".join(f"t.{k} = s.{k}" for k in merge_keys)
     update_sets = ", ".join(f"{col} = s.{col}" for col in value_columns)
-    all_columns = list(view.merge_keys) + value_columns
+    all_columns = list(merge_keys) + value_columns
     insert_cols = ", ".join(all_columns)
     insert_vals = ", ".join(f"s.{col}" for col in all_columns)
 
     return (
         f"MERGE INTO {target_table} AS t\n"
-        f"USING (\n{query_with_filter}\n) AS s\n"
+        f"USING (\n{source_query}\n) AS s\n"
         f"ON {on_clause}\n"
         f"WHEN MATCHED THEN UPDATE SET {update_sets}\n"
         f"WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
@@ -88,9 +61,8 @@ async def execute_full_refresh(cursor, view: ViewConfig, target_table: str) -> R
     log.info("%s: full refresh — deleting target %s", view.name, target_table)
     await cursor.execute(f"DELETE FROM {target_table} WHERE true")
 
-    query = view.query.replace("{range_filter}", "true")
     log.info("%s: full refresh — inserting into %s", view.name, target_table)
-    await cursor.execute(f"INSERT INTO {target_table} {query}")
+    await cursor.execute(f"INSERT INTO {target_table} {view.query}")
 
     elapsed = time.monotonic() - start
     stats = _extract_stats(cursor)
@@ -105,6 +77,8 @@ async def execute_incremental_refresh(
     cursor,
     view: ViewConfig,
     target_table: str,
+    filter_column: str,
+    merge_keys: tuple[str, ...] | list[str],
     value_columns: list[str],
     filter_range: tuple[datetime, datetime],
 ) -> RefreshResult:
@@ -112,12 +86,12 @@ async def execute_incremental_refresh(
     start_time = time.monotonic()
     range_start, range_end = filter_range
 
-    range_filter = build_range_filter(view.filter_column, range_start, range_end)
-    merge_sql = build_merge_sql(view, target_table, range_filter, value_columns)
+    source_query = inject_range_filter(view.query, filter_column, range_start, range_end)
+    merge_sql = build_merge_sql(target_table, source_query, merge_keys, value_columns)
 
     log.info(
         "%s: incremental refresh — %s in [%s, %s)",
-        view.name, view.filter_column, range_start, range_end,
+        view.name, filter_column, range_start, range_end,
     )
     log.debug("%s: executing MERGE:\n%s", view.name, merge_sql)
     await cursor.execute(merge_sql)
