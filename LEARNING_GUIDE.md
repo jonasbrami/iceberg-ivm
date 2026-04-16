@@ -260,7 +260,7 @@ DELETE FROM target WHERE true;
 INSERT INTO target SELECT ... FROM source WHERE TRUE;
 ```
 
-The view's query has `{range_filter}` substituted with `TRUE` for full refresh.
+The view's query runs verbatim — no range predicate is injected for full refresh.
 
 ### Incremental refresh (`execute_incremental_refresh`, lines 104-131)
 
@@ -327,25 +327,27 @@ trino:
 ```yaml
 views:
   - name: ohlcv_1m
-    source_table: iceberg.market_data.trades
-    filter_column: ts
     query: |
       SELECT symbol, date_trunc('minute', ts) AS minute,
              min_by(price, ts) AS open, max(price) AS high,
              min(price) AS low, max_by(price, ts) AS close,
              sum(quantity) AS volume, count(*) AS trade_count
       FROM iceberg.market_data.trades
-      WHERE {range_filter}
-      GROUP BY 1, 2
-    merge_keys: [symbol, minute]
+      GROUP BY symbol, date_trunc('minute', ts)
     refresh_interval_seconds: 60
 ```
 
-**Validation rules** (`config.py`):
+Only two fields are required: `name` and `query`. The query is the full SELECT
+as you'd write it after `CREATE MATERIALIZED VIEW … AS` — nothing else.
 
-- `query` **must** contain the literal `{range_filter}` placeholder.
-- `query` **must** contain a simple `date_trunc('granularity', col)` expression — granularity is parsed from this and drives `snap_range`.
-- `merge_keys` must uniquely identify the rows of the query output.
+**Validation rules** (`query_parser.parse_view_query`, called from `config._parse_view`):
+
+- Single SELECT, single FROM table (no JOIN, no UNION, no CTE, no subquery).
+- Exactly one distinct `date_trunc('X', col)` — granularity and filter column
+  are derived from it.
+- `date_trunc` must not be wrapped in arithmetic.
+- GROUP BY present; merge keys are resolved from it against the projection.
+- Every computed projection column must have an explicit `AS alias`.
 - `target_table` defaults to `{trino.catalog}.{trino.schema}.{view.name}`.
 - `target_partitioning` defaults to source's partitioning (auto-discovered).
 
@@ -478,7 +480,7 @@ Three layers of correctness, each a separate failure mode:
 flowchart TB
     L1["Layer 1: Timestamp parsing<br/>(_parse_ts)<br/>Failure: lexicographic comparison"]
     L2["Layer 2: Boundary snapping<br/>(snap_range)<br/>Failure: partial buckets"]
-    L3["Layer 3: Execution<br/>(build_range_filter, MERGE)<br/>Failure: timezone mismatch"]
+    L3["Layer 3: Execution<br/>(inject_range_filter, MERGE)<br/>Failure: timezone mismatch"]
     L1 --> L2 --> L3 --> Result["Correct incremental aggregates"]
 ```
 

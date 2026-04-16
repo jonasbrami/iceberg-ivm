@@ -11,23 +11,21 @@ trino:
 
 views:
   - name: ohlcv_1m
-    source_table: iceberg.market_data.trades
-    filter_column: ts
-    # filter_granularity is always inferred from date_trunc in the query
+    # The query is exactly what you would write after CREATE MATERIALIZED VIEW … AS.
+    # source_table, filter_column, filter_granularity, and merge_keys are all
+    # derived from this by the orchestrator's AST parser.
     query: |
       SELECT
         symbol,
         date_trunc('minute', ts) AS minute,
         min_by(price, ts) AS open,
-        max(price) AS high,
-        min(price) AS low,
+        max(price)        AS high,
+        min(price)        AS low,
         max_by(price, ts) AS close,
-        sum(quantity) AS volume,
-        count(*) AS trade_count
+        sum(quantity)     AS volume,
+        count(*)          AS trade_count
       FROM iceberg.market_data.trades
-      WHERE {range_filter}
-      GROUP BY 1, 2
-    merge_keys: [symbol, minute]
+      GROUP BY symbol, date_trunc('minute', ts)
     refresh_interval_seconds: 60
     # optional (auto-discovered from source if omitted):
     # target_table: iceberg.analytics.ohlcv_1m

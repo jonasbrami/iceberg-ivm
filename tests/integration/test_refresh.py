@@ -9,7 +9,8 @@ import pytest
 from trino_mv_orchestrator.config import ViewConfig
 from trino_mv_orchestrator.detector import RefreshAction, detect_changes
 from trino_mv_orchestrator.executor import execute_full_refresh, execute_incremental_refresh
-from trino_mv_orchestrator.introspect import discover_columns, discover_source_tables, build_create_table_sql
+from trino_mv_orchestrator.introspect import discover_columns, build_create_table_sql
+from trino_mv_orchestrator.query_parser import parse_view_query
 from trino_mv_orchestrator.state import read_last_snapshot, write_last_snapshot
 
 pytestmark = [pytest.mark.integration, pytest.mark.xdist_group("integration")]
@@ -24,17 +25,17 @@ CREATE TABLE {SOURCE_TABLE} (
 """
 
 VIEW = ViewConfig(
-    name="test_ohlcv", source_table=SOURCE_TABLE, filter_column="ts",
+    name="test_ohlcv",
     query=f"""
         SELECT symbol, date_trunc('minute', ts) AS minute,
                min_by(price, ts) AS open, max(price) AS high,
                min(price) AS low, max_by(price, ts) AS close,
                sum(quantity) AS volume, count(*) AS trade_count
-        FROM {SOURCE_TABLE} WHERE {{range_filter}} GROUP BY 1, 2
+        FROM {SOURCE_TABLE} GROUP BY 1, 2
     """,
-    merge_keys=["symbol", "minute"],
     target_table=TARGET_TABLE, target_partitioning="ARRAY['day(minute)']",
 )
+PARSED = parse_view_query(VIEW.query)
 
 
 async def insert_trades(cursor, day, trades):
@@ -51,12 +52,6 @@ async def query_bars(cursor):
 
 
 class TestIntrospection:
-    async def test_discover_source_tables(self, trino_conn):
-        cursor = await trino_conn.cursor()
-        await cursor.execute(CREATE_SOURCE)
-        await insert_trades(cursor, "2026-04-08", [("AAPL", "09:30:00", 150.0, 100)])
-        assert SOURCE_TABLE in await discover_source_tables(cursor, VIEW.query)
-
     async def test_discover_columns(self, trino_conn):
         cursor = await trino_conn.cursor()
         await cursor.execute(CREATE_SOURCE)
@@ -99,7 +94,7 @@ class TestIncrementalRefresh:
         await insert_trades(cursor, "2026-04-08", [("AAPL", "09:30:00", 150.0, 100)])
 
         cols = await discover_columns(cursor, VIEW.query)
-        value_cols = [c.name for c in cols if c.name not in VIEW.merge_keys]
+        value_cols = [c.name for c in cols if c.name not in PARSED.merge_keys]
         await cursor.execute(build_create_table_sql(TARGET_TABLE, cols, "ARRAY['day(minute)']"))
         await execute_full_refresh(cursor, VIEW, TARGET_TABLE)
 
@@ -112,7 +107,10 @@ class TestIncrementalRefresh:
         assert result.action == RefreshAction.INCREMENTAL
         assert result.filter_range is not None
 
-        await execute_incremental_refresh(cursor, VIEW, TARGET_TABLE, value_cols, result.filter_range)
+        await execute_incremental_refresh(
+            cursor, VIEW, TARGET_TABLE,
+            PARSED.filter_column, PARSED.merge_keys, value_cols, result.filter_range,
+        )
         assert len(await query_bars(cursor)) == 2
 
     async def test_same_day_update(self, trino_conn):
@@ -121,7 +119,7 @@ class TestIncrementalRefresh:
         await insert_trades(cursor, "2026-04-08", [("AAPL", "09:30:00", 150.0, 100)])
 
         cols = await discover_columns(cursor, VIEW.query)
-        value_cols = [c.name for c in cols if c.name not in VIEW.merge_keys]
+        value_cols = [c.name for c in cols if c.name not in PARSED.merge_keys]
         await cursor.execute(build_create_table_sql(TARGET_TABLE, cols, "ARRAY['day(minute)']"))
         await execute_full_refresh(cursor, VIEW, TARGET_TABLE)
 
@@ -133,7 +131,10 @@ class TestIncrementalRefresh:
         result = await detect_changes(cursor, SOURCE_TABLE, "ts", "minute", last_snapshot=result.current_snapshot)
         assert result.action == RefreshAction.INCREMENTAL
 
-        await execute_incremental_refresh(cursor, VIEW, TARGET_TABLE, value_cols, result.filter_range)
+        await execute_incremental_refresh(
+            cursor, VIEW, TARGET_TABLE,
+            PARSED.filter_column, PARSED.merge_keys, value_cols, result.filter_range,
+        )
         bars = await query_bars(cursor)
         assert len(bars) == 1
         assert bars[0]["high"] == 160.0

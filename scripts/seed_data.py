@@ -82,22 +82,18 @@ trino:
 
 views:
   - name: ohlcv_1m
-    source_table: iceberg.market_data.trades
-    filter_column: ts
     query: |
       SELECT
         symbol,
         date_trunc('minute', ts) AS minute,
         min_by(price, ts) AS open,
-        max(price) AS high,
-        min(price) AS low,
+        max(price)        AS high,
+        min(price)        AS low,
         max_by(price, ts) AS close,
-        sum(quantity) AS volume,
-        count(*) AS trade_count
+        sum(quantity)     AS volume,
+        count(*)          AS trade_count
       FROM iceberg.market_data.trades
-      WHERE {range_filter}
-      GROUP BY 1, 2
-    merge_keys: [symbol, minute]
+      GROUP BY symbol, date_trunc('minute', ts)
     target_table: iceberg.analytics.ohlcv_1m
     target_partitioning: "ARRAY['day(minute)']"
     refresh_interval_seconds: 30

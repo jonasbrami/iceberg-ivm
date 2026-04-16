@@ -1,10 +1,14 @@
-"""Tests for config loading and validation."""
+"""Tests for config loading and validation.
+
+Query-parsing tests live in test_query_parser.py; these cover YAML loading,
+identifier validation, and save/load round-tripping.
+"""
 import textwrap
 from pathlib import Path
 
 import pytest
 
-from trino_mv_orchestrator.config import ViewConfig, infer_granularity, load_config, load_views, save_views
+from trino_mv_orchestrator.config import ViewConfig, load_config, load_views, save_views
 
 
 def write_config(tmp_path: Path, content: str) -> Path:
@@ -31,10 +35,12 @@ trino:
 VALID_VIEWS = """\
 views:
   - name: ohlcv_1m
-    source_table: iceberg.market_data.trades
-    filter_column: ts
-    query: "SELECT date_trunc('day', ts) AS d FROM t WHERE {range_filter} GROUP BY 1"
-    merge_keys: [symbol, minute]
+    query: |
+      SELECT symbol,
+             date_trunc('minute', ts) AS minute,
+             sum(qty) AS volume
+      FROM iceberg.market_data.trades
+      GROUP BY 1, 2
     refresh_interval_seconds: 30
 """
 
@@ -64,9 +70,9 @@ def test_load_views_valid(tmp_path):
     views = load_views(write_views(tmp_path, VALID_VIEWS))
     assert len(views) == 1
     v = views[0]
-    assert v.filter_column == "ts"
-    assert v.merge_keys == ("symbol", "minute")
-    assert isinstance(v.merge_keys, tuple)
+    assert v.name == "ohlcv_1m"
+    assert "date_trunc" in v.query
+    assert v.refresh_interval_seconds == 30
 
 
 def test_load_views_missing_file(tmp_path):
@@ -75,23 +81,23 @@ def test_load_views_missing_file(tmp_path):
 
 def test_view_defaults(tmp_path):
     minimal = (
-        "views:\n  - name: v\n    source_table: t\n    filter_column: ts\n"
-        "    query: \"SELECT date_trunc('day', ts) AS d FROM t WHERE {range_filter} GROUP BY 1\"\n"
-        "    merge_keys: [a]\n"
+        "views:\n"
+        "  - name: v\n"
+        "    query: \"SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1\"\n"
     )
     views = load_views(write_views(tmp_path, minimal))
     assert views[0].refresh_interval_seconds == 60
 
 
-def test_missing_filter_column(tmp_path):
-    bad = VALID_VIEWS.replace("    filter_column: ts\n", "")
-    with pytest.raises(ValueError, match="filter_column"):
+def test_missing_query(tmp_path):
+    bad = VALID_VIEWS.replace("    query: |\n      SELECT symbol,\n             date_trunc('minute', ts) AS minute,\n             sum(qty) AS volume\n      FROM iceberg.market_data.trades\n      GROUP BY 1, 2\n", "")
+    with pytest.raises(ValueError, match="missing required fields"):
         load_views(write_views(tmp_path, bad))
 
 
-def test_missing_placeholder(tmp_path):
-    bad = VALID_VIEWS.replace("{range_filter}", "1=1")
-    with pytest.raises(ValueError, match="range_filter"):
+def test_missing_name(tmp_path):
+    bad = VALID_VIEWS.replace("  - name: ohlcv_1m\n", "  - \n")
+    with pytest.raises(ValueError, match="missing required fields"):
         load_views(write_views(tmp_path, bad))
 
 
@@ -101,27 +107,35 @@ def test_invalid_view_name(tmp_path):
         load_views(write_views(tmp_path, bad))
 
 
-def test_invalid_source_table(tmp_path):
-    bad = VALID_VIEWS.replace("source_table: iceberg.market_data.trades", "source_table: x;DROP")
+def test_invalid_target_table(tmp_path):
+    bad = VALID_VIEWS.replace(
+        "    refresh_interval_seconds: 30\n",
+        "    target_table: x;DROP\n",
+    )
     with pytest.raises(ValueError, match="valid qualified table name"):
         load_views(write_views(tmp_path, bad))
 
 
-def test_invalid_filter_column(tmp_path):
-    bad = VALID_VIEWS.replace("filter_column: ts", "filter_column: ts OR")
-    with pytest.raises(ValueError, match="valid SQL identifier"):
-        load_views(write_views(tmp_path, bad))
+def test_legacy_range_filter_placeholder_rejected(tmp_path):
+    """{range_filter} is no longer supported — old views.yaml files must be migrated."""
+    legacy = (
+        "views:\n  - name: v\n"
+        "    query: \"SELECT date_trunc('day', ts) AS d FROM t WHERE {range_filter} GROUP BY 1\"\n"
+    )
+    with pytest.raises(ValueError, match="range_filter"):
+        load_views(write_views(tmp_path, legacy))
 
 
-def test_invalid_merge_key(tmp_path):
-    bad = VALID_VIEWS.replace("merge_keys: [symbol, minute]", "merge_keys: [symbol, 1bad]")
-    with pytest.raises(ValueError, match="valid SQL identifier"):
-        load_views(write_views(tmp_path, bad))
-
-
-def test_valid_qualified_table_names(tmp_path):
-    views = load_views(write_views(tmp_path, VALID_VIEWS))
-    assert views[0].source_table == "iceberg.market_data.trades"
+def test_duplicate_view_names_rejected(tmp_path):
+    views_yaml = (
+        "views:\n"
+        "  - name: v\n"
+        "    query: \"SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1\"\n"
+        "  - name: v\n"
+        "    query: \"SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1\"\n"
+    )
+    with pytest.raises(ValueError, match="duplicate"):
+        load_views(write_views(tmp_path, views_yaml))
 
 
 # ── save_views / load_views round-trip ──
@@ -129,123 +143,18 @@ def test_valid_qualified_table_names(tmp_path):
 def test_save_views_and_reload(tmp_path):
     views = [ViewConfig(
         name="ohlcv_1m",
-        source_table="iceberg.market_data.trades",
-        query="SELECT date_trunc('day', ts) AS d FROM t WHERE {range_filter} GROUP BY 1",
-        merge_keys=("symbol", "minute"),
-        filter_column="ts",
+        query="SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1",
         refresh_interval_seconds=30,
     )]
     views_path = tmp_path / "views.yaml"
     save_views(views, views_path)
     loaded = load_views(views_path)
-    assert loaded[0].filter_column == views[0].filter_column
-    assert loaded[0].merge_keys == views[0].merge_keys
+    assert loaded[0].name == views[0].name
+    assert loaded[0].query.strip() == views[0].query.strip()
+    assert loaded[0].refresh_interval_seconds == 30
 
 
 def test_save_views_creates_parent_dirs(tmp_path):
     views_path = tmp_path / "data" / "views.yaml"
     save_views([], views_path)
     assert views_path.exists()
-
-
-# ── infer_granularity ──
-
-def test_infer_minute():
-    assert infer_granularity("SELECT date_trunc('minute', ts) FROM t") == "minute"
-
-def test_infer_hour():
-    assert infer_granularity("SELECT date_trunc('hour', ts) FROM t") == "hour"
-
-def test_infer_day():
-    assert infer_granularity("SELECT date_trunc('day', ts) FROM t") == "day"
-
-def test_infer_week():
-    assert infer_granularity("SELECT date_trunc('week', ts) FROM t") == "week"
-
-def test_infer_month():
-    assert infer_granularity("SELECT date_trunc('month', ts) FROM t") == "month"
-
-def test_infer_quarter():
-    assert infer_granularity("SELECT date_trunc('quarter', ts) FROM t") == "quarter"
-
-def test_infer_year():
-    assert infer_granularity("SELECT date_trunc('year', ts) FROM t") == "year"
-
-def test_infer_case_insensitive():
-    assert infer_granularity("SELECT DATE_TRUNC('Hour', ts) FROM t") == "hour"
-
-def test_infer_no_date_trunc_raises():
-    with pytest.raises(ValueError, match="must contain a date_trunc"):
-        infer_granularity("SELECT ts FROM t")
-
-def test_infer_complex_expr_raises():
-    """date_trunc used in arithmetic should be rejected."""
-    q = ("SELECT date_trunc('minute', minute) "
-         "- (extract(minute FROM minute) % 5) * INTERVAL '1' MINUTE AS bar FROM t")
-    with pytest.raises(ValueError, match="complex date_trunc"):
-        infer_granularity(q)
-
-def test_infer_invalid_granularity_raises():
-    with pytest.raises(ValueError, match="could not infer a single granularity"):
-        infer_granularity("SELECT date_trunc('second', ts) FROM t")
-
-def test_infer_multiple_same():
-    q = "SELECT date_trunc('hour', ts), date_trunc('hour', other) FROM t"
-    assert infer_granularity(q) == "hour"
-
-def test_infer_multiple_different_raises():
-    q = "SELECT date_trunc('hour', ts), date_trunc('day', ts) FROM t"
-    with pytest.raises(ValueError, match="could not infer a single granularity"):
-        infer_granularity(q)
-
-
-# ── views-level query validation ──
-# The loader calls infer_granularity() on the query to validate it, but the
-# result is not stored. These tests verify that valid queries load and invalid
-# queries are rejected.
-
-def test_load_views_accepts_minute(tmp_path):
-    views_yaml = (
-        "views:\n  - name: v\n    source_table: t\n    filter_column: ts\n"
-        "    query: \"SELECT date_trunc('minute', ts) AS m FROM t WHERE {range_filter} GROUP BY 1\"\n"
-        "    merge_keys: [m]\n"
-    )
-    assert len(load_views(write_views(tmp_path, views_yaml))) == 1
-
-
-def test_load_views_accepts_quarter(tmp_path):
-    views_yaml = (
-        "views:\n  - name: v\n    source_table: t\n    filter_column: ts\n"
-        "    query: \"SELECT date_trunc('quarter', ts) AS q FROM t WHERE {range_filter} GROUP BY 1\"\n"
-        "    merge_keys: [q]\n"
-    )
-    assert len(load_views(write_views(tmp_path, views_yaml))) == 1
-
-
-def test_load_views_accepts_year(tmp_path):
-    views_yaml = (
-        "views:\n  - name: v\n    source_table: t\n    filter_column: ts\n"
-        "    query: \"SELECT date_trunc('year', ts) AS y FROM t WHERE {range_filter} GROUP BY 1\"\n"
-        "    merge_keys: [y]\n"
-    )
-    assert len(load_views(write_views(tmp_path, views_yaml))) == 1
-
-
-def test_load_views_fails_when_cannot_infer(tmp_path):
-    views_yaml = (
-        "views:\n  - name: v\n    source_table: t\n    filter_column: ts\n"
-        "    query: \"SELECT ts FROM t WHERE {range_filter}\"\n"
-        "    merge_keys: [ts]\n"
-    )
-    with pytest.raises(ValueError, match="must contain a date_trunc"):
-        load_views(write_views(tmp_path, views_yaml))
-
-
-def test_load_views_fails_on_complex_expr(tmp_path):
-    views_yaml = (
-        "views:\n  - name: v\n    source_table: t\n    filter_column: ts\n"
-        "    query: \"SELECT date_trunc('minute', ts) - INTERVAL '5' MINUTE AS x FROM t WHERE {range_filter} GROUP BY 1\"\n"
-        "    merge_keys: [x]\n"
-    )
-    with pytest.raises(ValueError, match="complex date_trunc"):
-        load_views(write_views(tmp_path, views_yaml))
