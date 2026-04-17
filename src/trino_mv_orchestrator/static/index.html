@@ -242,14 +242,15 @@
             <!-- Action buttons -->
             <div class="flex items-center gap-1 shrink-0">
               <button @click="triggerRefresh(view.name)"
-                      :disabled="refreshing[view.name]"
-                      class="flex items-center gap-[5px] text-[11px] font-medium
-                             px-[10px] py-[6px] rounded-lg
-                             bg-[rgba(15,15,30,0.03)] hover:bg-[rgba(15,15,30,0.06)]
-                             text-[#666684] hover:text-[#1a1a28]
-                             border border-[rgba(15,15,30,0.10)] hover:border-[rgba(15,15,30,0.18)]
+                      :disabled="refreshing[view.name] === true"
+                      class="flex items-center gap-[5px] text-[11px] font-semibold
+                             px-[11px] py-[6px] rounded-lg cursor-pointer
+                             bg-indigo-50 hover:bg-indigo-100
+                             text-indigo-700 hover:text-indigo-800
+                             border border-indigo-200 hover:border-indigo-300
                              transition-all duration-150
-                             disabled:opacity-35 disabled:cursor-not-allowed active:scale-95">
+                             disabled:opacity-35 disabled:cursor-not-allowed
+                             active:scale-95">
                 <template x-if="!refreshing[view.name]">
                   <span>Refresh</span>
                 </template>
@@ -431,6 +432,18 @@
   </div>
 
 </div>
+
+<!-- ── Toast ───────────────────────────────────────────────────── -->
+<div x-show="toast.message" x-cloak x-transition.opacity
+     class="fixed bottom-6 right-6 z-[60] max-w-[420px] px-4 py-[10px] rounded-xl
+            text-[12px] font-mono leading-snug shadow-[0_10px_30px_rgba(15,15,30,0.15)]
+            border"
+     :class="{
+       'bg-white text-[#3a3a52] border-[rgba(15,15,30,0.10)]': toast.kind === 'muted',
+       'bg-emerald-50 text-emerald-800 border-emerald-500/[0.35]': toast.kind === 'success',
+       'bg-red-50 text-red-700 border-red-500/[0.35]': toast.kind === 'error',
+     }"
+     x-text="toast.message"></div>
 
 <!-- ── Modal overlay ────────────────────────────────────────────── -->
 <div x-show="showForm" x-cloak
@@ -819,11 +832,32 @@ function app() {
     async triggerRefresh(name) {
       this.refreshing = { ...this.refreshing, [name]: true };
       try {
-        await fetch(`/api/views/${name}/refresh`, { method: 'POST' });
+        const res = await fetch(`/api/views/${name}/refresh`, { method: 'POST' });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          this.showToast(`${name}: refresh failed — ${body.detail || res.statusText}`, 'error');
+        } else if (body.last_error) {
+          this.showToast(`${name}: ${body.last_error}`, 'error');
+        } else {
+          const action = body.last_action || 'done';
+          const label = { skip: 'no changes', full: 'full refresh', incremental: 'incremental refresh' }[action] || action;
+          this.showToast(`${name}: ${label}`, action === 'skip' ? 'muted' : 'success');
+        }
         await this.loadViews();
+      } catch (e) {
+        this.showToast(`${name}: ${e.message || 'network error'}`, 'error');
       } finally {
         this.refreshing = { ...this.refreshing, [name]: false };
       }
+    },
+
+    // ── toast ──
+    toast: { message: '', kind: 'muted' },
+    _toastTimer: null,
+    showToast(message, kind = 'muted') {
+      this.toast = { message, kind };
+      if (this._toastTimer) clearTimeout(this._toastTimer);
+      this._toastTimer = setTimeout(() => { this.toast = { message: '', kind }; }, 3500);
     },
 
     timeAgo(ts) {

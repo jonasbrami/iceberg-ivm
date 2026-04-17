@@ -133,32 +133,70 @@ the inverse is trivially computable by `snap_range('X')`. Complex expressions
 reliably inferred, and the inverse would produce a too-narrow filter that
 corrupts aggregates.
 
+## Requirements
+
+- **Trino ≥ 465** — `extra_properties` table-property support was added in 465 (see the prerequisite below).
+- **Iceberg catalog supporting writes from Trino** — Hive Metastore, REST, Nessie, Polaris, Snowflake Open Catalog, or JDBC.
+- **Trino user** with the following privileges:
+  - `SELECT` on every source table (plus its `$snapshots`, `$all_entries`, `$properties` metadata tables — these inherit from the base-table grant in Trino's Iceberg connector).
+  - `CREATE TABLE` on the target schema — the orchestrator creates the target on first refresh.
+  - `SELECT`, `INSERT`, `DELETE`, `UPDATE` on every target table — needed for `MERGE` (incremental) and `DELETE + INSERT` (full refresh).
+  - `ALTER TABLE` on every target table — state persistence via `SET PROPERTIES extra_properties = …`.
+- **Iceberg column statistics** on the source `filter_column` — the detector reads `readable_metrics` from `$all_entries`. Statistics are on by default for Trino and Spark ≥ 3.5 writers.
+- **Python ≥ 3.12** — only when running from source (the Docker image does not require this on the host).
+
 ## Quick start
 
-```bash
-uv sync
-uv run trino-mv-orchestrator -c config.yaml
-# Web UI:  http://localhost:8000
-# Metrics: http://localhost:8000/metrics
-```
+### 1. Trino prerequisite
 
-### Trino prerequisite
+Refresh state (the last source snapshot processed) is persisted **inside the
+target table** as an Iceberg custom property — so dropping the view cleans its
+state up automatically, no sidecar DB needed. Trino's Iceberg connector ships
+this as an opt-in feature: by default no custom property keys can be written
+through `extra_properties`, so you need to allow `mv.last_source_snapshot` on
+every catalog the orchestrator writes to:
 
 ```properties
 # etc/catalog/iceberg.properties
 iceberg.allowed-extra-properties=mv.last_source_snapshot
 ```
 
-### Minimal view definition
+Without this, the state-writing `ALTER TABLE … SET PROPERTIES extra_properties
+= …` fails, and the orchestrator will redo a full refresh on every cycle
+because it can't remember where it left off.
+
+**References** (Trino docs):
+
+- [`iceberg.allowed-extra-properties`](https://trino.io/docs/current/connector/iceberg.html#general-configuration) —
+  *"List of extra properties that are allowed to be set on Iceberg tables. Use
+  `*` to allow all properties."*  Default: `[]`.
+- [`extra_properties` table property](https://trino.io/docs/current/connector/iceberg.html#table-properties) —
+  the per-table map we write the snapshot ID into.
+- Introduced in [Trino 465](https://trino.io/docs/current/release/release-465.html)
+  (2024-12-11): *"Add support for reading and writing arbitrary table properties
+  with the `extra_properties` table property."*  Trino ≥ 465 is required.
+
+### 2. Create two YAML files
+
+**`config.yaml`** — Trino connection + server settings (see
+[`config.yaml.example`](config.yaml.example) for a starting template):
 
 ```yaml
+server:
+  port: 8000
+  config_reload_interval_seconds: 30
 trino:
   host: localhost
   port: 8080
   catalog: iceberg
   schema: analytics
   user: orchestrator
+```
 
+**`views.yaml`** — the views to maintain. Write each `query` *exactly* as you
+would after `CREATE MATERIALIZED VIEW … AS`:
+
+```yaml
 views:
   - name: ohlcv_1m
     query: |
@@ -166,21 +204,63 @@ views:
         symbol,
         date_trunc('minute', ts) AS minute,
         min_by(price, ts) AS open, max(price) AS high,
-        min(price) AS low, max_by(price, ts) AS close,
-        sum(quantity) AS volume, count(*) AS trade_count
+        min(price) AS low,        max_by(price, ts) AS close,
+        sum(quantity) AS volume,  count(*) AS trade_count
       FROM iceberg.market_data.trades
       GROUP BY symbol, date_trunc('minute', ts)
+    refresh_interval_seconds: 30
 ```
 
-The operator writes *exactly* what they would put after
-`CREATE MATERIALIZED VIEW … AS`. The orchestrator parses the query and derives
-`source_table`, `filter_column`, `filter_granularity`, and `merge_keys` from it.
-At refresh time the time-range `WHERE` predicate is AST-injected automatically —
-there is no `{range_filter}` placeholder.
+The orchestrator parses each query and derives `source_table`, `filter_column`,
+`filter_granularity`, and `merge_keys` from it. At refresh time the time-range
+WHERE predicate is AST-injected automatically — there is no `{range_filter}`
+placeholder. Column types are auto-discovered via `DESCRIBE OUTPUT` and the
+target table is created on first run.
 
-The orchestrator also auto-discovers column types (`DESCRIBE OUTPUT`), creates
-the target table, and starts refreshing. Views can also be managed from the web
-UI.
+Views can also be managed interactively from the web UI.
+
+### 3. Run it
+
+Install dependencies and start the service:
+
+```bash
+uv sync
+uv run trino-mv-orchestrator -c config.yaml --views views.yaml
+# Web UI:  http://localhost:8000
+# Metrics: http://localhost:8000/metrics
+```
+
+**CLI flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `-c`, `--config` | `config.yaml` | Path to the Trino + server config |
+| `--views` | `views.yaml` | Path to the views file (empty if absent) |
+| `-v`, `--verbose` | off | Enable DEBUG logging |
+
+The server port comes from `server.port` in `config.yaml`. Both files are
+hot-reloaded on mtime change at `server.config_reload_interval_seconds` (default
+30s) — no restart needed when adding/editing views.
+
+**Trino connection settings** (`host`, `port`, `catalog`, `schema`, `user`) come
+from `config.yaml`'s `trino:` section only — there are no environment-variable
+or CLI overrides today. For per-environment deploys, template the file at
+deploy time (e.g. Helm, envsubst) or mount a different `config.yaml` per
+environment.
+
+### Running against a local Trino stack
+
+A `tests/docker-compose.yml` brings up Trino + MinIO + Postgres for local
+development:
+
+```bash
+cd tests && docker compose up -d trino
+# Trino UI: http://localhost:18080
+# Seed sample data + generate config/views:
+cd ..
+uv run --with trino python scripts/seed_data.py
+uv run trino-mv-orchestrator -c config.yaml --views views.yaml
+```
 
 ### Configuration reference
 
