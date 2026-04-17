@@ -386,6 +386,41 @@ def test_create_view_fails_on_arithmetic(client, setup_state):
     assert "arithmetic" in r.json()["detail"]
 
 
+# ── /api/views/parse — live validation for the UI ──
+
+def test_parse_query_returns_parsed_fields(client):
+    r = client.post("/api/views/parse", json={
+        "query": (
+            "SELECT symbol, date_trunc('week', ts) AS week, sum(q) AS v "
+            "FROM iceberg.md.trades GROUP BY 1, 2"
+        ),
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["source_table"] == "iceberg.md.trades"
+    assert body["filter_column"] == "ts"
+    assert body["granularity"] == "week"
+    assert body["merge_keys"] == ["symbol", "week"]
+
+
+def test_parse_query_rejects_invalid(client):
+    r = client.post("/api/views/parse", json={
+        "query": "SELECT date_trunc('day', ts) - INTERVAL '1' DAY AS x FROM t GROUP BY 1",
+    })
+    assert r.status_code == 422
+    assert "arithmetic" in r.json()["detail"]
+
+
+def test_parse_query_rejects_legacy_placeholder(client):
+    r = client.post("/api/views/parse", json={
+        "query": (
+            "SELECT date_trunc('day', ts) AS d FROM t WHERE {range_filter} GROUP BY 1"
+        ),
+    })
+    assert r.status_code == 422
+    assert "range_filter" in r.json()["detail"]
+
+
 def test_create_view_rejects_legacy_range_filter(client, setup_state):
     r = client.post("/api/views", json={
         "name": "legacy_view",

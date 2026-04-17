@@ -493,16 +493,62 @@
 
               <!-- text (multi-line) -->
               <template x-if="field.type === 'text'">
-                <textarea
-                  x-model="form[field.name]"
-                  :rows="field.rows || 6"
-                  :placeholder="field.placeholder"
-                  class="w-full bg-white border border-[rgba(15,15,30,0.12)] rounded-[10px]
-                         px-3 py-[10px] text-[12px] font-mono text-[#1a1a28] placeholder-[#b8b8c8]
-                         leading-[1.75] resize-y
-                         focus:outline-none focus:border-indigo-500/55
-                         focus:ring-2 focus:ring-indigo-500/[0.14]
-                         transition-[border-color,box-shadow] duration-150"></textarea>
+                <div>
+                  <textarea
+                    x-model="form[field.name]"
+                    @input="field.name === 'query' && scheduleParse()"
+                    :rows="field.rows || 6"
+                    :placeholder="field.placeholder"
+                    class="w-full bg-white border border-[rgba(15,15,30,0.12)] rounded-[10px]
+                           px-3 py-[10px] text-[12px] font-mono text-[#1a1a28] placeholder-[#b8b8c8]
+                           leading-[1.75] resize-y
+                           focus:outline-none focus:border-indigo-500/55
+                           focus:ring-2 focus:ring-indigo-500/[0.14]
+                           transition-[border-color,box-shadow] duration-150"></textarea>
+
+                  <!-- Live parse panel — only shown for the query field -->
+                  <template x-if="field.name === 'query'">
+                    <div class="mt-2">
+                      <!-- error state -->
+                      <div x-show="parseError && !parsing"
+                           class="text-[11px] font-mono text-red-700 leading-relaxed
+                                  bg-red-500/[0.06] border border-red-500/[0.22] rounded-lg px-3 py-[8px]">
+                        <span class="font-medium uppercase tracking-[0.06em] text-[10px]">parse error</span>
+                        <span class="block mt-[2px]" x-text="parseError"></span>
+                      </div>
+
+                      <!-- parsed attributes -->
+                      <div x-show="parsed && !parseError"
+                           class="flex flex-wrap items-center gap-[6px] text-[11px] font-mono
+                                  bg-emerald-500/[0.05] border border-emerald-500/[0.22]
+                                  rounded-lg px-3 py-[8px]">
+                        <span class="uppercase tracking-[0.06em] text-[10px] text-emerald-800/85 font-medium mr-1">
+                          derived
+                        </span>
+                        <template x-for="chip in [
+                          { label: 'source', value: parsed && parsed.source_table },
+                          { label: 'filter col', value: parsed && parsed.filter_column },
+                          { label: 'granularity', value: parsed && parsed.granularity },
+                          { label: 'merge keys', value: parsed && (parsed.merge_keys || []).join(', ') },
+                        ]" :key="chip.label">
+                          <span class="inline-flex items-baseline gap-[5px]
+                                       px-[8px] py-[3px] rounded-md
+                                       bg-white/70 border border-[rgba(15,15,30,0.10)]">
+                            <span class="text-[9.5px] uppercase tracking-[0.08em] text-[#666684]"
+                                  x-text="chip.label"></span>
+                            <span class="text-[#1a1a28]" x-text="chip.value"></span>
+                          </span>
+                        </template>
+                      </div>
+
+                      <!-- subtle in-flight hint -->
+                      <div x-show="parsing"
+                           class="text-[10.5px] font-mono text-[#888ca0] mt-[4px] ml-[2px]">
+                        parsing…
+                      </div>
+                    </div>
+                  </template>
+                </div>
               </template>
 
               <!-- number -->
@@ -584,6 +630,12 @@ function app() {
     schema: [],
     form: {},
 
+    // ── live query parsing (populates as the operator types) ──
+    parsed: null,          // { source_table, filter_column, granularity, merge_keys }
+    parseError: '',        // human-readable error from /api/views/parse
+    parsing: false,        // in-flight indicator
+    _parseTimer: null,     // debounce handle
+
     get schemaRows() {
       // Group consecutive fields sharing the same non-null `group` into a single row.
       const rows = [];
@@ -633,6 +685,47 @@ function app() {
       }
       this.form = fresh;
       this.formError = '';
+      this.parsed = null;
+      this.parseError = '';
+      this.parsing = false;
+      if (this._parseTimer) { clearTimeout(this._parseTimer); this._parseTimer = null; }
+    },
+
+    // Debounce-parse the current query. Called from the textarea's @input.
+    scheduleParse() {
+      if (this._parseTimer) clearTimeout(this._parseTimer);
+      const q = (this.form.query || '').trim();
+      if (!q) {
+        this.parsed = null;
+        this.parseError = '';
+        this.parsing = false;
+        return;
+      }
+      this._parseTimer = setTimeout(() => this.runParse(q), 350);
+    },
+
+    async runParse(q) {
+      this.parsing = true;
+      try {
+        const res = await fetch('/api/views/parse', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: q }),
+        });
+        if (res.ok) {
+          this.parsed = await res.json();
+          this.parseError = '';
+        } else {
+          const body = await res.json().catch(() => ({ detail: 'parse failed' }));
+          this.parsed = null;
+          this.parseError = body.detail || 'parse failed';
+        }
+      } catch (e) {
+        this.parsed = null;
+        this.parseError = e.message || 'network error';
+      } finally {
+        this.parsing = false;
+      }
     },
 
     editView(view) {
@@ -648,7 +741,12 @@ function app() {
       }
       this.form = populated;
       this.formError = '';
+      this.parsed = null;
+      this.parseError = '';
       this.showForm = true;
+      // Populate the parsed panel immediately so the user sees the
+      // current derivation without waiting for the debounce.
+      this.scheduleParse();
     },
 
     buildBody() {
@@ -684,6 +782,7 @@ function app() {
       this.formError = '';
       const err = this.validateForm();
       if (err) { this.formError = err; return; }
+      if (this.parseError) { this.formError = this.parseError; return; }
 
       const body = this.buildBody();
 
