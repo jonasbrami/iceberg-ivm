@@ -1,9 +1,0 @@
-server:
-  port: 8000
-  config_reload_interval_seconds: 30
-trino:
-  host: trino
-  port: 8080
-  catalog: iceberg
-  schema: analytics
-  user: demo
