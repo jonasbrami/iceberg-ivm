@@ -327,6 +327,73 @@ export TRINO_USER=demo
 uv run trino-mv-orchestrator -c config.yaml --views views.yaml
 ```
 
+## Using it
+
+### The web UI
+
+Open http://localhost:8000 after starting the service. You get a single-page app listing every configured view:
+
+- **Header** — view count, poll cadence, a **New View** button that opens the create-view modal.
+- **View cards** — one per view, showing:
+  - name and a status badge (`pending`, `idle`, `incremental`, `full`, `error`)
+  - `source → target` qualified table names
+  - stats row: total `Refreshes`, last `Duration`, polled `Interval`, `Last` refresh timestamp, cumulative `Errors`
+  - **Refresh / Edit / Delete** buttons
+  - a collapsible **query** panel with the raw SQL
+  - a collapsible **recent queries (N)** panel with one row per refresh-time query (`merge` / `full_delete` / `full_insert`) — click any row to open that query in the Trino UI
+- **Live query parsing** — while you type in the create/edit modal, a debounced panel under the query textarea shows the parser's derived `source`, `filter col`, `granularity`, and `merge keys`, or a red parse error.
+- **Refresh toast** — clicking Refresh pops a small bottom-right toast reporting the action (`no changes` / `incremental refresh` / `full refresh` / error message).
+
+### Managing views — two paths
+
+Both write to the same `views.yaml`, so you can mix freely:
+
+| Path | When | Notes |
+|---|---|---|
+| Edit `views.yaml` on disk | Version-controlled deploys; bulk changes | Hot-reloaded on mtime change every `config_reload_interval_seconds` (default 30s) — no restart needed. |
+| Web UI / REST API | Exploratory / ops workflows | `POST /api/views`, `DELETE /api/views/{name}`, `POST /api/views/{name}/refresh`. Writes to `views.yaml` atomically. |
+
+### How the refresh loop actually runs
+
+One asyncio task ticks every **1 second**. On each tick:
+
+- If `config_reload_interval_seconds` has elapsed since the last reload, re-read `config.yaml` + `views.yaml`.
+- For each configured view, if `refresh_interval_seconds` has elapsed since its last refresh, run one refresh cycle.
+
+Refreshes are **sequential** — one view at a time, no pool, no queue. A single slow refresh delays the next tick's scheduling; plan `refresh_interval_seconds` accordingly.
+
+### What the first run looks like
+
+On the first refresh of a brand-new view you'll see:
+
+1. `discover_columns` (a `PREPARE` + `DESCRIBE OUTPUT`, no data scan) resolves the target column types.
+2. `CREATE TABLE IF NOT EXISTS target (...) WITH (partitioning = ...)` creates the Iceberg table. Partitioning is copied from the source unless you set `target_partitioning` explicitly.
+3. The detector sees no `mv.last_source_snapshot` in the target's `$properties` and returns `FULL_REFRESH`.
+4. `execute_full_refresh` runs `DELETE FROM target WHERE true` then `INSERT INTO target SELECT …` (your original query, verbatim — no WHERE injected).
+5. The source snapshot ID is stored in `target.extra_properties.mv.last_source_snapshot`.
+
+Every subsequent cycle is incremental unless you drop the target table.
+
+### Day-2 operations
+
+| Task | How |
+|---|---|
+| Add / edit a view | Edit `views.yaml` (or use UI / API). Takes effect at next config reload. |
+| Delete a view | UI → Delete, or `DELETE /api/views/{name}`. Removes it from the schedule **only** — the target Iceberg table is untouched. Drop it separately if you want the data gone. |
+| Force a full refresh | `DROP TABLE <target>` in Trino. State lives inside the target, so dropping it resets the bookmark; the next tick creates the table and full-refreshes. |
+| Restart the orchestrator | Safe. Resident state is per-view status counters only; the snapshot bookmark lives in Iceberg. Restart picks up where it left off. |
+| Manual refresh | UI → Refresh, or `POST /api/views/{name}/refresh`. Runs one cycle synchronously and returns the action taken. |
+| Health check | `curl http://localhost:8000/health` → `{"status":"ok","views":N}` |
+
+### Deployment notes
+
+- **Single-instance.** The orchestrator is not HA. One process per target catalog/schema. Two instances against the same targets would race on `ALTER TABLE SET PROPERTIES` and produce conflicting MERGEs.
+- **Crash-safe.** State lives in Iceberg, not in the orchestrator. Kill/restart leaves no cleanup.
+- **What to monitor** (all labels `view`):
+  - `rate(mv_refresh_errors_total[5m]) > 0` — refresh is failing.
+  - `time() - mv_refresh_last_success_timestamp > 3 * refresh_interval_seconds` — view is stalled.
+  - `histogram_quantile(0.95, rate(mv_refresh_duration_seconds_bucket[10m]))` — refresh tail latency; unexpected growth usually means a partition scan you didn't plan for.
+
 ### Configuration reference
 
 | Field | Required | Description |
