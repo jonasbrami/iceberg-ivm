@@ -1,7 +1,6 @@
-"""Auto-discover query column types and source table partitioning."""
+"""Auto-discover query column types."""
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 
 
@@ -19,18 +18,6 @@ async def discover_columns(cursor, query: str) -> list[ColumnInfo]:
     columns = [ColumnInfo(name=row[0], type=row[4]) for row in await cursor.fetchall()]
     await cursor.execute(f"DEALLOCATE PREPARE {stmt_name}")
     return columns
-
-
-async def discover_source_partitioning(cursor, source_table: str) -> str | None:
-    """Extract the partitioning spec from SHOW CREATE TABLE.
-
-    Returns the ARRAY[...] string, or None if not partitioned.
-    """
-    await cursor.execute(f"SHOW CREATE TABLE {source_table}")
-    row = await cursor.fetchone()
-    create_sql = row[0]
-    match = re.search(r"partitioning\s*=\s*(ARRAY\[[^\]]+\])", create_sql)
-    return match.group(1) if match else None
 
 
 def build_create_table_sql(

@@ -367,7 +367,7 @@ Refreshes are **sequential** — one view at a time, no pool, no queue. A single
 On the first refresh of a brand-new view you'll see:
 
 1. `discover_columns` (a `PREPARE` + `DESCRIBE OUTPUT`, no data scan) resolves the target column types.
-2. `CREATE TABLE IF NOT EXISTS target (...) WITH (partitioning = ...)` creates the Iceberg table. Partitioning is copied from the source unless you set `target_partitioning` explicitly.
+2. `CREATE TABLE IF NOT EXISTS target (…)` creates the Iceberg table. The target is **unpartitioned by default**; set `target_partitioning` on the view to partition it (e.g. `"ARRAY['day(minute)']"`).
 3. The detector sees no `mv.last_source_snapshot` in the target's `$properties` and returns `FULL_REFRESH`.
 4. `execute_full_refresh` runs `DELETE FROM target WHERE true` then `INSERT INTO target SELECT …` (your original query, verbatim — no WHERE injected).
 5. The source snapshot ID is stored in `target.extra_properties.mv.last_source_snapshot`.
@@ -401,7 +401,7 @@ Every subsequent cycle is incremental unless you drop the target table.
 | `name` | yes | Unique view name |
 | `query` | yes | The full SELECT — exactly what you would write after `CREATE MATERIALIZED VIEW … AS`. `source_table`, `filter_column`, `filter_granularity`, and `merge_keys` are derived from this |
 | `target_table` | no | Defaults to `{catalog}.{schema}.{name}` |
-| `target_partitioning` | no | Defaults to source table's partitioning |
+| `target_partitioning` | no | Iceberg `ARRAY[...]` string for the target table's partitioning (e.g. `"ARRAY['day(minute)']"`). Unpartitioned if omitted — the orchestrator does not auto-inherit from the source, because the source's partition column is typically consumed by `date_trunc(...)` and no longer exists on the target (see issue #22). |
 | `refresh_interval_seconds` | no | Defaults to 60 |
 
 ### API

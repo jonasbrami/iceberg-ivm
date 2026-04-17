@@ -4,7 +4,6 @@ from trino_mv_orchestrator.introspect import (
     ColumnInfo,
     build_create_table_sql,
     discover_columns,
-    discover_source_partitioning,
 )
 
 
@@ -28,50 +27,6 @@ class MockCursor:
 
     async def fetchall(self):
         return self._rows
-
-
-# ── discover_source_partitioning ──
-
-class TestDiscoverSourcePartitioning:
-    async def test_partitioned_table(self):
-        create_sql = (
-            "CREATE TABLE iceberg.market_data.trades (\n"
-            "  ts timestamp(6) with time zone,\n"
-            "  symbol varchar\n"
-            ")\n"
-            "WITH (\n"
-            "  format = 'PARQUET',\n"
-            "  partitioning = ARRAY['day(ts)']\n"
-            ")"
-        )
-        cursor = MockCursor([[(create_sql,)]])
-        result = await discover_source_partitioning(cursor, "iceberg.market_data.trades")
-        assert result == "ARRAY['day(ts)']"
-        assert "SHOW CREATE TABLE" in cursor.executed[0]
-
-    async def test_multi_column_partitioning(self):
-        create_sql = (
-            "CREATE TABLE t (\n  a int\n)\n"
-            "WITH (\n  partitioning = ARRAY['day(ts)', 'bucket(16, id)']\n)"
-        )
-        cursor = MockCursor([[(create_sql,)]])
-        result = await discover_source_partitioning(cursor, "t")
-        assert result == "ARRAY['day(ts)', 'bucket(16, id)']"
-
-    async def test_not_partitioned(self):
-        create_sql = (
-            "CREATE TABLE t (\n  a int\n)\n"
-            "WITH (\n  format = 'PARQUET'\n)"
-        )
-        cursor = MockCursor([[(create_sql,)]])
-        result = await discover_source_partitioning(cursor, "t")
-        assert result is None
-
-    async def test_whitespace_variations(self):
-        create_sql = "WITH (  partitioning  =  ARRAY['month(ts)']  )"
-        cursor = MockCursor([[(create_sql,)]])
-        result = await discover_source_partitioning(cursor, "t")
-        assert result == "ARRAY['month(ts)']"
 
 
 # ── discover_columns ──
