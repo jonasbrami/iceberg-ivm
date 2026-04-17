@@ -58,6 +58,45 @@ sequenceDiagram
 4. **Refresh** -- `MERGE INTO` with a plain column range filter (Trino pushes down to partition pruning)
 5. **Persist** -- store snapshot ID in target table's Iceberg properties
 
+### Iceberg metadata: what we read and why
+
+The orchestrator treats Iceberg's metadata tables as a small, structured
+log it can poll cheaply. It never scans source *data* for change
+detection — just the metadata describing what data exists.
+
+| Table | What we read | What it tells us |
+|---|---|---|
+| `source.$snapshots` | `(snapshot_id, operation, committed_at)` | Did the source change since our last refresh? And was the change a legitimate `append`, a `replace` (compaction — no new data), or something else (`overwrite` / `delete`, which we reject)? |
+| `source.$all_entries` | `readable_metrics` JSON on files added in new snapshots (filtered by `snapshot_id IN (new)` and `status = 1`) | Per-file column-level min/max bounds. Gives us the tightest `[min_ts, max_ts]` bracket over the new data without reading a single data file. |
+| `target.$properties` | `mv.last_source_snapshot` | The last source snapshot we already processed — our "bookmark". |
+
+**Why `$all_entries` and not `$partitions`?** An earlier prototype diffed
+`$partitions` between snapshots — but when the GROUP BY granularity is
+coarser than the source partitioning (e.g. weekly bars from a daily-
+partitioned source), a per-partition filter reads only the changed
+partition and miscomputes the aggregate. File-level min/max is
+granularity-independent: the detector always gets the real time range
+of the new data regardless of how the source is partitioned.
+
+**Sample `readable_metrics`** (one row per file in `$all_entries`):
+
+```json
+{
+  "ts":     {"lower_bound": "2026-04-08T10:00:41+00:00",
+             "upper_bound": "2026-04-08T15:59:50+00:00"},
+  "price":  {"lower_bound": 138.5,  "upper_bound": 260.0},
+  "symbol": {"lower_bound": "AAPL", "upper_bound": "TSLA"}
+}
+```
+
+The detector pulls the `filter_column`'s `lower_bound` / `upper_bound`
+across every new file, takes the chronological min of the lowers and
+max of the uppers, then hands those two timestamps to
+`expand_to_bucket_bounds(…)` (the `date_trunc` inverse — see next
+section) to produce a bucket-aligned filter range. The range becomes
+literal `TIMESTAMP` values in the `MERGE`'s WHERE, which Trino's
+planner pushes straight down to Iceberg partition pruning.
+
 ### `date_trunc` and `expand_to_bucket_bounds`: forward and inverse
 
 The entire incremental refresh correctness depends on one thing: given the
