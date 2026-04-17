@@ -12,9 +12,12 @@ of decisions we need to make.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterator
+
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 import sqlparse
 from sqlparse.sql import (
@@ -259,6 +262,13 @@ def _read_date_trunc_args(fn: Function) -> tuple[str, str]:
     if isinstance(second, Identifier):
         col = second.get_real_name()
     elif second.ttype is Name:
+        col = str(second)
+    elif second.ttype in Keyword and _IDENTIFIER_RE.match(str(second)):
+        # sqlparse tokenizes reserved-word column names (minute, hour, day,
+        # week, …) as Keyword tokens instead of Name/Identifier.  Trino
+        # accepts these as unquoted column identifiers (verified against
+        # Trino 465+) so we do the same.  The regex rules out multi-token
+        # keyword expressions like "GROUP BY" or quoted strings.
         col = str(second)
     else:
         raise ValueError(

@@ -66,6 +66,50 @@ class TestParseViewQuery:
         p = parse_view_query(sql)
         assert p.merge_keys == ("symbol", "d")
 
+    @pytest.mark.parametrize("col", [
+        # The 7 granularity keywords — common column names in chained MVs
+        # where the upstream view aliased `date_trunc('X', ts) AS X`.
+        "minute", "hour", "day", "week", "month", "quarter", "year",
+        # Other SQL reserved words Trino accepts as unquoted column names.
+        "order", "group", "desc", "asc", "by",
+    ])
+    def test_accepts_reserved_word_column(self, col):
+        """date_trunc's second arg can be any valid Trino identifier, including
+        SQL reserved words. sqlparse tokenizes those as Keyword, not Name,
+        so the parser must accept Keyword tokens as column references too."""
+        sql = f"SELECT date_trunc('hour', {col}) AS h FROM t GROUP BY 1"
+        p = parse_view_query(sql)
+        assert p.filter_column == col
+        assert p.granularity == "hour"
+        assert p.merge_keys == ("h",)
+
+    @pytest.mark.parametrize("col", ["minute", "hour", "day"])
+    def test_group_by_expression_with_reserved_word_column(self, col):
+        """GROUP BY date_trunc('X', <keyword-col>) matches the projection."""
+        sql = (
+            f"SELECT symbol, date_trunc('hour', {col}) AS h "
+            f"FROM t GROUP BY symbol, date_trunc('hour', {col})"
+        )
+        p = parse_view_query(sql)
+        assert p.filter_column == col
+        assert p.merge_keys == ("symbol", "h")
+
+    def test_chained_mv_pattern(self):
+        """The canonical chained-MV shape: one MV reading another, with its
+        time column named after the upstream granularity."""
+        sql = """
+            SELECT symbol, date_trunc('hour', minute) AS hour,
+                   min_by(open, minute) AS open, max(high) AS high,
+                   sum(volume) AS volume
+            FROM iceberg.analytics.ohlcv_1m
+            GROUP BY 1, 2
+        """
+        p = parse_view_query(sql)
+        assert p.source_table == "iceberg.analytics.ohlcv_1m"
+        assert p.filter_column == "minute"
+        assert p.granularity == "hour"
+        assert p.merge_keys == ("symbol", "hour")
+
     def test_bare_column_alias_is_its_own_name(self):
         sql = "SELECT symbol, date_trunc('day', ts) AS d FROM t GROUP BY symbol, d"
         p = parse_view_query(sql)
