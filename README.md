@@ -279,7 +279,7 @@ cd tests && docker compose up -d trino
 # Trino UI: http://localhost:18080
 # Seed sample data + generate config/views:
 cd ..
-uv run --with trino python scripts/seed_data.py
+uv run --with trino python tests/seed_data.py
 
 # The compose Trino accepts any user without a password, so TRINO_PASSWORD
 # stays unset:
