@@ -146,7 +146,7 @@ def get_trino_connection(s: AppState) -> aiotrino.dbapi.Connection:
         raise ValueError(f"TRINO_URL does not contain a host: {cfg.trino.url!r}")
     log.debug("connecting to Trino at %s as %s", cfg.trino.url, cfg.trino.user)
     # Pin every session to UTC so Trino's `date_trunc` on TIMESTAMP WITH
-    # TIME ZONE columns agrees with the Python-side snap_range math. See
+    # TIME ZONE columns agrees with the Python-side expand_to_bucket_bounds math. See
     # DESIGN.md "Timezone assumption" for the full rationale.
     kwargs = dict(
         host=host, port=port,

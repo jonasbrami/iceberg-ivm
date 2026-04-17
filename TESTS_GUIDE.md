@@ -94,7 +94,7 @@ Covers `query_parser.py`. This is where the orchestrator now decides whether a v
 
 Covers `detector.py`. This is where the orchestrator's correctness is mostly proven.
 
-#### `TestSnapRange` — handcrafted boundary cases
+#### `TestExpandToBucketBounds` — handcrafted boundary cases
 
 12 tests, one per scenario, asserting the exact `(start, end)` pair returned for known inputs:
 
@@ -113,15 +113,15 @@ Covers `detector.py`. This is where the orchestrator's correctness is mostly pro
 | `test_year` | snaps to Jan 1 boundaries |
 | `test_year_spanning` | Dec→next-Jan spans two years |
 
-#### `TestSnapRangeInversesDateTrunc` — property-based
+#### `TestExpandToBucketBoundsInversesDateTrunc` — property-based
 
-Three properties, each parameterised over **every granularity × every sample timestamp pair**. This is the strongest correctness guarantee in the codebase: it asserts that `snap_range` is the **mathematical inverse** of `date_trunc`.
+Three properties, each parameterised over **every granularity × every sample timestamp pair**. This is the strongest correctness guarantee in the codebase: it asserts that `expand_to_bucket_bounds` is the **mathematical inverse** of `date_trunc`.
 
 - `test_boundaries_are_bucket_aligned` — `date_trunc(start) == start` and `date_trunc(end) == end`. (start/end land exactly on bucket boundaries)
 - `test_touched_buckets_are_fully_covered` — every bucket containing any source row is fully inside `[start, end)`. (no partial bucket = no wrong aggregate)
 - `test_range_is_tight` — `start == date_trunc(min_ts)`. (we don't expand further than needed)
 
-If you ever change `snap_range`, these are the tests to keep green.
+If you ever change `expand_to_bucket_bounds`, these are the tests to keep green.
 
 #### `TestParseTs` — timestamp string parsing
 
@@ -234,7 +234,7 @@ Covers `server.py`.
 - `test_reload_config_no_change` — unchanged mtime → reload skipped
 
 **Trino session pinning**
-- `test_get_trino_connection_pins_timezone_to_utc` — **the session-tz bug**. Asserts that every `aiotrino.dbapi.connect(...)` call passes `timezone="UTC"`. Without this, `date_trunc` on `TIMESTAMP WITH TIME ZONE` columns uses the session's tz, while the Python `snap_range` math runs in UTC — they disagree and partial buckets get recomputed with wrong aggregates.
+- `test_get_trino_connection_pins_timezone_to_utc` — **the session-tz bug**. Asserts that every `aiotrino.dbapi.connect(...)` call passes `timezone="UTC"`. Without this, `date_trunc` on `TIMESTAMP WITH TIME ZONE` columns uses the session's tz, while the Python `expand_to_bucket_bounds` math runs in UTC — they disagree and partial buckets get recomputed with wrong aggregates.
 
 **State advance on NO_CHANGE**
 - `test_refresh_view_advances_state_on_empty_append_no_change` — when `detect_changes` returns `NO_CHANGE` but `current_snapshot` has moved (compaction or empty-append), `write_last_snapshot` is still called. Otherwise the view re-detects the same snapshots forever.
@@ -284,7 +284,7 @@ Source is `iceberg.test_schema.trades` partitioned by `day(ts)`. Target is a 1-m
 
 ### `test_cross_partition_groupby.py` — the correctness flagship
 
-These tests are the **canonical proof** that `snap_range` works in the real world. They use coarse aggregations (week/month) on a daily-partitioned source — exactly the case where a naive filter would corrupt aggregates.
+These tests are the **canonical proof** that `expand_to_bucket_bounds` works in the real world. They use coarse aggregations (week/month) on a daily-partitioned source — exactly the case where a naive filter would corrupt aggregates.
 
 #### `TestWeeklyBarsCrossPartition`
 - `test_incremental_refresh_preserves_all_days` — the headline test:
@@ -293,7 +293,7 @@ These tests are the **canonical proof** that `snap_range` works in the real worl
   3. Run incremental refresh.
   4. Assert weekly bar volume = **350** (not 50 — i.e. Mon+Tue weren't dropped).
   
-  **Without `snap_range`**, this test fails because the MERGE would only see Wed's trade and rebuild the bar with volume=50.
+  **Without `expand_to_bucket_bounds`**, this test fails because the MERGE would only see Wed's trade and rebuild the bar with volume=50.
 
 - `test_new_data_in_next_week` — Insert week-1 data, full refresh. Insert week-2 data, incremental refresh. Assert filter range covers only week 2 (`[Apr 13, Apr 20)`) and week 1's bar is untouched.
 
@@ -309,6 +309,6 @@ These tests are the **canonical proof** that `snap_range` works in the real worl
 
 Three classes worth opening before changing anything:
 
-1. **`TestSnapRangeInversesDateTrunc`** (`test_detector.py:218`) — the property tests that pin the math. If you touch `snap_range`, run these first.
+1. **`TestExpandToBucketBoundsInversesDateTrunc`** (`test_detector.py:218`) — the property tests that pin the math. If you touch `expand_to_bucket_bounds`, run these first.
 2. **`TestDetectChanges`** (`test_detector.py:412`) — the truth table for the orchestrator's decision function. Eight cases that together describe every legitimate state transition.
 3. **`TestWeeklyBarsCrossPartition`** (`test_cross_partition_groupby.py:74`) — what correctness looks like end-to-end. If a refactor breaks this, you've broken the product.

@@ -11,7 +11,7 @@ from trino_mv_orchestrator.detector import (
     get_current_snapshot,
     get_new_files_column_range,
     get_snapshots_since,
-    snap_range,
+    expand_to_bucket_bounds,
 )
 
 
@@ -37,17 +37,17 @@ class MockCursor:
         return self._rows
 
 
-# ── snap_range ──
+# ── expand_to_bucket_bounds ──
 
-class TestSnapRange:
+class TestExpandToBucketBounds:
     def test_minute(self):
         ts = datetime(2026, 4, 8, 10, 30, 45, 123456, tzinfo=timezone.utc)
-        s, e = snap_range(ts, ts, "minute")
+        s, e = expand_to_bucket_bounds(ts, ts, "minute")
         assert s == datetime(2026, 4, 8, 10, 30, 0, 0, tzinfo=timezone.utc)
         assert e == datetime(2026, 4, 8, 10, 31, 0, 0, tzinfo=timezone.utc)
 
     def test_hour(self):
-        s, e = snap_range(
+        s, e = expand_to_bucket_bounds(
             datetime(2026, 4, 8, 10, 30, tzinfo=timezone.utc),
             datetime(2026, 4, 8, 11, 45, tzinfo=timezone.utc),
             "hour",
@@ -56,7 +56,7 @@ class TestSnapRange:
         assert e == datetime(2026, 4, 8, 12, 0, tzinfo=timezone.utc)
 
     def test_day(self):
-        s, e = snap_range(
+        s, e = expand_to_bucket_bounds(
             datetime(2026, 4, 8, 10, 0, tzinfo=timezone.utc),
             datetime(2026, 4, 9, 15, 0, tzinfo=timezone.utc),
             "day",
@@ -66,7 +66,7 @@ class TestSnapRange:
 
     def test_week(self):
         # 2026-04-08 is a Wednesday
-        s, e = snap_range(
+        s, e = expand_to_bucket_bounds(
             datetime(2026, 4, 8, 10, 0, tzinfo=timezone.utc),
             datetime(2026, 4, 8, 15, 0, tzinfo=timezone.utc),
             "week",
@@ -77,7 +77,7 @@ class TestSnapRange:
         assert e == datetime(2026, 4, 13, tzinfo=timezone.utc)
 
     def test_week_spanning_two_weeks(self):
-        s, e = snap_range(
+        s, e = expand_to_bucket_bounds(
             datetime(2026, 4, 8, tzinfo=timezone.utc),   # Wed week 1
             datetime(2026, 4, 15, tzinfo=timezone.utc),   # Wed week 2
             "week",
@@ -86,7 +86,7 @@ class TestSnapRange:
         assert e == datetime(2026, 4, 20, tzinfo=timezone.utc)  # Mon week 3
 
     def test_month(self):
-        s, e = snap_range(
+        s, e = expand_to_bucket_bounds(
             datetime(2026, 4, 15, tzinfo=timezone.utc),
             datetime(2026, 4, 20, tzinfo=timezone.utc),
             "month",
@@ -95,7 +95,7 @@ class TestSnapRange:
         assert e == datetime(2026, 5, 1, tzinfo=timezone.utc)
 
     def test_month_spanning_year_boundary(self):
-        s, e = snap_range(
+        s, e = expand_to_bucket_bounds(
             datetime(2026, 12, 15, tzinfo=timezone.utc),
             datetime(2026, 12, 25, tzinfo=timezone.utc),
             "month",
@@ -105,7 +105,7 @@ class TestSnapRange:
 
     def test_quarter(self):
         # Apr 15 is in Q2 (Apr-Jun)
-        s, e = snap_range(
+        s, e = expand_to_bucket_bounds(
             datetime(2026, 4, 15, tzinfo=timezone.utc),
             datetime(2026, 5, 20, tzinfo=timezone.utc),
             "quarter",
@@ -115,7 +115,7 @@ class TestSnapRange:
 
     def test_quarter_spanning_two(self):
         # Mar (Q1) to May (Q2)
-        s, e = snap_range(
+        s, e = expand_to_bucket_bounds(
             datetime(2026, 3, 15, tzinfo=timezone.utc),
             datetime(2026, 5, 10, tzinfo=timezone.utc),
             "quarter",
@@ -125,7 +125,7 @@ class TestSnapRange:
 
     def test_quarter_year_boundary(self):
         # Q4 (Oct-Dec) spanning into year boundary
-        s, e = snap_range(
+        s, e = expand_to_bucket_bounds(
             datetime(2026, 11, 1, tzinfo=timezone.utc),
             datetime(2026, 12, 15, tzinfo=timezone.utc),
             "quarter",
@@ -134,7 +134,7 @@ class TestSnapRange:
         assert e == datetime(2027, 1, 1, tzinfo=timezone.utc)    # Q1 next year
 
     def test_year(self):
-        s, e = snap_range(
+        s, e = expand_to_bucket_bounds(
             datetime(2026, 6, 15, tzinfo=timezone.utc),
             datetime(2026, 9, 20, tzinfo=timezone.utc),
             "year",
@@ -144,7 +144,7 @@ class TestSnapRange:
 
     def test_year_spanning(self):
         # Dec 2026 to Jan 2027
-        s, e = snap_range(
+        s, e = expand_to_bucket_bounds(
             datetime(2026, 12, 15, tzinfo=timezone.utc),
             datetime(2027, 1, 10, tzinfo=timezone.utc),
             "year",
@@ -153,7 +153,7 @@ class TestSnapRange:
         assert e == datetime(2028, 1, 1, tzinfo=timezone.utc)
 
 
-class TestSnapRangeBoundaryExact:
+class TestExpandToBucketBoundsBoundaryExact:
     """A row whose timestamp lands exactly on a bucket boundary belongs to
     the bucket *starting* at that boundary, never the previous one. The
     snapped range must therefore include that bucket — i.e. end must be
@@ -165,7 +165,7 @@ class TestSnapRangeBoundaryExact:
 
     def test_min_and_max_both_at_minute_boundary(self):
         ts = datetime(2026, 4, 8, 10, 0, 0, 0, tzinfo=timezone.utc)
-        s, e = snap_range(ts, ts, "minute")
+        s, e = expand_to_bucket_bounds(ts, ts, "minute")
         # The single point belongs to the minute starting at ts
         assert s == ts
         assert e == ts + timedelta(minutes=1)
@@ -173,7 +173,7 @@ class TestSnapRangeBoundaryExact:
     def test_max_at_hour_boundary_advances_end(self):
         # min mid-hour, max exactly on the next hour boundary.
         # The max row sits in the [11:00, 12:00) bucket → end must be 12:00.
-        s, e = snap_range(
+        s, e = expand_to_bucket_bounds(
             datetime(2026, 4, 8, 10, 30, tzinfo=timezone.utc),
             datetime(2026, 4, 8, 11, 0, tzinfo=timezone.utc),
             "hour",
@@ -183,13 +183,13 @@ class TestSnapRangeBoundaryExact:
 
     def test_both_at_day_boundary(self):
         d = datetime(2026, 4, 8, 0, 0, 0, 0, tzinfo=timezone.utc)
-        s, e = snap_range(d, d, "day")
+        s, e = expand_to_bucket_bounds(d, d, "day")
         assert s == d
         assert e == d + timedelta(days=1)
 
     def test_max_exactly_at_next_day_midnight(self):
         # min on Apr 8, max exactly Apr 9 00:00 → max row belongs to Apr 9
-        s, e = snap_range(
+        s, e = expand_to_bucket_bounds(
             datetime(2026, 4, 8, 10, 0, tzinfo=timezone.utc),
             datetime(2026, 4, 9, 0, 0, 0, 0, tzinfo=timezone.utc),
             "day",
@@ -200,13 +200,13 @@ class TestSnapRangeBoundaryExact:
     def test_both_at_week_start(self):
         # 2026-04-06 is a Monday — exact week boundary
         mon = datetime(2026, 4, 6, 0, 0, 0, 0, tzinfo=timezone.utc)
-        s, e = snap_range(mon, mon, "week")
+        s, e = expand_to_bucket_bounds(mon, mon, "week")
         assert s == mon
         assert e == mon + timedelta(days=7)
 
     def test_max_at_next_week_start(self):
         # min mid-week, max on next Monday 00:00 → max belongs to next week
-        s, e = snap_range(
+        s, e = expand_to_bucket_bounds(
             datetime(2026, 4, 8, 10, 0, tzinfo=timezone.utc),     # Wed week 1
             datetime(2026, 4, 13, 0, 0, tzinfo=timezone.utc),     # Mon week 2
             "week",
@@ -216,13 +216,13 @@ class TestSnapRangeBoundaryExact:
 
     def test_both_at_month_start(self):
         m = datetime(2026, 4, 1, 0, 0, 0, 0, tzinfo=timezone.utc)
-        s, e = snap_range(m, m, "month")
+        s, e = expand_to_bucket_bounds(m, m, "month")
         assert s == m
         assert e == datetime(2026, 5, 1, tzinfo=timezone.utc)
 
     def test_max_at_next_month_start_year_boundary(self):
         # max exactly on Jan 1 next year → max belongs to January
-        s, e = snap_range(
+        s, e = expand_to_bucket_bounds(
             datetime(2026, 12, 15, tzinfo=timezone.utc),
             datetime(2027, 1, 1, 0, 0, 0, 0, tzinfo=timezone.utc),
             "month",
@@ -232,18 +232,18 @@ class TestSnapRangeBoundaryExact:
 
     def test_both_at_quarter_start(self):
         q = datetime(2026, 4, 1, 0, 0, 0, 0, tzinfo=timezone.utc)  # Q2 start
-        s, e = snap_range(q, q, "quarter")
+        s, e = expand_to_bucket_bounds(q, q, "quarter")
         assert s == q
         assert e == datetime(2026, 7, 1, tzinfo=timezone.utc)      # Q3 start
 
     def test_both_at_year_start(self):
         y = datetime(2026, 1, 1, 0, 0, 0, 0, tzinfo=timezone.utc)
-        s, e = snap_range(y, y, "year")
+        s, e = expand_to_bucket_bounds(y, y, "year")
         assert s == y
         assert e == datetime(2027, 1, 1, tzinfo=timezone.utc)
 
 
-# ── snap_range is the inverse of date_trunc ──
+# ── expand_to_bucket_bounds is the inverse of date_trunc ──
 
 def _py_date_trunc(granularity: str, ts: datetime) -> datetime:
     """Python equivalent of Trino's date_trunc — the forward function."""
@@ -305,8 +305,8 @@ _GRANULARITIES = ["minute", "hour", "day", "week", "month", "quarter", "year"]
 import pytest
 
 
-class TestSnapRangeInversesDateTrunc:
-    """Verify the invariant: snap_range is the exact inverse of date_trunc.
+class TestExpandToBucketBoundsInversesDateTrunc:
+    """Verify the invariant: expand_to_bucket_bounds is the exact inverse of date_trunc.
 
     For every granularity and every sample timestamp pair:
     1. start and end are bucket boundaries (date_trunc is idempotent on them)
@@ -318,7 +318,7 @@ class TestSnapRangeInversesDateTrunc:
     @pytest.mark.parametrize("granularity", _GRANULARITIES)
     @pytest.mark.parametrize("min_ts, max_ts", _SAMPLE_PAIRS)
     def test_boundaries_are_bucket_aligned(self, granularity, min_ts, max_ts):
-        start, end = snap_range(min_ts, max_ts, granularity)
+        start, end = expand_to_bucket_bounds(min_ts, max_ts, granularity)
 
         # start is a bucket boundary: date_trunc(start) == start
         assert _py_date_trunc(granularity, start) == start, (
@@ -332,7 +332,7 @@ class TestSnapRangeInversesDateTrunc:
     @pytest.mark.parametrize("granularity", _GRANULARITIES)
     @pytest.mark.parametrize("min_ts, max_ts", _SAMPLE_PAIRS)
     def test_touched_buckets_are_fully_covered(self, granularity, min_ts, max_ts):
-        start, end = snap_range(min_ts, max_ts, granularity)
+        start, end = expand_to_bucket_bounds(min_ts, max_ts, granularity)
 
         # The bucket containing min_ts is within [start, end)
         bucket_min = _py_date_trunc(granularity, min_ts)
@@ -356,7 +356,7 @@ class TestSnapRangeInversesDateTrunc:
     @pytest.mark.parametrize("min_ts, max_ts", _SAMPLE_PAIRS)
     def test_range_is_tight(self, granularity, min_ts, max_ts):
         """start is the earliest bucket boundary that covers min_ts."""
-        start, end = snap_range(min_ts, max_ts, granularity)
+        start, end = expand_to_bucket_bounds(min_ts, max_ts, granularity)
 
         # start == date_trunc(min_ts): the range starts exactly at the
         # bucket containing min_ts, not one bucket earlier
@@ -389,7 +389,7 @@ class TestParseTs:
     def test_truncates_sub_microsecond_precision(self):
         """9-digit fractional seconds are truncated to 6 (microseconds).
 
-        snap_range floors to minute or coarser, so dropping the last
+        expand_to_bucket_bounds floors to minute or coarser, so dropping the last
         three digits cannot shift the bucket a row belongs to —
         truncation is correctness-safe.
         """

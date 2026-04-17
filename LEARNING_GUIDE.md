@@ -119,7 +119,7 @@ sequenceDiagram
     else new snapshots
         D->>T: SELECT $snapshots since last_snap
         D->>T: SELECT $all_entries readable_metrics
-        D->>D: snap_range(min, max, granularity)
+        D->>D: expand_to_bucket_bounds(min, max, granularity)
         D-->>R: INCREMENTAL + filter_range
     end
 
@@ -192,7 +192,7 @@ Three loud error types (`ExpiredSnapshotError`, `MissingFilterColumnError`, `Une
 
 ---
 
-## 8. `snap_range()` — The Heart of Correctness
+## 8. `expand_to_bucket_bounds()` — The Heart of Correctness
 
 `detector.py:221-273`. This is the single most important function in the codebase.
 
@@ -214,7 +214,7 @@ The result: partial buckets → wrong aggregates → silent data corruption.
 
 ### The fix
 
-`snap_range` inverts `date_trunc` by snapping outwards:
+`expand_to_bucket_bounds` inverts `date_trunc` by snapping outwards:
 
 ```mermaid
 flowchart LR
@@ -240,11 +240,11 @@ Day 2 (Tue Apr 7):  200 volume → incremental, weekly bar = 300
 Day 3 (Wed Apr 8):   50 volume → NEW snapshot
 
 File stats (Wed):    ts ∈ [10:00, 10:30]
-snap_range('week'):  [Mon Apr 6, Mon Apr 13)        ← full week
+expand_to_bucket_bounds('week'):  [Mon Apr 6, Mon Apr 13)        ← full week
 MERGE filter:        WHERE ts >= '2026-04-06' AND ts < '2026-04-13'
 MERGE reads:         Mon + Tue + Wed = 350 ✓
 
-(Without snap_range, would have read only Wednesday → 50 ✗)
+(Without expand_to_bucket_bounds, would have read only Wednesday → 50 ✗)
 ```
 
 ---
@@ -427,7 +427,7 @@ flowchart TB
 - Unit tests use a mock cursor with pre-loaded `fetchone/fetchall` results.
 - Integration tests share one docker compose stack but serialize via `xdist_group("integration")` to avoid table-name collisions.
 - For bug fixes: **write a clean failing test that reproduces the bug first** (per project memory).
-- The canonical correctness test is `test_cross_partition_groupby.py:test_incremental_refresh_preserves_all_days` — it would fail without `snap_range`.
+- The canonical correctness test is `test_cross_partition_groupby.py:test_incremental_refresh_preserves_all_days` — it would fail without `expand_to_bucket_bounds`.
 
 ---
 
@@ -442,7 +442,7 @@ flowchart TB
 | Change detection | `detector.py:276-351` |
 | Snapshot enumeration | `detector.py:103-138` |
 | File stats extraction | `detector.py:146-196` |
-| **`snap_range`** | `detector.py:221-273` |
+| **`expand_to_bucket_bounds`** | `detector.py:221-273` |
 | Timestamp parsing | `detector.py:199-218` |
 | Error types | `detector.py:24-72` |
 | MERGE SQL | `executor.py:61-82` |
@@ -468,7 +468,7 @@ flowchart TB
 6. `tests/integration/test_cross_partition_groupby.py` — see the correctness invariant in action.
 7. Re-read §12 above with the code open.
 
-When you can answer *"what would break if `snap_range` returned the raw min/max?"* without looking, you understand the system.
+When you can answer *"what would break if `expand_to_bucket_bounds` returned the raw min/max?"* without looking, you understand the system.
 
 ---
 
@@ -479,7 +479,7 @@ Three layers of correctness, each a separate failure mode:
 ```mermaid
 flowchart TB
     L1["Layer 1: Timestamp parsing<br/>(_parse_ts)<br/>Failure: lexicographic comparison"]
-    L2["Layer 2: Boundary snapping<br/>(snap_range)<br/>Failure: partial buckets"]
+    L2["Layer 2: Boundary snapping<br/>(expand_to_bucket_bounds)<br/>Failure: partial buckets"]
     L3["Layer 3: Execution<br/>(inject_range_filter, MERGE)<br/>Failure: timezone mismatch"]
     L1 --> L2 --> L3 --> Result["Correct incremental aggregates"]
 ```

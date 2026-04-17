@@ -145,7 +145,7 @@ assigns to a row differs from the bucket Python computed.
 Concrete walk-through with session tz = `America/New_York` (UTC−5),
 granularity `day`, a new row at `2026-01-15 02:00:00 UTC`:
 
-- Python's `snap_range` floors to `2026-01-15 00:00 UTC` and ceils to
+- Python's `expand_to_bucket_bounds` floors to `2026-01-15 00:00 UTC` and ceils to
   `2026-01-16 00:00 UTC`. The MERGE filter is
   `[2026-01-15 00:00 UTC, 2026-01-16 00:00 UTC)`.
 - The MERGE reads all rows in that 24-hour UTC window, then the
@@ -164,7 +164,7 @@ tz.
 
 **Fix.** Pin `timezone='UTC'` on every `aiotrino.dbapi.connect(...)` in
 `server.get_trino_connection`. `date_trunc` on tz-aware columns then
-operates in UTC, aligning with `snap_range` by construction.
+operates in UTC, aligning with `expand_to_bucket_bounds` by construction.
 
 ### Append-only source assumption
 
@@ -205,10 +205,10 @@ correctly handles both updates (recomputed rows) and inserts (new rows).
 
 Partition-based detection breaks when GROUP BY spans multiple partitions.
 File-level column stats from `readable_metrics` give the exact value range
-of new data regardless of partition scheme. Combined with `snap_range()`,
+of new data regardless of partition scheme. Combined with `expand_to_bucket_bounds()`,
 this produces the minimum correct time range for any GROUP BY granularity.
 
-### Why snap_range in Python, not a Trino subquery?
+### Why expand_to_bucket_bounds in Python, not a Trino subquery?
 
 We tested whether Trino pushes down `date_trunc('week', ts) IN (...)`
 predicates to Iceberg partition pruning. It does NOT -- `EXPLAIN (TYPE IO)`
@@ -273,9 +273,9 @@ and the custom `jonasbrami/trino-arrow` build -- same result.
 
 ## Implementation details
 
-### snap_range()
+### expand_to_bucket_bounds()
 
-`detector.py:snap_range(min_ts, max_ts, granularity)` expands a timestamp
+`detector.py:expand_to_bucket_bounds(min_ts, max_ts, granularity)` expands a timestamp
 range outward to complete GROUP BY bucket boundaries:
 
 - `minute`: floor to second=0, ceil to next minute
