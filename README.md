@@ -189,21 +189,32 @@ because it can't remember where it left off.
   (2024-12-11): *"Add support for reading and writing arbitrary table properties
   with the `extra_properties` table property."*  Trino ≥ 465 is required.
 
-### 2. Create two YAML files
+### 2. Set Trino credentials (environment variables)
 
-**`config.yaml`** — Trino connection + server settings (see
-[`config.yaml.example`](config.yaml.example) for a starting template):
+Trino URL, user, and password are read **only** from the environment. They
+never appear in `config.yaml`, so secrets stay out of the repo and
+per-environment deployments only need to set a few env vars.
+
+| Variable | Required | Notes |
+|---|---|---|
+| `TRINO_URL` | yes | Coordinator URL, e.g. `http://trino:8080` or `https://trino.prod:8443`. Scheme determines `http` vs `https`. |
+| `TRINO_USER` | yes | Trino username. |
+| `TRINO_PASSWORD` | no | BasicAuth password. Omit (or leave empty) for anonymous access — e.g. the local dev compose stack. |
+
+The orchestrator refuses to start if `TRINO_URL` or `TRINO_USER` is missing.
+
+### 3. Create two YAML files
+
+**`config.yaml`** — server settings + per-deployment Trino *catalog* and
+*schema* (not secrets; see [`config.yaml.example`](config.yaml.example)):
 
 ```yaml
 server:
   port: 8000
   config_reload_interval_seconds: 30
 trino:
-  host: localhost
-  port: 8080
   catalog: iceberg
   schema: analytics
-  user: orchestrator
 ```
 
 **`views.yaml`** — the views to maintain. Write each `query` *exactly* as you
@@ -232,12 +243,15 @@ target table is created on first run.
 
 Views can also be managed interactively from the web UI.
 
-### 3. Run it
+### 4. Run it
 
-Install dependencies and start the service:
+Install dependencies, export the credential env vars, and start the service:
 
 ```bash
 uv sync
+export TRINO_URL=http://localhost:8080
+export TRINO_USER=orchestrator
+# export TRINO_PASSWORD=…            # only if your Trino requires it
 uv run trino-mv-orchestrator -c config.yaml --views views.yaml
 # Web UI:  http://localhost:8000
 # Metrics: http://localhost:8000/metrics
@@ -247,19 +261,13 @@ uv run trino-mv-orchestrator -c config.yaml --views views.yaml
 
 | Flag | Default | Description |
 |---|---|---|
-| `-c`, `--config` | `config.yaml` | Path to the Trino + server config |
+| `-c`, `--config` | `config.yaml` | Path to the server + trino catalog/schema config |
 | `--views` | `views.yaml` | Path to the views file (empty if absent) |
 | `-v`, `--verbose` | off | Enable DEBUG logging |
 
 The server port comes from `server.port` in `config.yaml`. Both files are
 hot-reloaded on mtime change at `server.config_reload_interval_seconds` (default
 30s) — no restart needed when adding/editing views.
-
-**Trino connection settings** (`host`, `port`, `catalog`, `schema`, `user`) come
-from `config.yaml`'s `trino:` section only — there are no environment-variable
-or CLI overrides today. For per-environment deploys, template the file at
-deploy time (e.g. Helm, envsubst) or mount a different `config.yaml` per
-environment.
 
 ### Running against a local Trino stack
 
@@ -271,7 +279,12 @@ cd tests && docker compose up -d trino
 # Trino UI: http://localhost:18080
 # Seed sample data + generate config/views:
 cd ..
-uv run --with trino python scripts/seed_data.py
+uv run --with trino python tests/seed_data.py
+
+# The compose Trino accepts any user without a password, so TRINO_PASSWORD
+# stays unset:
+export TRINO_URL=http://localhost:18080
+export TRINO_USER=demo
 uv run trino-mv-orchestrator -c config.yaml --views views.yaml
 ```
 

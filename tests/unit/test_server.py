@@ -11,12 +11,18 @@ from trino_mv_orchestrator.server import AppState, ViewStatus, app, get_app_stat
 
 STATIC_CONFIG_YAML = textwrap.dedent("""\
     trino:
-      host: localhost
-      port: 8080
       catalog: iceberg
       schema: analytics
-      user: test
 """)
+
+
+# Credentials come from env vars only — set them for every test so
+# load_config doesn't refuse to initialize.
+@pytest.fixture(autouse=True)
+def trino_env(monkeypatch):
+    monkeypatch.setenv("TRINO_URL", "http://localhost:8080")
+    monkeypatch.setenv("TRINO_USER", "test")
+    monkeypatch.setenv("TRINO_PASSWORD", "hunter2")
 
 VIEWS_YAML = textwrap.dedent("""\
     views:
@@ -29,8 +35,12 @@ VIEWS_YAML = textwrap.dedent("""\
 
 
 @pytest.fixture(autouse=True)
-def setup_state(tmp_path):
-    """Pre-seed AppState on app.state so lifespan skips init and refresh loop exits immediately."""
+def setup_state(tmp_path, trino_env):
+    """Pre-seed AppState on app.state so lifespan skips init and refresh loop exits immediately.
+
+    Depends on `trino_env` so the credential env vars are set before
+    load_config runs.
+    """
     cfg_path = tmp_path / "config.yaml"
     views_path = tmp_path / "views.yaml"
     cfg_path.write_text(STATIC_CONFIG_YAML)
@@ -219,6 +229,67 @@ def test_get_trino_connection_pins_timezone_to_utc(setup_state):
     assert captured.get("timezone") == "UTC", (
         f"Trino connection was opened without timezone=UTC; got {captured}"
     )
+
+
+def test_get_trino_connection_uses_env_credentials(setup_state):
+    """The connection opens with host/port/scheme parsed from TRINO_URL
+    and uses BasicAuthentication from TRINO_USER / TRINO_PASSWORD."""
+    from trino_mv_orchestrator.server import get_trino_connection
+    from aiotrino.auth import BasicAuthentication
+
+    captured = {}
+    def fake_connect(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    with patch("trino_mv_orchestrator.server.aiotrino.dbapi.connect",
+               side_effect=fake_connect):
+        get_trino_connection(setup_state)
+
+    assert captured["host"] == "localhost"
+    assert captured["port"] == 8080
+    assert captured["http_scheme"] == "http"
+    assert captured["user"] == "test"
+    assert isinstance(captured["auth"], BasicAuthentication)
+
+
+def test_get_trino_connection_parses_https_url(setup_state, monkeypatch):
+    """https:// URL produces http_scheme='https' and the right port."""
+    from trino_mv_orchestrator.server import get_trino_connection
+    monkeypatch.setenv("TRINO_URL", "https://trino.prod.internal:8443")
+    setup_state.config = load_config(setup_state.config_path)  # reload with new env
+
+    captured = {}
+    def fake_connect(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    with patch("trino_mv_orchestrator.server.aiotrino.dbapi.connect",
+               side_effect=fake_connect):
+        get_trino_connection(setup_state)
+
+    assert captured["host"] == "trino.prod.internal"
+    assert captured["port"] == 8443
+    assert captured["http_scheme"] == "https"
+
+
+def test_get_trino_connection_omits_auth_when_no_password(setup_state, monkeypatch):
+    """When TRINO_PASSWORD is unset the connection opens without auth."""
+    from trino_mv_orchestrator.server import get_trino_connection
+    monkeypatch.delenv("TRINO_PASSWORD")
+    setup_state.config = load_config(setup_state.config_path)  # reload
+
+    captured = {}
+    def fake_connect(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    with patch("trino_mv_orchestrator.server.aiotrino.dbapi.connect",
+               side_effect=fake_connect):
+        get_trino_connection(setup_state)
+
+    assert "auth" not in captured
+    assert captured["user"] == "test"
 
 
 # ── State advance on NO_CHANGE ──

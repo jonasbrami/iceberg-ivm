@@ -25,12 +25,18 @@ def write_views(tmp_path: Path, content: str) -> Path:
 
 STATIC_CONFIG = """\
 trino:
-  host: localhost
-  port: 8080
   catalog: iceberg
   schema: analytics
-  user: test
 """
+
+
+# All load_config tests use this fixture to populate the credential env
+# vars; load_config refuses to start without them.
+@pytest.fixture(autouse=True)
+def trino_env(monkeypatch):
+    monkeypatch.setenv("TRINO_URL", "http://localhost:8080")
+    monkeypatch.setenv("TRINO_USER", "test")
+    monkeypatch.setenv("TRINO_PASSWORD", "hunter2")
 
 VALID_VIEWS = """\
 views:
@@ -49,7 +55,11 @@ views:
 
 def test_load_valid(tmp_path):
     cfg = load_config(write_config(tmp_path, STATIC_CONFIG))
-    assert cfg.trino.host == "localhost"
+    assert cfg.trino.url == "http://localhost:8080"
+    assert cfg.trino.user == "test"
+    assert cfg.trino.password == "hunter2"
+    assert cfg.trino.catalog == "iceberg"
+    assert cfg.trino.schema == "analytics"
     assert cfg.views == []
 
 
@@ -62,6 +72,50 @@ def test_defaults(tmp_path):
     cfg = load_config(write_config(tmp_path, STATIC_CONFIG))
     assert cfg.views == []
     assert cfg.server.port == 8000
+
+
+@pytest.mark.parametrize("var", ["TRINO_URL", "TRINO_USER"])
+def test_missing_required_env_var_raises(tmp_path, monkeypatch, var):
+    """TRINO_URL and TRINO_USER are required — no defaults."""
+    monkeypatch.delenv(var)
+    with pytest.raises(ValueError, match=var):
+        load_config(write_config(tmp_path, STATIC_CONFIG))
+
+
+def test_missing_password_is_allowed(tmp_path, monkeypatch):
+    """TRINO_PASSWORD is optional — missing => no auth / anonymous
+    connection (for clusters that don't require basic auth, e.g.
+    the local dev compose stack)."""
+    monkeypatch.delenv("TRINO_PASSWORD")
+    cfg = load_config(write_config(tmp_path, STATIC_CONFIG))
+    assert cfg.trino.password is None
+    assert cfg.trino.user == "test"
+
+
+def test_empty_password_treated_as_missing(tmp_path, monkeypatch):
+    """TRINO_PASSWORD='' (empty string) collapses to None so it
+    doesn't produce BasicAuthentication with an empty password."""
+    monkeypatch.setenv("TRINO_PASSWORD", "")
+    cfg = load_config(write_config(tmp_path, STATIC_CONFIG))
+    assert cfg.trino.password is None
+
+
+def test_yaml_host_port_user_are_not_accepted(tmp_path):
+    """Host/port/user in YAML must not silently override the env vars;
+    credentials only come from env.  Any leftover field in the YAML is
+    simply ignored, but the loader does not read it."""
+    yaml = (
+        "trino:\n"
+        "  host: wrong-host\n"
+        "  port: 9999\n"
+        "  user: wrong-user\n"
+        "  catalog: iceberg\n"
+        "  schema: analytics\n"
+    )
+    cfg = load_config(write_config(tmp_path, yaml))
+    # The env var wins; YAML host/port/user are ignored
+    assert cfg.trino.url == "http://localhost:8080"
+    assert cfg.trino.user == "test"
 
 
 # ── load_views ──
