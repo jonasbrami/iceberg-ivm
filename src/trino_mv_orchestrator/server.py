@@ -25,7 +25,11 @@ from trino_mv_orchestrator.config import (
     save_views,
 )
 from trino_mv_orchestrator.detector import RefreshAction, detect_changes
-from trino_mv_orchestrator.executor import execute_full_refresh, execute_incremental_refresh
+from trino_mv_orchestrator.executor import (
+    QueryInfo,
+    execute_full_refresh,
+    execute_incremental_refresh,
+)
 from trino_mv_orchestrator.introspect import (
     build_create_table_sql,
     discover_columns,
@@ -76,6 +80,9 @@ def _parse_table_labels(table: str) -> dict[str, str]:
 
 # ── Application state ──
 
+RECENT_QUERY_LIMIT = 50
+
+
 @dataclass
 class ViewStatus:
     name: str
@@ -86,6 +93,9 @@ class ViewStatus:
     last_error: str | None = None
     total_refreshes: int = 0
     total_errors: int = 0
+    # Ring buffer of the last few refresh queries (MERGE / INSERT / DELETE).
+    # In-memory only; cleared on process restart.
+    recent_queries: list[QueryInfo] = field(default_factory=list)
 
 
 @dataclass
@@ -249,6 +259,9 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
         vs.last_duration = refresh_result.elapsed
         vs.last_error = None
         vs.total_refreshes += 1
+        # Ring-buffer the refresh queries (MERGE / INSERT / DELETE) for the UI.
+        # Newest first, capped to RECENT_QUERY_LIMIT.
+        vs.recent_queries = (refresh_result.queries + vs.recent_queries)[:RECENT_QUERY_LIMIT]
         REFRESH_DURATION.labels(view=view.name).observe(refresh_result.elapsed)
         REFRESH_LAST_SUCCESS.labels(view=view.name).set(vs.last_refresh)
 

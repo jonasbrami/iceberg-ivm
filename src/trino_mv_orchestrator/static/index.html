@@ -351,6 +351,59 @@
                         rounded-lg px-4 py-3.5 overflow-x-auto"><code x-text="view.query"></code></pre>
           </details>
 
+          <!-- Recent refresh queries (collapsible) — links to Trino UI -->
+          <details x-show="view.status?.recent_queries?.length > 0" class="group mt-2">
+            <summary class="flex items-center gap-[5px] w-fit cursor-pointer select-none
+                            text-[11px] font-mono text-[#9090a8] hover:text-[#3a3a52]
+                            transition-colors duration-150">
+              <svg class="w-[11px] h-[11px] transition-transform duration-150 group-open:rotate-90 shrink-0"
+                   fill="none" viewBox="0 0 24 24" stroke-width="2.8" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" />
+              </svg>
+              <span>recent queries</span>
+              <span class="text-[#c0c0d0] font-normal"
+                    x-text="'(' + (view.status?.recent_queries?.length ?? 0) + ')'"></span>
+            </summary>
+
+            <div class="mt-[9px] bg-[#f4f4f9] border border-[rgba(15,15,30,0.06)] rounded-lg
+                        divide-y divide-[rgba(15,15,30,0.05)]">
+              <template x-for="q in view.status.recent_queries" :key="q.query_id">
+                <a :href="q.info_uri" target="_blank" rel="noopener"
+                   class="flex items-center gap-[10px] px-3 py-[8px] hover:bg-white/60 transition-colors duration-100">
+                  <!-- stage chip -->
+                  <span class="shrink-0 text-[9.5px] uppercase tracking-[0.08em] font-mono font-medium
+                               px-[7px] py-[2px] rounded-md"
+                        :class="q.stage === 'merge'
+                                  ? 'bg-indigo-500/[0.10] text-indigo-700 border border-indigo-500/[0.25]'
+                                  : q.stage === 'full_insert'
+                                    ? 'bg-emerald-500/[0.10] text-emerald-800 border border-emerald-500/[0.25]'
+                                    : 'bg-[rgba(15,15,30,0.05)] text-[#666684] border border-[rgba(15,15,30,0.10)]'"
+                        x-text="q.stage"></span>
+
+                  <!-- query id -->
+                  <span class="font-mono text-[11px] text-[#3a3a52] truncate"
+                        x-text="q.query_id"></span>
+
+                  <!-- elapsed + rows -->
+                  <span class="ml-auto shrink-0 flex items-baseline gap-[10px]">
+                    <span class="text-[10.5px] font-mono tabular-nums text-[#666684]"
+                          x-text="(q.elapsed_ms / 1000).toFixed(2) + 's'"></span>
+                    <span x-show="q.processed_rows > 0"
+                          class="text-[10.5px] font-mono tabular-nums text-[#888ca0]"
+                          x-text="formatRows(q.processed_rows) + ' rows'"></span>
+                  </span>
+
+                  <!-- external-link icon -->
+                  <svg class="w-[11px] h-[11px] text-[#c0c0d0] shrink-0" fill="none"
+                       viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round"
+                          d="M13.5 6H5.25A2.25 2.25 0 003 8.25v10.5A2.25 2.25 0 005.25 21h10.5A2.25 2.25 0 0018 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25" />
+                  </svg>
+                </a>
+              </template>
+            </div>
+          </details>
+
         </div>
       </div>
     </template>
@@ -679,6 +732,13 @@ function app() {
       if (diff < 60)   return diff + 's ago';
       if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
       return Math.floor(diff / 3600) + 'h ago';
+    },
+
+    formatRows(n) {
+      if (n == null) return '';
+      if (n < 1000) return String(n);
+      if (n < 1e6)  return (n / 1e3).toFixed(1).replace(/\.0$/, '') + 'K';
+      return (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M';
     },
   };
 }
