@@ -273,6 +273,80 @@ async def test_refresh_view_advances_state_on_empty_append_no_change(setup_state
     )
 
 
+async def test_refresh_view_appends_recent_queries(setup_state, client):
+    """A successful refresh must surface the MERGE / INSERT query IDs on
+    the view's status so the UI can link to the Trino UI.
+    """
+    from trino_mv_orchestrator import server as server_mod
+    from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
+    from trino_mv_orchestrator.executor import RefreshResult, QueryInfo
+    from trino_mv_orchestrator.introspect import ColumnInfo
+
+    view = setup_state.config.views[0]
+
+    class FakeConn:
+        async def cursor(self): return FakeCursor()
+        async def close(self): pass
+
+    class FakeCursor:
+        stats = {}
+        async def execute(self, sql): pass
+        async def fetchone(self): return None
+        async def fetchall(self): return []
+
+    async def fake_write(cursor, target, snap_id): pass
+    async def fake_read(cursor, target): return None
+
+    async def fake_detect(*args, **kwargs):
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=1)
+
+    async def fake_discover_columns(cursor, query):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+    async def fake_discover_partitioning(cursor, src): return None
+
+    async def fake_full(cursor, view, target):
+        return RefreshResult(
+            elapsed=0.5,
+            processed_rows=10,
+            processed_bytes=2048,
+            queries=[
+                QueryInfo(
+                    query_id="20260417_000000_00001_xyz",
+                    info_uri="http://trino/ui/query.html?20260417_000000_00001_xyz",
+                    stage="full_delete", started_at=1.0, elapsed_ms=120.0,
+                ),
+                QueryInfo(
+                    query_id="20260417_000000_00002_xyz",
+                    info_uri="http://trino/ui/query.html?20260417_000000_00002_xyz",
+                    stage="full_insert", started_at=2.0, elapsed_ms=380.0,
+                    processed_rows=10, processed_bytes=2048,
+                ),
+            ],
+        )
+
+    with patch.object(server_mod, "get_trino_connection", lambda s: FakeConn()), \
+         patch.object(server_mod, "discover_columns", fake_discover_columns), \
+         patch.object(server_mod, "discover_source_partitioning", fake_discover_partitioning), \
+         patch.object(server_mod, "read_last_snapshot", fake_read), \
+         patch.object(server_mod, "write_last_snapshot", fake_write), \
+         patch.object(server_mod, "detect_changes", fake_detect), \
+         patch.object(server_mod, "execute_full_refresh", fake_full):
+        await server_mod.refresh_view(setup_state, view)
+
+    # Now the view status should carry the captured queries.
+    vs = setup_state.view_statuses[view.name]
+    assert len(vs.recent_queries) == 2
+    stages = [q.stage for q in vs.recent_queries]
+    assert "full_insert" in stages and "full_delete" in stages
+
+    # And the API exposes them.
+    body = client.get("/api/views").json()[0]
+    status_queries = body["status"]["recent_queries"]
+    assert len(status_queries) == 2
+    assert status_queries[0]["info_uri"].endswith("20260417_000000_00001_xyz") or \
+           status_queries[1]["info_uri"].endswith("20260417_000000_00001_xyz")
+
+
 # ── Metrics presence ──
 
 def test_new_metrics_defined():
@@ -310,6 +384,41 @@ def test_create_view_fails_on_arithmetic(client, setup_state):
     })
     assert r.status_code == 422
     assert "arithmetic" in r.json()["detail"]
+
+
+# ── /api/views/parse — live validation for the UI ──
+
+def test_parse_query_returns_parsed_fields(client):
+    r = client.post("/api/views/parse", json={
+        "query": (
+            "SELECT symbol, date_trunc('week', ts) AS week, sum(q) AS v "
+            "FROM iceberg.md.trades GROUP BY 1, 2"
+        ),
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["source_table"] == "iceberg.md.trades"
+    assert body["filter_column"] == "ts"
+    assert body["granularity"] == "week"
+    assert body["merge_keys"] == ["symbol", "week"]
+
+
+def test_parse_query_rejects_invalid(client):
+    r = client.post("/api/views/parse", json={
+        "query": "SELECT date_trunc('day', ts) - INTERVAL '1' DAY AS x FROM t GROUP BY 1",
+    })
+    assert r.status_code == 422
+    assert "arithmetic" in r.json()["detail"]
+
+
+def test_parse_query_rejects_legacy_placeholder(client):
+    r = client.post("/api/views/parse", json={
+        "query": (
+            "SELECT date_trunc('day', ts) AS d FROM t WHERE {range_filter} GROUP BY 1"
+        ),
+    })
+    assert r.status_code == 422
+    assert "range_filter" in r.json()["detail"]
 
 
 def test_create_view_rejects_legacy_range_filter(client, setup_state):

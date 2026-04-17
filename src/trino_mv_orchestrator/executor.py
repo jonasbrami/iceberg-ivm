@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from trino_mv_orchestrator.config import ViewConfig
@@ -13,11 +13,28 @@ log = logging.getLogger(__name__)
 
 
 @dataclass
+class QueryInfo:
+    """Metadata for a single Trino query run during a refresh.
+
+    Captures what the UI needs to link to the Trino UI (``info_uri`` points
+    at ``/ui/query.html?<query_id>``) plus stats for display.
+    """
+    query_id: str
+    info_uri: str
+    stage: str           # "full_delete" | "full_insert" | "merge"
+    started_at: float    # wall-clock epoch seconds
+    elapsed_ms: float
+    processed_rows: int = 0
+    processed_bytes: int = 0
+
+
+@dataclass
 class RefreshResult:
     """Statistics from a refresh execution."""
     elapsed: float
     processed_rows: int = 0
     processed_bytes: int = 0
+    queries: list[QueryInfo] = field(default_factory=list)
 
 
 def _extract_stats(cursor) -> dict:
@@ -27,6 +44,29 @@ def _extract_stats(cursor) -> dict:
         "processed_rows": stats.get("processedRows", 0) or 0,
         "processed_bytes": stats.get("processedBytes", 0) or 0,
     }
+
+
+async def _execute_tracked(cursor, sql: str, stage: str) -> QueryInfo:
+    """Execute ``sql`` and return a QueryInfo capturing query_id, info_uri,
+    elapsed time, and row/byte stats from the cursor.
+
+    Safe against mock cursors that don't expose query_id / info_uri — those
+    fall back to empty strings so tests keep working.
+    """
+    started_wall = time.time()
+    t0 = time.monotonic()
+    await cursor.execute(sql)
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    stats = _extract_stats(cursor)
+    return QueryInfo(
+        query_id=getattr(cursor, "query_id", "") or "",
+        info_uri=getattr(cursor, "info_uri", "") or "",
+        stage=stage,
+        started_at=started_wall,
+        elapsed_ms=elapsed_ms,
+        processed_rows=stats["processed_rows"],
+        processed_bytes=stats["processed_bytes"],
+    )
 
 
 def build_merge_sql(
@@ -59,18 +99,26 @@ async def execute_full_refresh(cursor, view: ViewConfig, target_table: str) -> R
     """Full refresh: DELETE all + INSERT all. Returns RefreshResult."""
     start = time.monotonic()
     log.info("%s: full refresh — deleting target %s", view.name, target_table)
-    await cursor.execute(f"DELETE FROM {target_table} WHERE true")
+    delete_q = await _execute_tracked(
+        cursor, f"DELETE FROM {target_table} WHERE true", stage="full_delete",
+    )
 
     log.info("%s: full refresh — inserting into %s", view.name, target_table)
-    await cursor.execute(f"INSERT INTO {target_table} {view.query}")
+    insert_q = await _execute_tracked(
+        cursor, f"INSERT INTO {target_table} {view.query}", stage="full_insert",
+    )
 
     elapsed = time.monotonic() - start
-    stats = _extract_stats(cursor)
     log.info(
         "%s: full refresh complete (%.1fs, %d rows, %d bytes)",
-        view.name, elapsed, stats["processed_rows"], stats["processed_bytes"],
+        view.name, elapsed, insert_q.processed_rows, insert_q.processed_bytes,
     )
-    return RefreshResult(elapsed=elapsed, **stats)
+    return RefreshResult(
+        elapsed=elapsed,
+        processed_rows=insert_q.processed_rows,
+        processed_bytes=insert_q.processed_bytes,
+        queries=[delete_q, insert_q],
+    )
 
 
 async def execute_incremental_refresh(
@@ -94,12 +142,16 @@ async def execute_incremental_refresh(
         view.name, filter_column, range_start, range_end,
     )
     log.debug("%s: executing MERGE:\n%s", view.name, merge_sql)
-    await cursor.execute(merge_sql)
+    merge_q = await _execute_tracked(cursor, merge_sql, stage="merge")
 
     elapsed = time.monotonic() - start_time
-    stats = _extract_stats(cursor)
     log.info(
         "%s: incremental refresh complete (%.1fs, %d rows, %d bytes)",
-        view.name, elapsed, stats["processed_rows"], stats["processed_bytes"],
+        view.name, elapsed, merge_q.processed_rows, merge_q.processed_bytes,
     )
-    return RefreshResult(elapsed=elapsed, **stats)
+    return RefreshResult(
+        elapsed=elapsed,
+        processed_rows=merge_q.processed_rows,
+        processed_bytes=merge_q.processed_bytes,
+        queries=[merge_q],
+    )

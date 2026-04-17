@@ -25,7 +25,11 @@ from trino_mv_orchestrator.config import (
     save_views,
 )
 from trino_mv_orchestrator.detector import RefreshAction, detect_changes
-from trino_mv_orchestrator.executor import execute_full_refresh, execute_incremental_refresh
+from trino_mv_orchestrator.executor import (
+    QueryInfo,
+    execute_full_refresh,
+    execute_incremental_refresh,
+)
 from trino_mv_orchestrator.introspect import (
     build_create_table_sql,
     discover_columns,
@@ -76,6 +80,9 @@ def _parse_table_labels(table: str) -> dict[str, str]:
 
 # ── Application state ──
 
+RECENT_QUERY_LIMIT = 50
+
+
 @dataclass
 class ViewStatus:
     name: str
@@ -86,6 +93,9 @@ class ViewStatus:
     last_error: str | None = None
     total_refreshes: int = 0
     total_errors: int = 0
+    # Ring buffer of the last few refresh queries (MERGE / INSERT / DELETE).
+    # In-memory only; cleared on process restart.
+    recent_queries: list[QueryInfo] = field(default_factory=list)
 
 
 @dataclass
@@ -249,6 +259,9 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
         vs.last_duration = refresh_result.elapsed
         vs.last_error = None
         vs.total_refreshes += 1
+        # Ring-buffer the refresh queries (MERGE / INSERT / DELETE) for the UI.
+        # Newest first, capped to RECENT_QUERY_LIMIT.
+        vs.recent_queries = (refresh_result.queries + vs.recent_queries)[:RECENT_QUERY_LIMIT]
         REFRESH_DURATION.labels(view=view.name).observe(refresh_result.elapsed)
         REFRESH_LAST_SUCCESS.labels(view=view.name).set(vs.last_refresh)
 
@@ -432,6 +445,36 @@ def list_views(s: AppState = Depends(get_app_state)) -> list[ViewResponse]:
     if not s.config:
         return []
     return [_view_to_response(v, s.view_statuses.get(v.name)) for v in s.config.views]
+
+
+class ParseRequest(BaseModel):
+    query: str
+
+
+class ParseResponse(BaseModel):
+    source_table: str
+    filter_column: str
+    granularity: str
+    merge_keys: tuple[str, ...]
+
+
+@app.post("/api/views/parse")
+def parse_query(body: ParseRequest) -> ParseResponse:
+    """Parse a view query and return the derived attributes.
+
+    Used by the UI to live-validate the query as the operator types.
+    Returns 422 with a human-readable detail on any parse violation.
+    """
+    try:
+        p = parse_view_query(body.query)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    return ParseResponse(
+        source_table=p.source_table,
+        filter_column=p.filter_column,
+        granularity=p.granularity,
+        merge_keys=p.merge_keys,
+    )
 
 
 @app.post("/api/views", status_code=201)
