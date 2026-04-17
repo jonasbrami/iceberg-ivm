@@ -370,6 +370,109 @@ MERGE INTO iceberg.md.trades_weekly AS t USING (
 ) AS s ON t.symbol = s.symbol AND t.week = s.week …
 ```
 
+## Example queries
+
+### ✅ Supported
+
+**Minute-level OHLCV bars:**
+```sql
+SELECT
+  symbol,
+  date_trunc('minute', ts) AS minute,
+  min_by(price, ts) AS open, max(price) AS high,
+  min(price) AS low,         max_by(price, ts) AS close,
+  sum(quantity) AS volume,   count(*) AS trade_count
+FROM iceberg.market_data.trades
+GROUP BY symbol, date_trunc('minute', ts)
+```
+
+**Weekly bars from a daily-partitioned source** — the detector expands the
+file-stats range to full week boundaries:
+```sql
+SELECT symbol, date_trunc('week', ts) AS week, sum(quantity) AS volume
+FROM iceberg.market_data.trades
+GROUP BY 1, 2
+```
+
+**Pre-filtered view** (your `WHERE` is preserved; the orchestrator `AND`s the
+time-range predicate onto it):
+```sql
+SELECT symbol, date_trunc('hour', ts) AS hour, count(*) AS c
+FROM iceberg.md.trades
+WHERE status = 'settled'
+GROUP BY 1, 2
+```
+
+**Positional GROUP BY** (resolves to projection aliases — merge keys become
+`['symbol', 'day']`):
+```sql
+SELECT symbol, date_trunc('day', ts) AS day, sum(qty) AS v
+FROM iceberg.md.trades
+GROUP BY 1, 2
+```
+
+### ❌ Not supported — rejected at config load
+
+**Joins** (change detection only watches one source — other tables' changes
+would be silently missed):
+```sql
+SELECT t.symbol, date_trunc('day', t.ts) AS day, count(*)
+FROM trades t JOIN symbols s ON t.symbol = s.ticker
+GROUP BY 1, 2
+```
+
+**CTEs / `WITH` clauses:**
+```sql
+WITH filtered AS (SELECT * FROM trades WHERE price > 0)
+SELECT date_trunc('day', ts) AS day, count(*)
+FROM filtered
+GROUP BY 1
+```
+
+**Subquery in FROM:**
+```sql
+SELECT date_trunc('day', ts) AS day, count(*)
+FROM (SELECT ts FROM trades WHERE price > 0) s
+GROUP BY 1
+```
+
+**Set operations** (`UNION` / `INTERSECT` / `EXCEPT`):
+```sql
+SELECT date_trunc('day', ts) AS day FROM trades_us
+UNION ALL
+SELECT date_trunc('day', ts) AS day FROM trades_eu
+```
+
+**`date_trunc` wrapped in arithmetic** — the canonical 5-minute-bars mistake.
+The bucket width can't be reliably inferred, so the inverse would produce a
+too-narrow filter that corrupts aggregates:
+```sql
+SELECT date_trunc('minute', ts) - (extract(minute FROM ts) % 5) * INTERVAL '1' MINUTE AS bar
+FROM trades
+GROUP BY 1
+```
+
+**Multiple distinct granularities in one view** — a view has a single
+granularity:
+```sql
+SELECT date_trunc('day', ts) AS d, date_trunc('hour', ts) AS h, count(*)
+FROM trades
+GROUP BY 1, 2
+```
+
+**Computed projection without an alias** — the target-table column would get
+an auto-generated name like `_col0`:
+```sql
+SELECT date_trunc('day', ts), count(*)
+FROM trades
+GROUP BY 1
+```
+
+**No `date_trunc` / no `GROUP BY`** — the correctness model requires both:
+```sql
+SELECT symbol, price FROM trades
+```
+
 ## Limitations
 
 ### Query shape
