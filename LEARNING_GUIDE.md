@@ -100,10 +100,7 @@ sequenceDiagram
     R->>I: discover_columns(query)
     I->>T: DESCRIBE OUTPUT (query)
     T-->>I: column types
-    R->>I: discover_source_partitioning()
-    I->>T: SHOW CREATE TABLE source
-    T-->>I: partition spec
-    R->>T: CREATE TABLE IF NOT EXISTS target (auto-partitioned)
+    R->>T: CREATE TABLE IF NOT EXISTS target (partitioning from view.target_partitioning, else unpartitioned)
 
     R->>ST: read_last_snapshot(target)
     ST->>T: SELECT FROM target."$properties"

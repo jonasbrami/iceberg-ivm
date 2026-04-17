@@ -328,11 +328,8 @@ async def test_refresh_view_advances_state_on_empty_append_no_change(setup_state
     async def fake_discover_columns(cursor, query):
         return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
 
-    async def fake_discover_partitioning(cursor, src): return None
-
     with patch.object(server_mod, "get_trino_connection", lambda s: FakeConn()), \
          patch.object(server_mod, "discover_columns", fake_discover_columns), \
-         patch.object(server_mod, "discover_source_partitioning", fake_discover_partitioning), \
          patch.object(server_mod, "read_last_snapshot", fake_read), \
          patch.object(server_mod, "write_last_snapshot", fake_write), \
          patch.object(server_mod, "detect_changes", fake_detect):
@@ -373,7 +370,6 @@ async def test_refresh_view_appends_recent_queries(setup_state, client):
 
     async def fake_discover_columns(cursor, query):
         return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
-    async def fake_discover_partitioning(cursor, src): return None
 
     async def fake_full(cursor, view, target):
         return RefreshResult(
@@ -397,7 +393,6 @@ async def test_refresh_view_appends_recent_queries(setup_state, client):
 
     with patch.object(server_mod, "get_trino_connection", lambda s: FakeConn()), \
          patch.object(server_mod, "discover_columns", fake_discover_columns), \
-         patch.object(server_mod, "discover_source_partitioning", fake_discover_partitioning), \
          patch.object(server_mod, "read_last_snapshot", fake_read), \
          patch.object(server_mod, "write_last_snapshot", fake_write), \
          patch.object(server_mod, "detect_changes", fake_detect), \

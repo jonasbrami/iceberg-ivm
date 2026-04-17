@@ -36,7 +36,6 @@ from trino_mv_orchestrator.executor import (
 from trino_mv_orchestrator.introspect import (
     build_create_table_sql,
     discover_columns,
-    discover_source_partitioning,
 )
 from trino_mv_orchestrator.query_parser import parse_view_query
 from trino_mv_orchestrator.state import read_last_snapshot, write_last_snapshot
@@ -206,13 +205,14 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
         target_table = resolve_target_table(view, s.config)
         source_labels = _parse_table_labels(parsed.source_table)
 
-        # Auto-discover columns and create target
+        # Auto-discover columns and create target. The target is unpartitioned
+        # by default — set view.target_partitioning explicitly to partition it.
+        # (Auto-inheriting the source's spec was fragile when the source
+        # partition column had been aliased away by date_trunc; see issue #22.)
         columns = await discover_columns(cursor, view.query)
-        target_partitioning = (
-            view.target_partitioning
-            or await discover_source_partitioning(cursor, parsed.source_table)
+        create_sql = build_create_table_sql(
+            target_table, columns, view.target_partitioning,
         )
-        create_sql = build_create_table_sql(target_table, columns, target_partitioning)
         await cursor.execute(create_sql)
 
         value_columns = [c.name for c in columns if c.name not in parsed.merge_keys]
