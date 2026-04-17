@@ -9,7 +9,10 @@ import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from urllib.parse import urlparse
+
 import aiotrino
+from aiotrino.auth import BasicAuthentication
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
@@ -135,16 +138,26 @@ def get_app_state(request: Request) -> AppState:
 
 def get_trino_connection(s: AppState) -> aiotrino.dbapi.Connection:
     cfg = s.config
-    log.debug("connecting to Trino at %s:%s", cfg.trino.host, cfg.trino.port)
+    parsed = urlparse(cfg.trino.url)
+    scheme = parsed.scheme or "http"
+    host = parsed.hostname
+    port = parsed.port or (443 if scheme == "https" else 80)
+    if not host:
+        raise ValueError(f"TRINO_URL does not contain a host: {cfg.trino.url!r}")
+    log.debug("connecting to Trino at %s as %s", cfg.trino.url, cfg.trino.user)
     # Pin every session to UTC so Trino's `date_trunc` on TIMESTAMP WITH
     # TIME ZONE columns agrees with the Python-side snap_range math. See
     # DESIGN.md "Timezone assumption" for the full rationale.
-    return aiotrino.dbapi.connect(
-        host=cfg.trino.host, port=cfg.trino.port,
+    kwargs = dict(
+        host=host, port=port,
+        http_scheme=scheme,
         catalog=cfg.trino.catalog, schema=cfg.trino.schema,
         user=cfg.trino.user,
         timezone="UTC",
     )
+    if cfg.trino.password:
+        kwargs["auth"] = BasicAuthentication(cfg.trino.user, cfg.trino.password)
+    return aiotrino.dbapi.connect(**kwargs)
 
 
 def resolve_target_table(view: ViewConfig, cfg: Config) -> str:

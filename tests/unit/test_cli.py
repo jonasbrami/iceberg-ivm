@@ -7,12 +7,15 @@ import pytest
 
 CONFIG_YAML = textwrap.dedent("""\
     trino:
-      host: localhost
-      port: 8080
       catalog: iceberg
       schema: analytics
-      user: test
 """)
+
+
+@pytest.fixture(autouse=True)
+def trino_env(monkeypatch):
+    monkeypatch.setenv("TRINO_URL", "http://localhost:8080")
+    monkeypatch.setenv("TRINO_USER", "test")
 
 
 class TestCliMain:

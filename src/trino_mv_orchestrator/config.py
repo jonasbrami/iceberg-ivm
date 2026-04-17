@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,6 +12,15 @@ import yaml
 from trino_mv_orchestrator.query_parser import parse_view_query
 
 log = logging.getLogger(__name__)
+
+# Trino credentials are *only* read from these environment variables.
+# No defaults, no YAML overrides — keeping secrets out of the repo and
+# making per-environment deployment a matter of setting env vars.
+#
+# TRINO_PASSWORD is optional: if unset, the orchestrator connects
+# without BasicAuth (for clusters that allow anonymous access — e.g.
+# the local dev compose stack).
+_TRINO_ENV_REQUIRED = ("TRINO_URL", "TRINO_USER")
 
 _IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 _QUALIFIED_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$")
@@ -45,11 +55,11 @@ class ServerConfig:
 
 @dataclass(frozen=True)
 class TrinoConfig:
-    host: str
-    port: int
-    catalog: str
-    schema: str
-    user: str
+    url: str                # full coordinator URL, e.g. "http://trino:8080" (from TRINO_URL)
+    user: str               # from TRINO_USER
+    password: str | None    # from TRINO_PASSWORD; None → connect anonymously
+    catalog: str            # from YAML (trino.catalog)
+    schema: str             # from YAML (trino.schema)
 
 
 @dataclass(frozen=True)
@@ -84,23 +94,38 @@ def _parse_view(raw: dict) -> ViewConfig:
 def load_config(path: str | Path) -> Config:
     """Load static configuration (trino + server) from a YAML file.
 
-    Views are managed separately via load_views / save_views.
+    Trino credentials (URL, user, password) are read *only* from the
+    ``TRINO_URL`` / ``TRINO_USER`` / ``TRINO_PASSWORD`` environment
+    variables — never from YAML — so secrets stay out of the repo and
+    deployments can inject per-environment values. Any host/port/user in
+    the YAML's ``trino:`` section is ignored.
+
+    Views are managed separately via ``load_views`` / ``save_views``.
     """
     raw = yaml.safe_load(Path(path).read_text())
     if "trino" not in raw:
         raise ValueError("config missing 'trino' section")
 
     trino_raw = raw["trino"]
-    missing = {"host", "port", "catalog", "schema", "user"} - trino_raw.keys()
-    if missing:
-        raise ValueError(f"trino config missing required fields: {sorted(missing)}")
+    missing_yaml = {"catalog", "schema"} - trino_raw.keys()
+    if missing_yaml:
+        raise ValueError(
+            f"trino config missing required YAML fields: {sorted(missing_yaml)}"
+        )
+
+    missing_env = [v for v in _TRINO_ENV_REQUIRED if not os.environ.get(v)]
+    if missing_env:
+        raise ValueError(
+            f"trino credentials missing from environment: {missing_env}. "
+            f"Set {', '.join(_TRINO_ENV_REQUIRED)} before starting the orchestrator."
+        )
 
     trino = TrinoConfig(
-        host=trino_raw["host"],
-        port=int(trino_raw["port"]),
+        url=os.environ["TRINO_URL"],
+        user=os.environ["TRINO_USER"],
+        password=os.environ.get("TRINO_PASSWORD") or None,
         catalog=trino_raw["catalog"],
         schema=trino_raw["schema"],
-        user=trino_raw["user"],
     )
 
     server_raw = raw.get("server", {})
@@ -111,8 +136,8 @@ def load_config(path: str | Path) -> Config:
 
     cfg = Config(trino=trino, views=[], server=server)
     log.info(
-        "loaded static config from %s (trino=%s:%d/%s)",
-        path, trino.host, trino.port, trino.catalog,
+        "loaded static config from %s (trino=%s as %s / %s.%s)",
+        path, trino.url, trino.user, trino.catalog, trino.schema,
     )
     return cfg
 
