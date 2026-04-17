@@ -7,6 +7,19 @@ using only Iceberg file-level metadata for change detection. When source data
 changes, only the affected time range is recomputed from complete source data,
 guaranteeing correct aggregations. Refreshes are atomic via `MERGE INTO`.
 
+**Lightweight by design.** The orchestrator itself moves no data and holds no
+table contents — it only reads Iceberg metadata (`$snapshots`, `$all_entries`)
+and issues SQL to Trino. All data lives in Iceberg; all scans and writes
+happen inside Trino. The orchestrator's resident state is a handful of
+per-view status counters.
+
+**Materialized views are Iceberg tables, which makes them chainable.** Because
+each target is a first-class Iceberg table, it can be the *source* of another
+view. Example: a `trades → 1-minute bars` MV feeding a `1-minute → 1-hour
+bars` MV. The second view only needs metadata from the first's target table,
+so the chain stays cheap: each hop is still a bounded `MERGE` on a snapped
+time range.
+
 > This project was designed and implemented through a conversation between a
 > human prompter and Claude Code. See [DESIGN.md](DESIGN.md) for the full
 > design rationale and conversation context.
@@ -410,6 +423,21 @@ SELECT symbol, date_trunc('day', ts) AS day, sum(qty) AS v
 FROM iceberg.md.trades
 GROUP BY 1, 2
 ```
+
+**Chained MV** (a view whose source is another view's target — since every
+target is an Iceberg table, it's a normal source for the next hop):
+```sql
+SELECT symbol, date_trunc('hour', bucket) AS hour_bucket,
+       min_by(open, bucket) AS open, max(high) AS high,
+       min(low) AS low,       max_by(close, bucket) AS close,
+       sum(volume) AS volume, sum(trade_count) AS trade_count
+FROM iceberg.analytics.ohlcv_1m
+GROUP BY 1, 2
+```
+Note: avoid naming the upstream MV's time column with a SQL reserved word
+(`minute`, `hour`, `day`, `week`, `month`, `quarter`, `year`) — the parser
+rejects bare reserved words as the second arg of `date_trunc(...)`. Use a
+non-reserved alias like `bucket` or `minute_ts` in the upstream view.
 
 ### ❌ Not supported — rejected at config load
 
