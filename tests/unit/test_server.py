@@ -1,6 +1,7 @@
 """Tests for the FastAPI server endpoints."""
+import asyncio
 import textwrap
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -156,16 +157,114 @@ def test_delete_not_found(client):
 
 # ── Trigger refresh ──
 
-@patch("trino_mv_orchestrator.server.refresh_view", new_callable=AsyncMock)
-def test_trigger_refresh(mock_refresh, client):
-    r = client.post("/api/views/test_view/refresh")
-    assert r.status_code == 200
-    mock_refresh.assert_called_once()
-
-
 def test_trigger_refresh_not_found(client):
     r = client.post("/api/views/nope/refresh")
     assert r.status_code == 404
+
+
+async def test_trigger_refresh_signals_worker_and_returns_status(setup_state):
+    """POST /refresh sets the worker's wake event, waits for the worker to
+    complete one refresh cycle, and returns the resulting status.
+    """
+    from trino_mv_orchestrator import server as server_mod
+
+    view = setup_state.config.views[0]
+    setup_state._stop = False
+
+    async def fake_refresh_view(s, v):
+        vs = s.view_statuses.setdefault(v.name, server_mod.ViewStatus(name=v.name))
+        vs.last_action = "full"
+
+    with patch.object(server_mod, "refresh_view", fake_refresh_view):
+        worker = asyncio.create_task(server_mod.view_worker(setup_state, view.name))
+        try:
+            result = await server_mod.trigger_refresh(view.name, setup_state)
+        finally:
+            setup_state._stop = True
+            worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
+
+    assert result["status"] == "ok"
+    assert result["last_action"] == "full"
+
+
+async def test_concurrent_triggers_for_same_view_do_not_overlap(setup_state):
+    """Repro for #23 / #24.
+
+    With a per-view worker as the sole caller of ``refresh_view``, concurrent
+    triggers (manual POSTs, interval ticks, …) coalesce into sequential
+    refreshes. No two ``refresh_view`` bodies are ever in flight at once.
+    """
+    from trino_mv_orchestrator import server as server_mod
+    from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
+    from trino_mv_orchestrator.executor import RefreshResult
+    from trino_mv_orchestrator.introspect import ColumnInfo
+
+    view = setup_state.config.views[0]
+    setup_state._stop = False
+
+    class FakeConn:
+        async def cursor(self): return FakeCursor()
+        async def close(self): pass
+
+    class FakeCursor:
+        stats = {}
+        async def execute(self, sql): pass
+        async def fetchone(self): return None
+        async def fetchall(self): return []
+
+    in_flight = 0
+    max_in_flight = 0
+
+    async def slow_full(cursor, view, target):
+        nonlocal in_flight, max_in_flight
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        # Yield the event loop so a second caller could interleave if the
+        # worker weren't serializing refreshes.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        in_flight -= 1
+        return RefreshResult(
+            elapsed=0.0, processed_rows=0, processed_bytes=0, queries=[],
+        )
+
+    async def fake_detect(*a, **k):
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=1)
+
+    async def fake_discover_columns(c, q):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+
+    async def fake_read(c, t): return None
+    async def fake_write(c, t, snap): pass
+
+    with patch.object(server_mod, "get_trino_connection", lambda s: FakeConn()), \
+         patch.object(server_mod, "discover_columns", fake_discover_columns), \
+         patch.object(server_mod, "read_last_snapshot", fake_read), \
+         patch.object(server_mod, "write_last_snapshot", fake_write), \
+         patch.object(server_mod, "detect_changes", fake_detect), \
+         patch.object(server_mod, "execute_full_refresh", slow_full):
+        worker = asyncio.create_task(server_mod.view_worker(setup_state, view.name))
+        try:
+            await asyncio.gather(
+                server_mod.trigger_refresh(view.name, setup_state),
+                server_mod.trigger_refresh(view.name, setup_state),
+            )
+        finally:
+            setup_state._stop = True
+            worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
+
+    assert max_in_flight == 1, (
+        f"worker ran refresh_view bodies in parallel "
+        f"(max_in_flight={max_in_flight}); see issue #24"
+    )
 
 
 # ── UI ──
