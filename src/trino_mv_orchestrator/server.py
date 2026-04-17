@@ -434,6 +434,36 @@ def list_views(s: AppState = Depends(get_app_state)) -> list[ViewResponse]:
     return [_view_to_response(v, s.view_statuses.get(v.name)) for v in s.config.views]
 
 
+class ParseRequest(BaseModel):
+    query: str
+
+
+class ParseResponse(BaseModel):
+    source_table: str
+    filter_column: str
+    granularity: str
+    merge_keys: tuple[str, ...]
+
+
+@app.post("/api/views/parse")
+def parse_query(body: ParseRequest) -> ParseResponse:
+    """Parse a view query and return the derived attributes.
+
+    Used by the UI to live-validate the query as the operator types.
+    Returns 422 with a human-readable detail on any parse violation.
+    """
+    try:
+        p = parse_view_query(body.query)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    return ParseResponse(
+        source_table=p.source_table,
+        filter_column=p.filter_column,
+        granularity=p.granularity,
+        merge_keys=p.merge_keys,
+    )
+
+
 @app.post("/api/views", status_code=201)
 def create_view(
     body: ViewCreate, s: AppState = Depends(get_app_state),
