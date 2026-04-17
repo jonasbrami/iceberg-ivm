@@ -1,6 +1,6 @@
 [project]
 name = "trino-mv-orchestrator"
-version = "0.1.0"
+version = "0.1.1"
 description = "Metadata-driven incremental materialized view orchestrator for Trino/Iceberg"
 readme = "README.md"
 authors = [
