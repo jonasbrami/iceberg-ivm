@@ -211,7 +211,7 @@ def test_get_trino_connection_pins_timezone_to_utc(setup_state):
     `date_trunc('day' | 'week' | 'month', ts)` on a TIMESTAMP WITH TIME
     ZONE column operates in the session timezone; if the session isn't
     UTC, Trino's bucket boundaries will disagree with the Python-side
-    `snap_range` math and the MERGE will recompute partial buckets with
+    `expand_to_bucket_bounds` math and the MERGE will recompute partial buckets with
     wrong aggregates. Pinning to UTC makes the two sides agree by
     construction.
     """

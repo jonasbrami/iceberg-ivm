@@ -42,7 +42,7 @@ sequenceDiagram
     T->>SRC: read manifest files (no data scan)
     T-->>O: ts ∈ [Apr 9 10:00, Apr 9 15:30]
 
-    Note over O: snap_range("day")<br/>→ [Apr 9, Apr 10)
+    Note over O: expand_to_bucket_bounds("day")<br/>→ [Apr 9, Apr 10)
 
     O->>T: MERGE INTO target<br/>USING (SELECT ... WHERE ts >= Apr 9 AND ts < Apr 10)<br/>ON keys WHEN MATCHED UPDATE / NOT MATCHED INSERT
     T->>SRC: read data files (partition-pruned)
@@ -58,7 +58,7 @@ sequenceDiagram
 4. **Refresh** -- `MERGE INTO` with a plain column range filter (Trino pushes down to partition pruning)
 5. **Persist** -- store snapshot ID in target table's Iceberg properties
 
-### `date_trunc` and `snap_range`: forward and inverse
+### `date_trunc` and `expand_to_bucket_bounds`: forward and inverse
 
 The entire incremental refresh correctness depends on one thing: given the
 min/max timestamps from new files, compute a filter range that covers **every
@@ -73,15 +73,15 @@ flowchart TB
         t3["10:22:18"] & t4["10:55:31"] -->|date_trunc| b2["<b>10:00</b>"]
     end
 
-    subgraph inverse["<b>Inverse: snap_range('hour')</b> — file stats → complete bucket boundaries"]
+    subgraph inverse["<b>Inverse: expand_to_bucket_bounds('hour')</b> — file stats → complete bucket boundaries"]
         direction LR
         stats["file stats<br/><b>min=09:15, max=10:55</b>"]
-        snap["snap_range"]
+        snap["expand_to_bucket_bounds"]
         result["filter range<br/><b>[09:00, 11:00)</b>"]
         stats --> snap --> result
     end
 
-    forward -..->|"snap_range reverses date_trunc"| inverse
+    forward -..->|"expand_to_bucket_bounds reverses date_trunc"| inverse
 
     style forward fill:#1a1a2e,stroke:#16213e,color:#e0e0e0
     style inverse fill:#0f3460,stroke:#16213e,color:#e0e0e0
@@ -91,7 +91,7 @@ flowchart TB
 ```
 
 `date_trunc` is a **many-to-one** function: it maps every timestamp within a
-bucket to the same boundary value. `snap_range` is its inverse: it expands a
+bucket to the same boundary value. `expand_to_bucket_bounds` is its inverse: it expands a
 raw timestamp range outward to the nearest bucket boundaries so the filter
 captures all rows that belong to any touched bucket.
 
@@ -110,7 +110,7 @@ flowchart LR
         fs["min = 09:15<br/>max = 10:55"]
     end
 
-    subgraph snapresult["snap_range result"]
+    subgraph snapresult["expand_to_bucket_bounds result"]
         direction TB
         floor["<b>floor</b>(09:15) = 09:00"]
         ceil["<b>ceil</b>(10:55) = 11:00"]
@@ -133,7 +133,7 @@ flowchart LR
 
 The two operations mirror each other exactly:
 
-| | `date_trunc('hour', ts)` | `snap_range('hour')` |
+| | `date_trunc('hour', ts)` | `expand_to_bucket_bounds('hour')` |
 |---|---|---|
 | **Direction** | timestamp → bucket start | timestamp range → bucket-aligned range |
 | **Operation** | floor to `:00:00` | floor min to `:00:00`, ceil max to next `:00:00` |
@@ -141,7 +141,7 @@ The two operations mirror each other exactly:
 | **Guarantees** | rows are grouped by hour | filter covers complete hours |
 
 This is why only simple `date_trunc` is allowed: for any `date_trunc('X', col)`,
-the inverse is trivially computable by `snap_range('X')`. Complex expressions
+the inverse is trivially computable by `expand_to_bucket_bounds('X')`. Complex expressions
 (e.g. 5-minute bars via arithmetic) break this — the bucket width can't be
 reliably inferred, and the inverse would produce a too-narrow filter that
 corrupts aggregates.
@@ -336,7 +336,7 @@ graph LR
 
     subgraph Orchestrator
         FS["File stats: ts ∈ [Apr 8 10:00, Apr 8 15:30]"]
-        SR["snap_range('week'): [Apr 6, Apr 13)"]
+        SR["expand_to_bucket_bounds('week'): [Apr 6, Apr 13)"]
         FS --> SR
     end
 
@@ -551,7 +551,7 @@ parser enforces this at load time and rejects anything else with a clear error.
   (`overwrite`, `delete`) fails loudly.
 - **UTC session timezone.** The orchestrator pins every Trino session to
   `UTC` so that `date_trunc('day' | 'week' | …, ts)` on `TIMESTAMP WITH
-  TIME ZONE` columns aligns with the Python-side `snap_range` bucket math.
+  TIME ZONE` columns aligns with the Python-side `expand_to_bucket_bounds` bucket math.
   Without this pin, a non-UTC session would produce bucket boundaries
   that disagree with the computed filter range and silently corrupt
   incremental aggregates. See [DESIGN.md](DESIGN.md#timezone-assumption).
@@ -575,7 +575,7 @@ cd tests && docker compose down -v
 ```
 src/trino_mv_orchestrator/
     config.py        -- YAML config loading, saving, validation
-    detector.py      -- $snapshots + $all_entries file stats + snap_range()
+    detector.py      -- $snapshots + $all_entries file stats + expand_to_bucket_bounds()
     executor.py      -- MERGE SQL generation + execution
     introspect.py    -- DESCRIBE OUTPUT, EXPLAIN IO, SHOW CREATE TABLE
     state.py         -- Read/write last_source_snapshot via extra_properties

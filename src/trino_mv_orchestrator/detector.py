@@ -200,8 +200,8 @@ def _parse_ts(value: str) -> datetime:
     """Parse an Iceberg readable_metrics timestamp to a datetime.
 
     Sub-microsecond precision is silently truncated to microseconds —
-    snap_range floors to minute or coarser, so it cannot affect which
-    bucket a row belongs to.
+    ``expand_to_bucket_bounds`` floors to minute or coarser, so it
+    cannot affect which bucket a row belongs to.
     """
     try:
         return datetime.fromisoformat(value)
@@ -219,13 +219,25 @@ def _add_months(dt: datetime, n: int) -> datetime:
     return dt.replace(year=idx // 12, month=(idx % 12) + 1)
 
 
-def snap_range(
+def expand_to_bucket_bounds(
     min_ts: datetime, max_ts: datetime, granularity: str,
 ) -> tuple[datetime, datetime]:
-    """Snap a timestamp range outward to complete GROUP BY bucket boundaries.
+    """Expand a timestamp range outward to full GROUP BY bucket boundaries.
 
-    Returns (start, end) where start is the floor of the bucket containing
-    min_ts, and end is the ceiling (exclusive) of the bucket containing max_ts.
+    This is the **inverse** of Trino's ``date_trunc(granularity, ts)`` over a
+    range.  Where ``date_trunc`` maps many timestamps to a single bucket
+    start (forward, many-to-one), this function maps a ``(min_ts, max_ts)``
+    range to the smallest bucket-aligned interval that contains every
+    source row belonging to any touched bucket.
+
+    Returns ``(start, end)`` with ``start`` on a bucket boundary ≤ ``min_ts``
+    and ``end`` on the next bucket boundary > ``max_ts`` (half-open interval,
+    so the emitted WHERE predicate is ``col >= start AND col < end``).
+
+    Trino has no built-in inverse of ``date_trunc``; we do it in Python
+    once when the detector reads file stats, then emit concrete TIMESTAMP
+    literals into the MERGE so Trino's planner can partition-prune
+    without needing to constant-fold a ``date_trunc`` expression.
     """
     if granularity == "minute":
         start = min_ts.replace(second=0, microsecond=0)
@@ -321,7 +333,7 @@ async def detect_changes(
         return ChangeResult(action=RefreshAction.NO_CHANGE, current_snapshot=current_snap)
 
     min_ts, max_ts = col_range
-    snapped_start, snapped_end = snap_range(min_ts, max_ts, filter_granularity)
+    snapped_start, snapped_end = expand_to_bucket_bounds(min_ts, max_ts, filter_granularity)
 
     log.info(
         "file stats: %s in [%s, %s] → snapped to [%s, %s)",
