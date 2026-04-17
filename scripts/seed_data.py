@@ -66,7 +66,7 @@ def main():
     for row in cur.fetchall():
         print(f"  {row[0]} {row[1]}: {row[2]}")
 
-    # Write example config pointing at the test Trino
+    # Write example config + views files pointing at the compose Trino
     config = Path("config.yaml")
     config.write_text("""\
 server:
@@ -79,7 +79,9 @@ trino:
   catalog: iceberg
   schema: analytics
   user: demo
-
+""")
+    views = Path("views.yaml")
+    views.write_text("""\
 views:
   - name: ohlcv_1m
     query: |
@@ -98,8 +100,8 @@ views:
     target_partitioning: "ARRAY['day(minute)']"
     refresh_interval_seconds: 30
 """)
-    print(f"\nWrote {config}")
-    print("\nRun:  uv run trino-mv-orchestrator -c config.yaml")
+    print(f"\nWrote {config} + {views}")
+    print("\nRun:  uv run trino-mv-orchestrator -c config.yaml --views views.yaml")
     print("Open: http://localhost:8000")
 
     conn.close()
