@@ -101,6 +101,19 @@ class ViewStatus:
 
 
 @dataclass
+class ViewRuntime:
+    """Per-view concurrency primitives.
+
+    Kept separate from ``ViewStatus`` so ``ViewStatus`` stays JSON-serialisable
+    (``dataclasses.asdict`` can't walk ``asyncio.Event`` / ``Condition``).
+    """
+    wake: asyncio.Event = field(default_factory=asyncio.Event)
+    refresh_cond: asyncio.Condition = field(default_factory=asyncio.Condition)
+    refresh_seq: int = 0
+    refresh_in_flight: bool = False
+
+
+@dataclass
 class AppState:
     config_path: Path = field(default_factory=lambda: Path("config.yaml"))
     views_path: Path = field(default_factory=lambda: Path("views.yaml"))
@@ -108,6 +121,7 @@ class AppState:
     config_mtime: float = 0
     views_mtime: float = 0
     view_statuses: dict[str, ViewStatus] = field(default_factory=dict)
+    view_runtimes: dict[str, ViewRuntime] = field(default_factory=dict)
     _stop: bool = False
 
 
@@ -292,29 +306,88 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
         await conn.close()
 
 
-async def refresh_loop(s: AppState) -> None:
+async def view_worker(s: AppState, name: str) -> None:
+    """Sole caller of ``refresh_view`` for this view.
+
+    Asyncio is single-threaded: because this task is the only one that awaits
+    ``refresh_view(view)`` for ``name``, refreshes are sequential by
+    construction — no lock needed. Manual triggers set ``runtime.wake`` to
+    request a refresh; bursts of triggers coalesce into a single follow-up
+    pass, which removes the refresh-storm behaviour described in #24.
+    """
+    rt = s.view_runtimes.setdefault(name, ViewRuntime())
+    try:
+        while not s._stop:
+            view = next(
+                (v for v in (s.config.views if s.config else []) if v.name == name),
+                None,
+            )
+            if view is None:
+                log.info("%s: view removed, worker exiting", name)
+                return
+
+            rt.refresh_in_flight = True
+            try:
+                await refresh_view(s, view)
+            except Exception:
+                # refresh_view already logs + records its own exceptions; this is a
+                # last-resort guard so the worker never dies on an unexpected error.
+                log.exception("%s: worker caught unexpected error", name)
+            rt.refresh_in_flight = False
+            rt.refresh_seq += 1
+            async with rt.refresh_cond:
+                rt.refresh_cond.notify_all()
+
+            try:
+                await asyncio.wait_for(
+                    rt.wake.wait(),
+                    timeout=view.refresh_interval_seconds,
+                )
+            except asyncio.TimeoutError:
+                pass
+            rt.wake.clear()
+    finally:
+        # Wake any trigger_refresh waiter that might still be parked on the
+        # condition (e.g. view was deleted mid-wait); the waiter re-checks
+        # s.config.views and bails with 410 rather than hanging forever.
+        async with rt.refresh_cond:
+            rt.refresh_cond.notify_all()
+
+
+async def supervisor(s: AppState) -> None:
+    """Reload config periodically and keep one worker task per configured view."""
     reload_config(s)
-    last_refresh_times: dict[str, float] = {}
-    last_config_reload: float = time.time()
+    workers: dict[str, asyncio.Task] = {}
+    last_reload = time.time()
 
-    while not s._stop:
-        now = time.time()
+    def sync_workers() -> None:
+        current = {v.name for v in (s.config.views if s.config else [])}
+        for name in list(workers):
+            t = workers[name]
+            if name not in current or t.done():
+                t.cancel()
+                workers.pop(name)
+        for name in current:
+            if name not in workers:
+                log.info("spawning worker for %r", name)
+                workers[name] = asyncio.create_task(view_worker(s, name))
 
-        # Reload config at configured interval
-        reload_interval = s.config.server.config_reload_interval_seconds if s.config else 30
-        if now - last_config_reload >= reload_interval:
-            reload_config(s)
-            last_config_reload = now
-
-        if s.config:
-            for view in s.config.views:
-                last = last_refresh_times.get(view.name, 0)
-                if now - last >= view.refresh_interval_seconds:
-                    log.debug("%s: scheduling refresh (%.0fs since last)", view.name, now - last)
-                    await refresh_view(s, view)
-                    last_refresh_times[view.name] = time.time()
-
-        await asyncio.sleep(1)
+    try:
+        sync_workers()
+        while not s._stop:
+            await asyncio.sleep(1)
+            now = time.time()
+            reload_interval = (
+                s.config.server.config_reload_interval_seconds if s.config else 30
+            )
+            if now - last_reload >= reload_interval:
+                reload_config(s)
+                last_reload = now
+            sync_workers()
+    finally:
+        for t in workers.values():
+            t.cancel()
+        await asyncio.gather(*workers.values(), return_exceptions=True)
 
 
 # ── FastAPI lifespan ──
@@ -331,12 +404,12 @@ async def lifespan(app: FastAPI):
         app.state.s = s
 
     log.info(
-        "starting refresh loop — %d views configured",
+        "starting supervisor — %d views configured",
         len(s.config.views) if s.config else 0,
     )
-    task = asyncio.create_task(refresh_loop(s))
+    task = asyncio.create_task(supervisor(s))
     yield
-    log.info("shutting down refresh loop")
+    log.info("shutting down supervisor")
     s._stop = True
     task.cancel()
     try:
@@ -531,6 +604,7 @@ def delete_view(name: str, s: AppState = Depends(get_app_state)):
     s.config = new_cfg
     s.views_mtime = s.views_path.stat().st_mtime
     s.view_statuses.pop(name, None)
+    s.view_runtimes.pop(name, None)
     VIEWS_CONFIGURED.set(len(new_views))
     log.info("deleted view %r via API", name)
 
@@ -542,8 +616,24 @@ async def trigger_refresh(name: str, s: AppState = Depends(get_app_state)):
     view = next((v for v in s.config.views if v.name == name), None)
     if not view:
         raise HTTPException(404, f"view '{name}' not found")
+
+    rt = s.view_runtimes.setdefault(name, ViewRuntime())
     log.info("manual refresh triggered for %r", name)
-    await refresh_view(s, view)
+
+    # We want the caller to see the status of a refresh that observed their
+    # trigger. If a refresh is already in flight, it started before our wake
+    # and can't reflect it — wait for the *next* completion after that.
+    seq_before = rt.refresh_seq
+    target = seq_before + (2 if rt.refresh_in_flight else 1)
+    rt.wake.set()
+    async with rt.refresh_cond:
+        while rt.refresh_seq < target:
+            # If the view was deleted while we waited, the worker's finally
+            # notify_all will wake us; bail rather than re-entering wait().
+            if not any(v.name == name for v in s.config.views):
+                raise HTTPException(410, f"view '{name}' deleted")
+            await rt.refresh_cond.wait()
+
     vs = s.view_statuses.get(name)
     return {
         "status": "ok",
