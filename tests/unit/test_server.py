@@ -191,12 +191,15 @@ async def test_trigger_refresh_signals_worker_and_returns_status(setup_state):
     assert result["last_action"] == "full"
 
 
-async def test_concurrent_triggers_for_same_view_do_not_overlap(setup_state):
+async def test_concurrent_triggers_coalesce_into_single_followup(setup_state):
     """Repro for #23 / #24.
 
-    With a per-view worker as the sole caller of ``refresh_view``, concurrent
-    triggers (manual POSTs, interval ticks, …) coalesce into sequential
-    refreshes. No two ``refresh_view`` bodies are ever in flight at once.
+    With a per-view worker as the sole caller of ``refresh_view``, a burst of
+    concurrent triggers (manual POSTs, interval ticks, …) coalesces into *one*
+    follow-up refresh after the in-flight one, regardless of burst size. This
+    is strictly stronger than "no overlap": a lock-based fix would serialize
+    every trigger into its own refresh — ``refresh_count`` would grow with
+    the burst. Coalescing keeps it at 2 (in-flight + single coalesced pass).
     """
     from trino_mv_orchestrator import server as server_mod
     from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
@@ -218,9 +221,10 @@ async def test_concurrent_triggers_for_same_view_do_not_overlap(setup_state):
 
     in_flight = 0
     max_in_flight = 0
+    refresh_count = 0
 
     async def slow_full(cursor, view, target):
-        nonlocal in_flight, max_in_flight
+        nonlocal in_flight, max_in_flight, refresh_count
         in_flight += 1
         max_in_flight = max(max_in_flight, in_flight)
         # Yield the event loop so a second caller could interleave if the
@@ -228,6 +232,7 @@ async def test_concurrent_triggers_for_same_view_do_not_overlap(setup_state):
         for _ in range(5):
             await asyncio.sleep(0)
         in_flight -= 1
+        refresh_count += 1
         return RefreshResult(
             elapsed=0.0, processed_rows=0, processed_bytes=0, queries=[],
         )
@@ -249,10 +254,11 @@ async def test_concurrent_triggers_for_same_view_do_not_overlap(setup_state):
          patch.object(server_mod, "execute_full_refresh", slow_full):
         worker = asyncio.create_task(server_mod.view_worker(setup_state, view.name))
         try:
-            await asyncio.gather(
-                server_mod.trigger_refresh(view.name, setup_state),
-                server_mod.trigger_refresh(view.name, setup_state),
-            )
+            # Fire 10 concurrent triggers — they all hit the worker while its
+            # first refresh is in flight.
+            await asyncio.gather(*[
+                server_mod.trigger_refresh(view.name, setup_state) for _ in range(10)
+            ])
         finally:
             setup_state._stop = True
             worker.cancel()
@@ -265,6 +271,54 @@ async def test_concurrent_triggers_for_same_view_do_not_overlap(setup_state):
         f"worker ran refresh_view bodies in parallel "
         f"(max_in_flight={max_in_flight}); see issue #24"
     )
+    assert refresh_count == 2, (
+        f"10 concurrent triggers produced {refresh_count} refreshes; "
+        f"expected exactly 2 (initial in-flight + one coalesced follow-up). "
+        f"A lock-based fix would produce ~11."
+    )
+
+
+async def test_trigger_bails_when_view_deleted_during_wait(setup_state):
+    """If the view is deleted while a trigger is parked on the condition,
+    the worker's shutdown-notify wakes the waiter and it returns 410 —
+    no hang.
+    """
+    from fastapi import HTTPException
+    from trino_mv_orchestrator import server as server_mod
+    from trino_mv_orchestrator.config import Config
+
+    view = setup_state.config.views[0]
+    setup_state._stop = False
+
+    # A refresh that blocks until cancelled — simulates a long-running INSERT.
+    async def hanging_refresh_view(s, v):
+        await asyncio.Event().wait()
+
+    with patch.object(server_mod, "refresh_view", hanging_refresh_view):
+        worker = asyncio.create_task(server_mod.view_worker(setup_state, view.name))
+        trigger = asyncio.create_task(
+            server_mod.trigger_refresh(view.name, setup_state)
+        )
+        # Let the worker enter refresh_view and the trigger reach its wait.
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        # Remove the view from config and cancel the worker, mirroring what
+        # delete_view + supervisor would do in production.
+        setup_state.config = Config(
+            trino=setup_state.config.trino,
+            views=[],
+            server=setup_state.config.server,
+        )
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+
+        with pytest.raises(HTTPException) as exc:
+            await trigger
+        assert exc.value.status_code == 410
 
 
 # ── UI ──

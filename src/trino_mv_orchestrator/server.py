@@ -316,35 +316,42 @@ async def view_worker(s: AppState, name: str) -> None:
     pass, which removes the refresh-storm behaviour described in #24.
     """
     rt = s.view_runtimes.setdefault(name, ViewRuntime())
-    while not s._stop:
-        view = next(
-            (v for v in (s.config.views if s.config else []) if v.name == name),
-            None,
-        )
-        if view is None:
-            log.info("%s: view removed, worker exiting", name)
-            return
+    try:
+        while not s._stop:
+            view = next(
+                (v for v in (s.config.views if s.config else []) if v.name == name),
+                None,
+            )
+            if view is None:
+                log.info("%s: view removed, worker exiting", name)
+                return
 
-        rt.refresh_in_flight = True
-        try:
-            await refresh_view(s, view)
-        except Exception:
-            # refresh_view already logs + records its own exceptions; this is a
-            # last-resort guard so the worker never dies on an unexpected error.
-            log.exception("%s: worker caught unexpected error", name)
-        rt.refresh_in_flight = False
-        rt.refresh_seq += 1
+            rt.refresh_in_flight = True
+            try:
+                await refresh_view(s, view)
+            except Exception:
+                # refresh_view already logs + records its own exceptions; this is a
+                # last-resort guard so the worker never dies on an unexpected error.
+                log.exception("%s: worker caught unexpected error", name)
+            rt.refresh_in_flight = False
+            rt.refresh_seq += 1
+            async with rt.refresh_cond:
+                rt.refresh_cond.notify_all()
+
+            try:
+                await asyncio.wait_for(
+                    rt.wake.wait(),
+                    timeout=view.refresh_interval_seconds,
+                )
+            except asyncio.TimeoutError:
+                pass
+            rt.wake.clear()
+    finally:
+        # Wake any trigger_refresh waiter that might still be parked on the
+        # condition (e.g. view was deleted mid-wait); the waiter re-checks
+        # s.config.views and bails with 410 rather than hanging forever.
         async with rt.refresh_cond:
             rt.refresh_cond.notify_all()
-
-        try:
-            await asyncio.wait_for(
-                rt.wake.wait(),
-                timeout=view.refresh_interval_seconds,
-            )
-        except asyncio.TimeoutError:
-            pass
-        rt.wake.clear()
 
 
 async def supervisor(s: AppState) -> None:
@@ -597,6 +604,7 @@ def delete_view(name: str, s: AppState = Depends(get_app_state)):
     s.config = new_cfg
     s.views_mtime = s.views_path.stat().st_mtime
     s.view_statuses.pop(name, None)
+    s.view_runtimes.pop(name, None)
     VIEWS_CONFIGURED.set(len(new_views))
     log.info("deleted view %r via API", name)
 
@@ -620,6 +628,10 @@ async def trigger_refresh(name: str, s: AppState = Depends(get_app_state)):
     rt.wake.set()
     async with rt.refresh_cond:
         while rt.refresh_seq < target:
+            # If the view was deleted while we waited, the worker's finally
+            # notify_all will wake us; bail rather than re-entering wait().
+            if not any(v.name == name for v in s.config.views):
+                raise HTTPException(410, f"view '{name}' deleted")
             await rt.refresh_cond.wait()
 
     vs = s.view_statuses.get(name)
