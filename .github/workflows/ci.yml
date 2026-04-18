@@ -11,6 +11,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # hatch-vcs reads tags to compute the project version at install time
+          fetch-depth: 0
+          fetch-tags: true
 
       - uses: astral-sh/setup-uv@v5
         with:
@@ -60,5 +64,10 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # metadata-action parses `refs/tags/v0.1.1` → `0.1.1`; the Dockerfile
+          # forwards it to SETUPTOOLS_SCM_PRETEND_VERSION_FOR_TRINO_MV_ORCHESTRATOR
+          # so hatch-vcs bakes the correct version into the built package.
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

@@ -1,6 +1,6 @@
 [project]
 name = "trino-mv-orchestrator"
-version = "0.1.1"
+dynamic = ["version"]
 description = "Metadata-driven incremental materialized view orchestrator for Trino/Iceberg"
 readme = "README.md"
 authors = [
@@ -20,8 +20,15 @@ dependencies = [
 trino-mv-orchestrator = "trino_mv_orchestrator.cli:main"
 
 [build-system]
-requires = ["uv_build>=0.11.1,<0.12.0"]
-build-backend = "uv_build"
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+# Version is derived from git tags: `v0.1.1` → `0.1.1`. Between tags,
+# installs produce a dev version (e.g. `0.1.2.dev3+g7817deb`). In Docker
+# builds (no `.git` in context) the publish workflow passes the tag via
+# SETUPTOOLS_SCM_PRETEND_VERSION_FOR_TRINO_MV_ORCHESTRATOR.
+[tool.hatch.version]
+source = "vcs"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
