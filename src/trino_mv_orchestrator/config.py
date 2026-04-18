@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
 
-from trino_mv_orchestrator.query_parser import parse_view_query
+from trino_mv_orchestrator.query_parser import (
+    IDENTIFIER_RE,
+    QUALIFIED_NAME_RE,
+    parse_view_query,
+)
 
 log = logging.getLogger(__name__)
 
@@ -22,17 +25,13 @@ log = logging.getLogger(__name__)
 # the local dev compose stack).
 _TRINO_ENV_REQUIRED = ("TRINO_URL", "TRINO_USER")
 
-_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
-_QUALIFIED_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$")
-
-
-def _validate_identifier(value: str, field_name: str) -> None:
-    if not _IDENTIFIER_RE.match(value):
+def validate_identifier(value: str, field_name: str) -> None:
+    if not IDENTIFIER_RE.match(value):
         raise ValueError(f"{field_name}: {value!r} is not a valid SQL identifier")
 
 
-def _validate_qualified_name(value: str, field_name: str) -> None:
-    if not _QUALIFIED_NAME_RE.match(value):
+def validate_qualified_name(value: str, field_name: str) -> None:
+    if not QUALIFIED_NAME_RE.match(value):
         raise ValueError(
             f"{field_name}: {value!r} is not a valid qualified table name"
         )
@@ -74,9 +73,9 @@ def _parse_view(raw: dict) -> ViewConfig:
     if missing:
         raise ValueError(f"view missing required fields: {sorted(missing)}")
 
-    _validate_identifier(raw["name"], "name")
+    validate_identifier(raw["name"], "name")
     if raw.get("target_table"):
-        _validate_qualified_name(raw["target_table"], "target_table")
+        validate_qualified_name(raw["target_table"], "target_table")
 
     # Full query validation — source_table, filter_column, granularity,
     # merge_keys are all derived here at load time.  Raises on any violation.

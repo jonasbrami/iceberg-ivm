@@ -17,8 +17,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterator
 
-_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
 import sqlparse
 from sqlparse.sql import (
     Function,
@@ -41,6 +39,9 @@ from sqlparse.tokens import (
 )
 
 log = logging.getLogger(__name__)
+
+IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+QUALIFIED_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
 
 VALID_GRANULARITIES = frozenset(
     ("minute", "hour", "day", "week", "month", "quarter", "year")
@@ -132,7 +133,7 @@ def _reject_unsupported_shapes(stmt: Statement) -> None:
         raise ValueError("CTEs (WITH clauses) are not supported")
     if "UNION" in top_keywords or "INTERSECT" in top_keywords or "EXCEPT" in top_keywords:
         raise ValueError("set operations (UNION/INTERSECT/EXCEPT) are not supported")
-    if "JOIN" in top_keywords or any("JOIN" in k for k in top_keywords):
+    if any("JOIN" in k for k in top_keywords):
         raise ValueError("joins are not supported; query must reference a single source table")
     if top_keywords.count("SELECT") > 1:
         raise ValueError("subqueries are not supported")
@@ -148,7 +149,7 @@ def _extract_source_table(stmt: Statement) -> str:
     for i, tok in enumerate(tokens):
         if tok.ttype is Keyword and tok.normalized.upper() == "FROM":
             for t in tokens[i + 1:]:
-                if t.ttype in (Whitespace,) or (t.ttype is not None and t.ttype in Whitespace):
+                if t.is_whitespace:
                     continue
                 if isinstance(t, Identifier):
                     name = str(t).strip()
@@ -167,23 +168,20 @@ def _extract_source_table(stmt: Statement) -> str:
     raise ValueError("FROM clause missing")
 
 
-def _walk(node) -> Iterator[tuple[object, object]]:
-    """Yield (parent, child) for every descendant token of ``node``."""
+def _iter_tokens(node) -> Iterator[object]:
+    """Yield every descendant token of ``node`` (pre-order)."""
     for t in getattr(node, "tokens", []):
-        yield node, t
-        yield from _walk(t)
+        yield t
+        yield from _iter_tokens(t)
 
 
-def _ancestors_contain_operation(stmt: Statement, target) -> bool:
-    """True if the target Function has an Operation in its ancestor chain."""
-    parents: dict[int, object] = {}
-    for parent, child in _walk(stmt):
-        parents[id(child)] = parent
-    cur = parents.get(id(target))
+def _in_arithmetic(tok) -> bool:
+    """True if ``tok`` is nested inside an ``Operation`` node."""
+    cur = tok.parent
     while cur is not None:
         if isinstance(cur, Operation):
             return True
-        cur = parents.get(id(cur))
+        cur = cur.parent
     return False
 
 
@@ -191,7 +189,7 @@ def _extract_date_trunc(stmt: Statement) -> tuple[str, str]:
     """Return (granularity, column_name) from date_trunc('X', col)."""
     calls = [
         tok
-        for _parent, tok in _walk(stmt)
+        for tok in _iter_tokens(stmt)
         if isinstance(tok, Function)
         and (tok.get_real_name() or "").lower() == "date_trunc"
     ]
@@ -204,7 +202,7 @@ def _extract_date_trunc(stmt: Statement) -> tuple[str, str]:
     granularities: set[str] = set()
     column: str | None = None
     for call in calls:
-        if _ancestors_contain_operation(stmt, call):
+        if _in_arithmetic(call):
             raise ValueError(
                 "date_trunc(...) must not be wrapped in arithmetic; "
                 "use date_trunc('X', col) directly in SELECT / GROUP BY"
@@ -263,7 +261,7 @@ def _read_date_trunc_args(fn: Function) -> tuple[str, str]:
         col = second.get_real_name()
     elif second.ttype is Name:
         col = str(second)
-    elif second.ttype in Keyword and _IDENTIFIER_RE.match(str(second)):
+    elif second.ttype in Keyword and IDENTIFIER_RE.match(str(second)):
         # sqlparse tokenizes reserved-word column names (minute, hour, day,
         # week, …) as Keyword tokens instead of Name/Identifier.  Trino
         # accepts these as unquoted column identifiers (verified against

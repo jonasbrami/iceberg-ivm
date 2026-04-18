@@ -9,7 +9,7 @@ import pytest
 from trino_mv_orchestrator.config import ViewConfig
 from trino_mv_orchestrator.detector import RefreshAction, detect_changes
 from trino_mv_orchestrator.executor import execute_full_refresh, execute_incremental_refresh
-from trino_mv_orchestrator.introspect import discover_columns, build_create_table_sql
+from trino_mv_orchestrator.introspect import ColumnInfo, build_create_table_sql, discover_columns
 from trino_mv_orchestrator.query_parser import parse_view_query
 from trino_mv_orchestrator.state import read_last_snapshot, write_last_snapshot
 
@@ -145,7 +145,7 @@ class TestIncrementalRefresh:
 class TestState:
     async def test_roundtrip(self, trino_conn):
         cursor = await trino_conn.cursor()
-        await cursor.execute(build_create_table_sql(TARGET_TABLE, [("x", "INTEGER")]))
+        await cursor.execute(build_create_table_sql(TARGET_TABLE, [ColumnInfo("x", "INTEGER")]))
         assert await read_last_snapshot(cursor, TARGET_TABLE) is None
         await write_last_snapshot(cursor, TARGET_TABLE, 12345)
         assert await read_last_snapshot(cursor, TARGET_TABLE) == 12345
