@@ -42,6 +42,10 @@ log = logging.getLogger(__name__)
 
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 QUALIFIED_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
+_DATE_TRUNC_RE = re.compile(
+    r"^\s*date_trunc\s*\(\s*'([^']+)'\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*$",
+    re.IGNORECASE,
+)
 
 VALID_GRANULARITIES = frozenset(
     ("minute", "hour", "day", "week", "month", "quarter", "year")
@@ -75,6 +79,9 @@ def parse_view_query(sql: str) -> ParsedView:
     )
 
 
+_TRAILING_CLAUSES = ("GROUP BY", "HAVING", "ORDER BY", "LIMIT", "OFFSET", "FETCH")
+
+
 def inject_range_filter(
     sql: str, filter_column: str, start: datetime, end: datetime
 ) -> str:
@@ -87,14 +94,23 @@ def inject_range_filter(
     stmt = _single_statement(sql)
     predicate = _build_range_predicate(filter_column, start, end)
 
-    where = _find_where(stmt)
+    where = next((t for t in stmt.tokens if isinstance(t, Where)), None)
     if where is not None:
-        # Append " AND <predicate>" onto the existing WHERE.  Any trailing
-        # whitespace inside the Where node must stay at the tail so the
-        # next keyword (GROUP BY / ORDER BY / …) stays separated.
-        _append_to_where(where, predicate)
-    else:
-        _insert_new_where(stmt, predicate)
+        # Append " AND <predicate>" onto the existing WHERE, keeping any
+        # trailing whitespace so the next keyword stays separated.
+        original = str(where)
+        stripped = original.rstrip()
+        trailing = original[len(stripped):] or " "
+        where.tokens = [Token(None, f"{stripped} AND {predicate}{trailing}")]
+        return str(stmt)
+
+    # No WHERE: insert one before the first trailing clause, else at end.
+    insert_idx = next(
+        (i for i, t in enumerate(stmt.tokens)
+         if t.ttype is Keyword and t.normalized.upper() in _TRAILING_CLAUSES),
+        len(stmt.tokens),
+    )
+    stmt.tokens.insert(insert_idx, Token(None, f"WHERE {predicate} "))
     return str(stmt)
 
 
@@ -145,27 +161,26 @@ def _reject_unsupported_shapes(stmt: Statement) -> None:
 
 def _extract_source_table(stmt: Statement) -> str:
     """Return the qualified name following FROM."""
-    tokens = list(stmt.tokens)
-    for i, tok in enumerate(tokens):
-        if tok.ttype is Keyword and tok.normalized.upper() == "FROM":
-            for t in tokens[i + 1:]:
-                if t.is_whitespace:
-                    continue
-                if isinstance(t, Identifier):
-                    name = str(t).strip()
-                    if name.startswith("("):
-                        raise ValueError("subqueries in FROM are not supported")
-                    return name
-                if isinstance(t, Parenthesis):
-                    raise ValueError("subqueries in FROM are not supported")
-                if t.ttype is Name:
-                    return str(t).strip()
-                if not str(t).strip():
-                    continue
-                raise ValueError(
-                    f"could not parse table reference after FROM: {str(t)!r}"
-                )
-    raise ValueError("FROM clause missing")
+    from_idx = next(
+        (i for i, t in enumerate(stmt.tokens)
+         if t.ttype is Keyword and t.normalized.upper() == "FROM"),
+        None,
+    )
+    if from_idx is None:
+        raise ValueError("FROM clause missing")
+    _, t = stmt.token_next(from_idx, skip_ws=True, skip_cm=True)
+    if isinstance(t, Parenthesis):
+        raise ValueError("subqueries in FROM are not supported")
+    if isinstance(t, Identifier) or (t is not None and t.ttype is Name):
+        name = str(t).strip()
+        # A subquery-with-alias (e.g. `(SELECT …) x`) is wrapped as an
+        # Identifier whose text starts with `(`.
+        if name.startswith("("):
+            raise ValueError("subqueries in FROM are not supported")
+        return name
+    raise ValueError(
+        f"could not parse table reference after FROM: {str(t)!r}"
+    )
 
 
 def _iter_tokens(node) -> Iterator[object]:
@@ -229,83 +244,62 @@ def _extract_date_trunc(stmt: Statement) -> tuple[str, str]:
 
 
 def _read_date_trunc_args(fn: Function) -> tuple[str, str]:
-    """Return (granularity_literal, column_name) from a date_trunc Function."""
-    paren = next((t for t in fn.tokens if isinstance(t, Parenthesis)), None)
-    if paren is None:
-        raise ValueError("malformed date_trunc call")
-    parts: list = []
-    for t in paren.tokens:
-        if t.ttype is Whitespace:
-            continue
-        if t.ttype is Punctuation and str(t) in ("(", ")", ","):
-            continue
-        if isinstance(t, IdentifierList):
-            for inner in t.tokens:
-                if inner.ttype is Whitespace:
-                    continue
-                if inner.ttype is Punctuation and str(inner) in (",",):
-                    continue
-                parts.append(inner)
-        else:
-            parts.append(t)
-    if len(parts) < 2:
-        raise ValueError("date_trunc requires two arguments: granularity and column")
-    first, second = parts[0], parts[1]
-    g_raw = str(first).strip()
-    if not (g_raw.startswith("'") and g_raw.endswith("'")):
+    """Return (granularity_literal, column_name) from a date_trunc Function.
+
+    sqlparse has already identified this token as a function call named
+    ``date_trunc``; we just pull the two arguments out of its source text.
+    The regex requires a string-literal first arg and a bare-identifier
+    second arg — the same shape the old token-walker accepted — which
+    also admits Trino reserved words (``minute``, ``hour``, …) as
+    unquoted column names.
+    """
+    m = _DATE_TRUNC_RE.fullmatch(str(fn))
+    if not m:
         raise ValueError(
-            f"first argument to date_trunc must be a string literal, got {g_raw!r}"
+            f"malformed date_trunc call {str(fn)!r}; "
+            "expected date_trunc('<granularity>', <column>)"
         )
-    g = g_raw[1:-1].lower()
-    if isinstance(second, Identifier):
-        col = second.get_real_name()
-    elif second.ttype is Name:
-        col = str(second)
-    elif second.ttype in Keyword and IDENTIFIER_RE.match(str(second)):
-        # sqlparse tokenizes reserved-word column names (minute, hour, day,
-        # week, …) as Keyword tokens instead of Name/Identifier.  Trino
-        # accepts these as unquoted column identifiers (verified against
-        # Trino 465+) so we do the same.  The regex rules out multi-token
-        # keyword expressions like "GROUP BY" or quoted strings.
-        col = str(second)
-    else:
-        raise ValueError(
-            "second argument to date_trunc must be a bare column name; "
-            f"got {str(second)!r}"
-        )
-    return g, col
+    return m.group(1).lower(), m.group(2)
+
+
+def _clause_items(tokens: list, start_idx: int, stop_keywords: frozenset[str]) -> list:
+    """Collect items after ``tokens[start_idx]`` up to a stop keyword (or end).
+
+    Flattens a single trailing ``IdentifierList`` into its children so the
+    caller gets a uniform list regardless of whether sqlparse chose to group
+    comma-separated items.
+    """
+    items = []
+    for t in tokens[start_idx + 1:]:
+        if t.is_whitespace or not str(t).strip():
+            continue
+        if t.ttype is Keyword and t.normalized.upper() in stop_keywords:
+            break
+        items.append(t)
+    if len(items) == 1 and isinstance(items[0], IdentifierList):
+        return [
+            it for it in items[0].tokens
+            if not it.is_whitespace
+            and it.ttype is not Punctuation
+            and str(it).strip()
+        ]
+    return items
 
 
 def _projection_list(stmt: Statement) -> list:
-    """Return the list of projection items (between SELECT and FROM).
-
-    Each item is the bare sqlparse token (Identifier / Function / Token).
-    """
+    """Return the list of projection items (between SELECT and FROM)."""
     tokens = list(stmt.tokens)
     select_idx = next(
-        (i for i, t in enumerate(tokens) if t.ttype is DML and t.normalized.upper() == "SELECT"),
+        (i for i, t in enumerate(tokens)
+         if t.ttype is DML and t.normalized.upper() == "SELECT"),
         None,
     )
-    from_idx = next(
-        (i for i, t in enumerate(tokens) if t.ttype is Keyword and t.normalized.upper() == "FROM"),
-        None,
-    )
-    if select_idx is None or from_idx is None:
+    if select_idx is None:
         raise ValueError("query must be of the form SELECT ... FROM ...")
-    proj_tokens = [
-        t
-        for t in tokens[select_idx + 1:from_idx]
-        if t.ttype not in (Whitespace,) and str(t).strip()
-    ]
-    if not proj_tokens:
+    items = _clause_items(tokens, select_idx, frozenset({"FROM"}))
+    if not items:
         raise ValueError("SELECT list is empty")
-    if len(proj_tokens) == 1 and isinstance(proj_tokens[0], IdentifierList):
-        return [
-            it
-            for it in proj_tokens[0].tokens
-            if it.ttype not in (Whitespace, Punctuation) and str(it).strip()
-        ]
-    return proj_tokens
+    return items
 
 
 def _projection_alias(item) -> str:
@@ -337,45 +331,20 @@ def _projection_alias(item) -> str:
     raise ValueError(f"cannot determine output name for projection item {str(item)!r}")
 
 
+_AFTER_GROUP_BY = frozenset({"HAVING", "ORDER BY", "LIMIT", "OFFSET", "FETCH"})
+
+
 def _extract_merge_keys(stmt: Statement) -> tuple[str, ...]:
     """Resolve GROUP BY items against the projection; return aliases."""
     tokens = list(stmt.tokens)
     gb_idx = next(
-        (
-            i
-            for i, t in enumerate(tokens)
-            if t.ttype is Keyword and t.normalized.upper() == "GROUP BY"
-        ),
+        (i for i, t in enumerate(tokens)
+         if t.ttype is Keyword and t.normalized.upper() == "GROUP BY"),
         None,
     )
     if gb_idx is None:
         raise ValueError("GROUP BY clause missing")
-
-    # Collect items after GROUP BY, stopping at the next keyword
-    gb_tokens = []
-    for t in tokens[gb_idx + 1:]:
-        if t.ttype is Whitespace or not str(t).strip():
-            continue
-        if t.ttype is Keyword and t.normalized.upper() in (
-            "HAVING",
-            "ORDER BY",
-            "LIMIT",
-            "OFFSET",
-            "FETCH",
-        ):
-            break
-        gb_tokens.append(t)
-
-    items: list = []
-    if len(gb_tokens) == 1 and isinstance(gb_tokens[0], IdentifierList):
-        for t in gb_tokens[0].tokens:
-            if t.ttype in (Whitespace, Punctuation):
-                continue
-            if not str(t).strip():
-                continue
-            items.append(t)
-    else:
-        items = gb_tokens
+    items = _clause_items(tokens, gb_idx, _AFTER_GROUP_BY)
 
     projection = _projection_list(stmt)
     proj_aliases = [_projection_alias(p) for p in projection]
@@ -449,50 +418,3 @@ def _build_range_predicate(col: str, start: datetime, end: datetime) -> str:
     )
 
 
-def _find_where(stmt: Statement) -> Where | None:
-    for t in stmt.tokens:
-        if isinstance(t, Where):
-            return t
-    return None
-
-
-def _append_to_where(where: Where, predicate: str) -> None:
-    """Append `` AND (<predicate>)`` to an existing WHERE, preserving any
-    trailing whitespace that separates it from the next clause.
-    """
-    # Move trailing-whitespace tokens out so we insert before them.
-    # (Whitespace ttype may be the Newline subtype — `in` does a hierarchy check.)
-    trailing: list = []
-    while where.tokens and where.tokens[-1].ttype in Whitespace:
-        trailing.insert(0, where.tokens.pop())
-    where.tokens.append(Token(Whitespace, " "))
-    where.tokens.append(Token(Keyword, "AND"))
-    where.tokens.append(Token(Whitespace, " "))
-    where.tokens.append(Token(None, predicate))
-    if trailing:
-        where.tokens.extend(trailing)
-    else:
-        where.tokens.append(Token(Whitespace, " "))
-
-
-def _insert_new_where(stmt: Statement, predicate: str) -> None:
-    """Insert a new WHERE clause between FROM and GROUP BY / HAVING / ORDER / LIMIT."""
-    insert_idx = None
-    for i, t in enumerate(stmt.tokens):
-        if t.ttype is Keyword and t.normalized.upper() in (
-            "GROUP BY",
-            "HAVING",
-            "ORDER BY",
-            "LIMIT",
-            "OFFSET",
-            "FETCH",
-        ):
-            insert_idx = i
-            break
-    if insert_idx is None:
-        insert_idx = len(stmt.tokens)
-
-    where_str = f"WHERE {predicate} "
-    where_tok = Token(None, where_str)
-    # Pad so the WHERE sits on its own line visually
-    stmt.tokens.insert(insert_idx, where_tok)
