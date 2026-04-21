@@ -212,3 +212,120 @@ def test_save_views_creates_parent_dirs(tmp_path):
     views_path = tmp_path / "data" / "views.yaml"
     save_views([], views_path)
     assert views_path.exists()
+
+
+# ── full_refresh_chunk ──
+
+
+def _views_yaml_with_chunk(view_granularity: str, chunk: str | None) -> str:
+    """Build a minimal views.yaml with `date_trunc(view_granularity, ts)` and
+    optional full_refresh_chunk."""
+    lines = [
+        "views:",
+        "  - name: v",
+        f"    query: \"SELECT date_trunc('{view_granularity}', ts) AS d FROM t GROUP BY 1\"",
+    ]
+    if chunk is not None:
+        lines.append(f"    full_refresh_chunk: {chunk}")
+    return "\n".join(lines) + "\n"
+
+
+def test_full_refresh_chunk_defaults_to_none(tmp_path):
+    views = load_views(write_views(tmp_path, _views_yaml_with_chunk("day", None)))
+    assert views[0].full_refresh_chunk is None
+
+
+def test_full_refresh_chunk_valid(tmp_path):
+    views = load_views(write_views(tmp_path, _views_yaml_with_chunk("minute", "day")))
+    assert views[0].full_refresh_chunk == "day"
+
+
+def test_full_refresh_chunk_rejects_invalid_granularity(tmp_path):
+    with pytest.raises(ValueError, match="not a valid granularity"):
+        load_views(write_views(tmp_path, _views_yaml_with_chunk("day", "fortnight")))
+
+
+@pytest.mark.parametrize("view_g, chunk_g", [
+    # chunk finer than view — would split GROUP BY buckets
+    ("day", "hour"),
+    ("hour", "minute"),
+    ("month", "day"),
+    # week does not divide month, month does not divide week
+    ("week", "month"),
+    ("month", "week"),
+    ("week", "quarter"),
+    ("quarter", "week"),
+])
+def test_full_refresh_chunk_rejects_incompatible(tmp_path, view_g, chunk_g):
+    with pytest.raises(ValueError, match="not compatible"):
+        load_views(write_views(tmp_path, _views_yaml_with_chunk(view_g, chunk_g)))
+
+
+@pytest.mark.parametrize("view_g, chunk_g", [
+    ("minute", "minute"),
+    ("minute", "hour"),
+    ("minute", "day"),
+    ("hour", "day"),
+    ("day", "day"),
+    ("day", "week"),
+    ("day", "month"),
+    ("week", "week"),
+    ("month", "month"),
+    ("month", "quarter"),
+    ("month", "year"),
+    ("quarter", "year"),
+    ("year", "year"),
+])
+def test_full_refresh_chunk_accepts_compatible(tmp_path, view_g, chunk_g):
+    views = load_views(write_views(tmp_path, _views_yaml_with_chunk(view_g, chunk_g)))
+    assert views[0].full_refresh_chunk == chunk_g
+
+
+def test_full_refresh_chunk_round_trip(tmp_path):
+    views = [ViewConfig(
+        name="v",
+        query="SELECT date_trunc('minute', ts) AS d FROM t GROUP BY 1",
+        full_refresh_chunk="day",
+    )]
+    views_path = tmp_path / "views.yaml"
+    save_views(views, views_path)
+    loaded = load_views(views_path)
+    assert loaded[0].full_refresh_chunk == "day"
+
+
+def test_save_views_omits_full_refresh_chunk_when_none(tmp_path):
+    """Views without chunked refresh must not emit a spurious
+    ``full_refresh_chunk`` key in the YAML."""
+    views = [ViewConfig(
+        name="v",
+        query="SELECT date_trunc('minute', ts) AS d FROM t GROUP BY 1",
+    )]
+    views_path = tmp_path / "views.yaml"
+    save_views(views, views_path)
+    yaml_text = views_path.read_text()
+    assert "full_refresh_chunk" not in yaml_text
+
+
+def test_full_refresh_chunk_rejects_view_without_direct_bucket_projection(tmp_path):
+    """``full_refresh_chunk`` requires a direct ``date_trunc(g, col) AS <alias>``
+    projection so the target has a column the executor can read as the
+    resume point. A wrapped expression is rejected only when chunking is
+    enabled."""
+    wrapped = (
+        "views:\n  - name: v\n"
+        "    query: \"SELECT from_iso8601_date(CAST(date_trunc('day', ts) AS varchar)) AS d FROM t GROUP BY 1\"\n"
+        "    full_refresh_chunk: day\n"
+    )
+    with pytest.raises(ValueError, match="direct projection"):
+        load_views(write_views(tmp_path, wrapped))
+
+
+def test_wrapped_date_trunc_accepted_without_chunk(tmp_path):
+    """A view whose date_trunc is wrapped is accepted when chunking is OFF
+    (it just can't use the chunked-backfill path)."""
+    wrapped = (
+        "views:\n  - name: v\n"
+        "    query: \"SELECT from_iso8601_date(CAST(date_trunc('day', ts) AS varchar)) AS d FROM t GROUP BY 1\"\n"
+    )
+    views = load_views(write_views(tmp_path, wrapped))
+    assert views[0].full_refresh_chunk is None

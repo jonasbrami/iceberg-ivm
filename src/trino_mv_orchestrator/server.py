@@ -30,6 +30,7 @@ from trino_mv_orchestrator.config import (
 from trino_mv_orchestrator.detector import RefreshAction, detect_changes
 from trino_mv_orchestrator.executor import (
     QueryInfo,
+    execute_chunked_full_refresh,
     execute_full_refresh,
     execute_incremental_refresh,
 )
@@ -272,9 +273,20 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
             return
 
         if result.action == RefreshAction.FULL_REFRESH:
-            refresh_result = await execute_full_refresh(cursor, view, target_table)
-            vs.last_action = "full"
-            vs.last_range = None
+            if view.full_refresh_chunk:
+                def _set_range(rng: tuple) -> None:
+                    vs.last_range = f"[{rng[0]}, {rng[1]})"
+                refresh_result = await execute_chunked_full_refresh(
+                    cursor, view, target_table, parsed, value_columns,
+                    chunk_granularity=view.full_refresh_chunk,
+                    should_stop=lambda: s._stop,
+                    on_chunk=_set_range,
+                )
+                vs.last_action = "chunked_full"
+            else:
+                refresh_result = await execute_full_refresh(cursor, view, target_table)
+                vs.last_action = "full"
+                vs.last_range = None
             REFRESH_TOTAL.labels(view=view.name, type="full").inc()
         else:
             refresh_result = await execute_incremental_refresh(
@@ -285,6 +297,15 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
             vs.last_action = "incremental"
             vs.last_range = f"[{result.filter_range[0]}, {result.filter_range[1]})"
             REFRESH_TOTAL.labels(view=view.name, type="incremental").inc()
+
+        # Chunked refresh may stop mid-backfill on graceful shutdown. In
+        # that case leave last_source_snapshot unset so the next tick
+        # resumes from target metadata.
+        if refresh_result.interrupted:
+            vs.last_refresh = time.time()
+            vs.last_duration = refresh_result.elapsed
+            vs.recent_queries = (refresh_result.queries + vs.recent_queries)[:RECENT_QUERY_LIMIT]
+            return
 
         await write_last_snapshot(cursor, target_table, result.current_snapshot)
 

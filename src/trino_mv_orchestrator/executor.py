@@ -5,9 +5,16 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Callable
 
 from trino_mv_orchestrator.config import ViewConfig
-from trino_mv_orchestrator.query_parser import inject_range_filter
+from trino_mv_orchestrator.detector import (
+    expand_to_bucket_bounds,
+    get_source_column_range,
+    get_target_bucket_max,
+    walk_buckets,
+)
+from trino_mv_orchestrator.query_parser import ParsedView, inject_range_filter
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +42,10 @@ class RefreshResult:
     processed_rows: int = 0
     processed_bytes: int = 0
     queries: list[QueryInfo] = field(default_factory=list)
+    # Set by ``execute_chunked_full_refresh`` when ``should_stop`` tripped
+    # between chunks. The caller uses this to skip ``write_last_snapshot``
+    # so the next tick resumes from target metadata.
+    interrupted: bool = False
 
 
 def _extract_stats(cursor) -> dict:
@@ -155,3 +166,98 @@ async def execute_incremental_refresh(
         processed_bytes=merge_q.processed_bytes,
         queries=[merge_q],
     )
+
+
+async def execute_chunked_full_refresh(
+    cursor,
+    view: ViewConfig,
+    target_table: str,
+    parsed: ParsedView,
+    value_columns: list[str],
+    *,
+    chunk_granularity: str,
+    should_stop: Callable[[], bool] = lambda: False,
+    on_chunk: Callable[[tuple[datetime, datetime]], None] = lambda _: None,
+) -> RefreshResult:
+    """Chunked first-run full refresh.
+
+    Walks the source's ``filter_column`` range one ``chunk_granularity``
+    bucket at a time, emitting a MERGE per chunk. MERGE (not INSERT) so
+    that a client-side retry that double-commits the same chunk matches
+    all rows on the second run and updates to identical values rather
+    than appending duplicates.
+
+    Resume: the next chunk to run is derived from the target's own Iceberg
+    ``$files`` metadata — specifically ``max(parsed.bucket_alias)``. Trino
+    INSERTs/MERGEs into Iceberg commit as atomic single snapshots, so
+    target metadata is a crash-safe authoritative record of completed
+    chunks. No orchestrator-side cursor state.
+
+    Returns ``RefreshResult`` with per-chunk ``QueryInfo`` in ``queries``.
+    Sets ``interrupted=True`` and returns early if ``should_stop()`` fires
+    between chunks.
+    """
+    start_time = time.monotonic()
+    assert parsed.bucket_alias is not None, (
+        "execute_chunked_full_refresh requires parsed.bucket_alias; "
+        "config validation should have rejected this view"
+    )
+
+    source_range = await get_source_column_range(
+        cursor, parsed.source_table, parsed.filter_column,
+    )
+    if source_range is None:
+        log.info("%s: source %s is empty, nothing to backfill",
+                 view.name, parsed.source_table)
+        return RefreshResult(elapsed=time.monotonic() - start_time)
+
+    backfill_start, backfill_end = expand_to_bucket_bounds(
+        source_range[0], source_range[1], chunk_granularity,
+    )
+
+    target_max = await get_target_bucket_max(
+        cursor, target_table, parsed.bucket_alias,
+    )
+    if target_max is None:
+        resume = backfill_start
+    else:
+        # Snap the last committed bucket upward to the next chunk boundary.
+        resume = expand_to_bucket_bounds(target_max, target_max, chunk_granularity)[1]
+
+    log.info(
+        "%s: chunked full refresh — %s in [%s, %s), chunk=%s, resume=%s",
+        view.name, parsed.filter_column, backfill_start, backfill_end,
+        chunk_granularity, resume,
+    )
+
+    result = RefreshResult(elapsed=0.0)
+    for chunk_start, chunk_end in walk_buckets(resume, backfill_end, chunk_granularity):
+        source_query = inject_range_filter(
+            view.query, parsed.filter_column, chunk_start, chunk_end,
+        )
+        merge_sql = build_merge_sql(
+            target_table, source_query, parsed.merge_keys, value_columns,
+        )
+        log.info(
+            "%s: chunk [%s, %s) — MERGE", view.name, chunk_start, chunk_end,
+        )
+        q = await _execute_tracked(cursor, merge_sql, stage="chunk_merge")
+        result.queries.append(q)
+        result.processed_rows += q.processed_rows
+        result.processed_bytes += q.processed_bytes
+        on_chunk((chunk_start, chunk_end))
+        if should_stop():
+            log.info("%s: chunked refresh interrupted after [%s, %s)",
+                     view.name, chunk_start, chunk_end)
+            result.interrupted = True
+            break
+
+    result.elapsed = time.monotonic() - start_time
+    log.info(
+        "%s: chunked full refresh %s (%.1fs, %d chunks, %d rows, %d bytes)",
+        view.name,
+        "interrupted" if result.interrupted else "complete",
+        result.elapsed, len(result.queries),
+        result.processed_rows, result.processed_bytes,
+    )
+    return result

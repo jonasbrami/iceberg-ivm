@@ -32,6 +32,7 @@ class TestParseViewQuery:
             filter_column="ts",
             granularity="week",
             merge_keys=("symbol", "week"),
+            bucket_alias="week",
         )
 
     @pytest.mark.parametrize("granularity", sorted(VALID_GRANULARITIES))
@@ -233,6 +234,55 @@ class TestRejections:
             parse_view_query(
                 "SELECT date_trunc('millennium', ts) AS m FROM t GROUP BY 1"
             )
+
+
+# ---------------------------------------------------------------------------
+# bucket_alias
+# ---------------------------------------------------------------------------
+
+
+class TestBucketAlias:
+    def test_simple(self):
+        p = parse_view_query(
+            "SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1"
+        )
+        assert p.bucket_alias == "d"
+
+    def test_among_other_projections(self):
+        p = parse_view_query(
+            "SELECT symbol, date_trunc('hour', ts) AS bucket, sum(x) AS s "
+            "FROM t GROUP BY 1, 2"
+        )
+        assert p.bucket_alias == "bucket"
+
+    def test_reserved_word_alias(self):
+        """A Trino reserved word as alias still becomes a string."""
+        p = parse_view_query(
+            "SELECT date_trunc('minute', time) AS minute FROM t GROUP BY 1"
+        )
+        assert p.bucket_alias == "minute"
+
+    def test_chained_mv(self):
+        """date_trunc('hour', minute) AS hour — alias, not the source column."""
+        p = parse_view_query(
+            "SELECT date_trunc('hour', minute) AS hour FROM t GROUP BY 1"
+        )
+        assert p.bucket_alias == "hour"
+
+    def test_none_when_nested_inside_another_function(self):
+        """If ``date_trunc`` only appears inside another function, there is
+        no direct projection to alias, so ``bucket_alias`` is ``None``.
+        Config validation rejects such views only when ``full_refresh_chunk``
+        is set (see test_config.py); they remain valid otherwise."""
+        p = parse_view_query(
+            "SELECT from_iso8601_date(CAST(date_trunc('day', ts) AS varchar)) AS d "
+            "FROM t GROUP BY 1"
+        )
+        # date_trunc still detected by _extract_date_trunc, but no direct
+        # projection item equals date_trunc('day', ts) so bucket_alias is None.
+        assert p.granularity == "day"
+        assert p.filter_column == "ts"
+        assert p.bucket_alias is None
 
 
 # ---------------------------------------------------------------------------

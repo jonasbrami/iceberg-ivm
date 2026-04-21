@@ -58,6 +58,13 @@ class ParsedView:
     filter_column: str
     granularity: str
     merge_keys: tuple[str, ...]
+    # Alias of the ``date_trunc(granularity, filter_column)`` projection
+    # item, if one exists as a direct projection. ``None`` if the
+    # expression appears only nested inside another function (rare but
+    # accepted). Required by the chunked full-refresh path, which reads
+    # ``max(bucket_alias)`` from the target; the config validator
+    # enforces presence when ``full_refresh_chunk`` is set.
+    bucket_alias: str | None
 
 
 def parse_view_query(sql: str) -> ParsedView:
@@ -71,11 +78,13 @@ def parse_view_query(sql: str) -> ParsedView:
     source_table = _extract_source_table(stmt)
     granularity, filter_column = _extract_date_trunc(stmt)
     merge_keys = _extract_merge_keys(stmt)
+    bucket_alias = _extract_bucket_alias(stmt, granularity, filter_column)
     return ParsedView(
         source_table=source_table,
         filter_column=filter_column,
         granularity=granularity,
         merge_keys=merge_keys,
+        bucket_alias=bucket_alias,
     )
 
 
@@ -379,6 +388,30 @@ def _extract_merge_keys(stmt: Statement) -> tuple[str, ...]:
     if not keys:
         raise ValueError("GROUP BY is empty")
     return tuple(keys)
+
+
+def _extract_bucket_alias(
+    stmt: Statement, granularity: str, filter_column: str
+) -> str | None:
+    """Return the projection alias for ``date_trunc(granularity, filter_column)``,
+    or ``None`` if the expression appears only nested inside another function
+    (e.g. ``foo(date_trunc('day', ts))``) and has no direct projection.
+    """
+    for item in _projection_list(stmt):
+        fn = item if isinstance(item, Function) else None
+        if fn is None and isinstance(item, Identifier):
+            first = item.token_first(skip_cm=True)
+            if isinstance(first, Function):
+                fn = first
+        if fn is None or (fn.get_real_name() or "").lower() != "date_trunc":
+            continue
+        try:
+            g, col = _read_date_trunc_args(fn)
+        except ValueError:
+            continue
+        if g == granularity and col == filter_column:
+            return _projection_alias(item)
+    return None
 
 
 def _canonical(tok) -> str:

@@ -11,6 +11,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
+from typing import Iterator
 
 log = logging.getLogger(__name__)
 
@@ -196,6 +197,80 @@ async def get_new_files_column_range(
     return (min(lows), max(highs))
 
 
+def _iter_column_bounds(
+    rows: list, column: str,
+) -> tuple[list[datetime], list[datetime], bool]:
+    """Extract ``(lower_bounds, upper_bounds, saw_column)`` from a list of
+    ``(readable_metrics,)`` rows. ``saw_column`` is True iff at least one
+    file's metrics included ``column`` — distinguishes "no files" from
+    "files exist but column is absent" for missing-column detection.
+    """
+    lows: list[datetime] = []
+    highs: list[datetime] = []
+    saw = False
+    for (metrics_raw,) in rows:
+        if metrics_raw is None:
+            continue
+        metrics = metrics_raw if isinstance(metrics_raw, dict) else json.loads(metrics_raw)
+        col = metrics.get(column)
+        if col is None:
+            continue
+        saw = True
+        lb = col.get("lower_bound")
+        ub = col.get("upper_bound")
+        if lb is not None:
+            lows.append(_parse_ts(str(lb)))
+        if ub is not None:
+            highs.append(_parse_ts(str(ub)))
+    return lows, highs, saw
+
+
+async def get_source_column_range(
+    cursor, source_table: str, filter_column: str,
+) -> tuple[datetime, datetime] | None:
+    """Read ``(min, max)`` of ``filter_column`` across all live files in the
+    current snapshot of ``source_table``.
+
+    Uses ``$files.readable_metrics`` — this returns the live file set of
+    the current snapshot, not per-commit manifest rows. Metadata-only.
+    Raises ``MissingFilterColumnError`` if files exist but none carry
+    ``filter_column`` metrics. Returns ``None`` for empty tables.
+    """
+    await cursor.execute(
+        f"SELECT readable_metrics FROM {system_table(source_table, 'files')}"
+    )
+    rows = await cursor.fetchall()
+    if not rows:
+        return None
+    lows, highs, saw = _iter_column_bounds(rows, filter_column)
+    if not saw:
+        raise MissingFilterColumnError(source_table, filter_column)
+    if not lows or not highs:
+        return None
+    return (min(lows), max(highs))
+
+
+async def get_target_bucket_max(
+    cursor, target_table: str, bucket_alias: str,
+) -> datetime | None:
+    """Read the max ``upper_bound`` of ``bucket_alias`` across live files in
+    ``target_table``.
+
+    The chunked full-refresh uses this as its resume point: the target's
+    own Iceberg metadata, rather than a separate cursor key, records what
+    has been committed. Returns ``None`` for an empty target or one whose
+    files carry no bounds on ``bucket_alias`` yet.
+    """
+    await cursor.execute(
+        f"SELECT readable_metrics FROM {system_table(target_table, 'files')}"
+    )
+    rows = await cursor.fetchall()
+    if not rows:
+        return None
+    _, highs, _ = _iter_column_bounds(rows, bucket_alias)
+    return max(highs) if highs else None
+
+
 def _parse_ts(value: str) -> datetime:
     """Parse an Iceberg readable_metrics timestamp to a datetime.
 
@@ -217,6 +292,45 @@ def _add_months(dt: datetime, n: int) -> datetime:
     # dt is assumed to be the first of a month; add n months with year rollover.
     idx = (dt.year * 12 + dt.month - 1) + n
     return dt.replace(year=idx // 12, month=(idx % 12) + 1)
+
+
+_FIXED_STEP = {
+    "minute": timedelta(minutes=1),
+    "hour": timedelta(hours=1),
+    "day": timedelta(days=1),
+    "week": timedelta(weeks=1),
+}
+
+
+def walk_buckets(
+    start: datetime, end: datetime, granularity: str,
+) -> Iterator[tuple[datetime, datetime]]:
+    """Yield half-open ``[chunk_start, chunk_end)`` intervals stepping one
+    ``granularity`` bucket at a time from ``start`` (inclusive) to ``end``
+    (exclusive).
+
+    ``start`` and ``end`` are expected to already be aligned to
+    ``granularity`` boundaries (the caller snaps them via
+    ``expand_to_bucket_bounds``). If ``start >= end``, yields nothing.
+    """
+    if start >= end:
+        return
+    if granularity in _FIXED_STEP:
+        step = _FIXED_STEP[granularity]
+        cur = start
+        while cur < end:
+            nxt = cur + step
+            yield (cur, min(nxt, end))
+            cur = nxt
+        return
+    months = {"month": 1, "quarter": 3, "year": 12}.get(granularity)
+    if months is None:
+        raise ValueError(f"unsupported granularity: {granularity}")
+    cur = start
+    while cur < end:
+        nxt = _add_months(cur, months)
+        yield (cur, min(nxt, end))
+        cur = nxt
 
 
 def expand_to_bucket_bounds(
