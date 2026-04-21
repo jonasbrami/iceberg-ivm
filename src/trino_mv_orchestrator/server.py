@@ -21,11 +21,11 @@ from pydantic import BaseModel, field_validator
 from trino_mv_orchestrator.config import (
     Config,
     ViewConfig,
-    _validate_identifier,
-    _validate_qualified_name,
     load_config,
     load_views,
     save_views,
+    validate_identifier,
+    validate_qualified_name,
 )
 from trino_mv_orchestrator.detector import RefreshAction, detect_changes
 from trino_mv_orchestrator.executor import (
@@ -75,9 +75,15 @@ SOURCE_SNAPSHOT = Gauge(
 
 
 def _parse_table_labels(table: str) -> dict[str, str]:
-    """Split a qualified table name into a Prometheus label dict."""
-    parts = (["", ""] + table.split("."))[-3:]
-    return dict(zip(("catalog", "schema", "table"), parts))
+    """Split a qualified table name into a Prometheus label dict.
+
+    Missing leading parts (bare ``tbl`` or ``schema.tbl``) become empty
+    strings so the label set keeps a stable shape.
+    """
+    parts = table.split(".")
+    padded = [""] * (3 - len(parts)) + parts
+    catalog, schema, tbl = padded[-3:]
+    return {"catalog": catalog, "schema": schema, "table": tbl}
 
 
 # ── Application state ──
@@ -433,14 +439,14 @@ class ViewCreate(BaseModel):
     @field_validator("name")
     @classmethod
     def validate_name(cls, v: str) -> str:
-        _validate_identifier(v, "name")
+        validate_identifier(v, "name")
         return v
 
     @field_validator("target_table")
     @classmethod
     def validate_target_table(cls, v: str | None) -> str | None:
         if v is not None:
-            _validate_qualified_name(v, "target_table")
+            validate_qualified_name(v, "target_table")
         return v
 
 

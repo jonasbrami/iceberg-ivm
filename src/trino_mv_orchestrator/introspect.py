@@ -22,18 +22,11 @@ async def discover_columns(cursor, query: str) -> list[ColumnInfo]:
 
 def build_create_table_sql(
     target_table: str,
-    columns: list[ColumnInfo] | list[tuple[str, str]],
+    columns: list[ColumnInfo],
     partitioning: str | None = None,
 ) -> str:
     """Generate CREATE TABLE IF NOT EXISTS DDL for the target table."""
-    cols = []
-    for c in columns:
-        if isinstance(c, ColumnInfo):
-            cols.append(f"{c.name} {c.type}")
-        else:
-            cols.append(f"{c[0]} {c[1]}")
-
-    col_str = ",\n  ".join(cols)
+    col_str = ",\n  ".join(f"{c.name} {c.type}" for c in columns)
     sql = f"CREATE TABLE IF NOT EXISTS {target_table} (\n  {col_str}\n)"
     props = ["format = 'PARQUET'"]
     if partitioning:

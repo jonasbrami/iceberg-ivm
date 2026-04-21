@@ -67,12 +67,6 @@ class TestBuildCreateTableSql:
         assert "format = 'PARQUET'" in sql
         assert "partitioning" not in sql
 
-    def test_with_tuples(self):
-        cols = [("a", "int"), ("b", "double")]
-        sql = build_create_table_sql("t", cols)
-        assert "a int" in sql
-        assert "b double" in sql
-
     def test_with_partitioning(self):
         cols = [ColumnInfo("ts", "timestamp(6)")]
         sql = build_create_table_sql("t", cols, "ARRAY['day(ts)']")
