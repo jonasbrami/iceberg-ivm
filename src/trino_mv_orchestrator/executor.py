@@ -5,7 +5,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable
+from typing import Awaitable, Callable
 
 from trino_mv_orchestrator.config import ViewConfig
 from trino_mv_orchestrator.detector import (
@@ -193,7 +193,7 @@ async def execute_chunked_full_refresh(
     *,
     chunk_granularity: str,
     should_stop: Callable[[], bool] = lambda: False,
-    on_chunk: Callable[[ChunkProgress], None] = lambda _: None,
+    on_chunk: Callable[[ChunkProgress], Awaitable[None]] | None = None,
 ) -> RefreshResult:
     """Chunked first-run full refresh.
 
@@ -268,12 +268,13 @@ async def execute_chunked_full_refresh(
         result.queries.append(q)
         result.processed_rows += q.processed_rows
         result.processed_bytes += q.processed_bytes
-        on_chunk(ChunkProgress(
-            chunk_range=(chunk_start, chunk_end),
-            query=q,
-            chunks_done=i,
-            chunks_total=total,
-        ))
+        if on_chunk is not None:
+            await on_chunk(ChunkProgress(
+                chunk_range=(chunk_start, chunk_end),
+                query=q,
+                chunks_done=i,
+                chunks_total=total,
+            ))
         if should_stop():
             log.info("%s: chunked refresh interrupted after [%s, %s)",
                      view.name, chunk_start, chunk_end)

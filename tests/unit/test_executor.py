@@ -348,11 +348,15 @@ class TestExecuteChunkedFullRefresh:
         )
         from trino_mv_orchestrator.executor import ChunkProgress
         captured: list[ChunkProgress] = []
+
+        async def _capture(p: ChunkProgress) -> None:
+            captured.append(p)
+
         r = await execute_chunked_full_refresh(
             cursor, view, "iceberg.out.mv", parsed,
             value_columns=["volume"],
             chunk_granularity="day",
-            on_chunk=captured.append,
+            on_chunk=_capture,
         )
         assert len(captured) == len(r.queries) == 2
         # Range bookkeeping — first chunk starts at source min, last chunk ends
@@ -391,7 +395,7 @@ class TestExecuteChunkedFullRefresh:
         def _stop() -> bool:
             return stop_flag["tripped"]
 
-        def _capture(p: ChunkProgress) -> None:
+        async def _capture(p: ChunkProgress) -> None:
             captured.append(p)
             stop_flag["tripped"] = True
 
