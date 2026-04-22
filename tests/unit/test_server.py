@@ -175,6 +175,76 @@ def test_delete_not_found(client):
     assert client.delete("/api/views/nope").status_code == 404
 
 
+# ── PUT /api/views/{name} — immutable query/name guard ──
+
+_EXISTING_QUERY = (
+    "SELECT date_trunc('day', ts) AS d, a\n"
+    "FROM iceberg.db.trades\n"
+    "GROUP BY 1, 2\n"
+)
+
+
+def test_update_view_accepts_mutable_field_change(client, setup_state):
+    """refresh_interval_seconds is mutable — PUT with the same query must succeed."""
+    r = client.put("/api/views/test_view", json={
+        "name": "test_view",
+        "query": _EXISTING_QUERY,
+        "refresh_interval_seconds": 300,
+    })
+    assert r.status_code == 200, r.text
+    assert r.json()["refresh_interval_seconds"] == 300
+    updated = next(v for v in setup_state.config.views if v.name == "test_view")
+    assert updated.refresh_interval_seconds == 300
+
+
+def test_update_view_rejects_query_change(client, setup_state):
+    """Changing the query would silently orphan materialized rows — must 422."""
+    r = client.put("/api/views/test_view", json={
+        "name": "test_view",
+        "query": "SELECT date_trunc('hour', ts) AS d FROM iceberg.db.trades GROUP BY 1",
+    })
+    assert r.status_code == 422
+    assert "query cannot be changed" in r.text
+    # State untouched
+    unchanged = next(v for v in setup_state.config.views if v.name == "test_view")
+    assert unchanged.query.strip() == _EXISTING_QUERY.strip()
+
+
+def test_update_view_rejects_name_change(client):
+    r = client.put("/api/views/test_view", json={
+        "name": "renamed",
+        "query": _EXISTING_QUERY,
+    })
+    assert r.status_code == 422
+    assert "name cannot be changed" in r.text
+
+
+def test_update_view_not_found(client):
+    r = client.put("/api/views/nope", json={
+        "name": "nope",
+        "query": _EXISTING_QUERY,
+    })
+    assert r.status_code == 404
+
+
+def test_update_view_whitespace_only_query_diff_is_accepted(client):
+    """A trailing-newline difference is not a semantic query change."""
+    r = client.put("/api/views/test_view", json={
+        "name": "test_view",
+        "query": _EXISTING_QUERY.strip(),
+        "refresh_interval_seconds": 90,
+    })
+    assert r.status_code == 200, r.text
+
+
+def test_view_schema_query_field_is_disabled_on_edit(client):
+    """The UI must lock the query field when editing — query changes are
+    semantically a delete+recreate, not an update."""
+    schema = client.get("/api/views/schema").json()
+    query_field = next(f for f in schema if f["name"] == "query")
+    assert query_field.get("disabled_on_edit") is True
+
+
 # ── full_refresh_chunk via the REST API (#32) ──
 
 _FULL_REFRESH_QUERY = (

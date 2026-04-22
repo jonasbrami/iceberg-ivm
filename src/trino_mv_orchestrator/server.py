@@ -628,7 +628,7 @@ VIEW_FORM_SCHEMA: list[dict] = [
          "source table, filter column, granularity and merge keys are "
          "derived automatically from the query."
      ),
-     "rows": 10},
+     "rows": 10, "disabled_on_edit": True},
     {"name": "target_table", "label": "Target Table", "type": "string", "required": False,
      "placeholder": "auto-generated", "group": "target"},
     {"name": "target_partitioning", "label": "Partitioning", "type": "string", "required": False,
@@ -745,6 +745,46 @@ def create_view(
     log.info("created view %r via API", body.name)
 
     return _view_to_response(new_view, s.view_statuses[body.name])
+
+
+@app.put("/api/views/{name}")
+def update_view(
+    name: str, body: ViewCreate, s: AppState = Depends(get_app_state),
+) -> ViewResponse:
+    """Update mutable fields of an existing view.
+
+    ``name`` and ``query`` are the view's identity — changing the query would
+    silently orphan already-materialized rows (the target table gets recreated
+    on the next refresh), so both are rejected here. To change either, delete
+    the view and recreate it.
+    """
+    if not s.config:
+        raise HTTPException(500, "config not loaded")
+    existing = next((v for v in s.config.views if v.name == name), None)
+    if not existing:
+        raise HTTPException(404, f"view '{name}' not found")
+    if body.name != name:
+        raise HTTPException(422, "name cannot be changed; delete and recreate the view instead")
+    if body.query.strip() != existing.query.strip():
+        raise HTTPException(422, "query cannot be changed; delete and recreate the view instead")
+
+    try:
+        validate_chunk_compatibility(body.full_refresh_chunk, body.query)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+
+    payload = body.model_dump()
+    if not payload.get("full_refresh_chunk"):
+        payload["full_refresh_chunk"] = None
+    updated = ViewConfig(**payload)
+    new_views = [updated if v.name == name else v for v in s.config.views]
+    new_cfg = Config(trino=s.config.trino, views=new_views, server=s.config.server)
+    save_views(new_views, s.views_path)
+    s.config = new_cfg
+    s.views_mtime = s.views_path.stat().st_mtime
+    log.info("updated view %r via API", name)
+
+    return _view_to_response(updated, s.view_statuses.get(name))
 
 
 @app.delete("/api/views/{name}", status_code=204)

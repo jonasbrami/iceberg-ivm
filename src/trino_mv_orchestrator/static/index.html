@@ -827,22 +827,14 @@ function app() {
       const body = this.buildBody();
 
       try {
-        if (this.editingView) {
-          await fetch(`/api/views/${this.editingView}`, { method: 'DELETE' });
-          const res = await fetch('/api/views', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-          });
-          if (!res.ok) { const e = await res.json(); throw new Error(e.detail); }
-        } else {
-          const res = await fetch('/api/views', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-          });
-          if (!res.ok) { const e = await res.json(); throw new Error(e.detail); }
-        }
+        const url = this.editingView ? `/api/views/${this.editingView}` : '/api/views';
+        const method = this.editingView ? 'PUT' : 'POST';
+        const res = await fetch(url, {
+          method,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!res.ok) { const e = await res.json(); throw new Error(e.detail); }
         this.showForm = false;
         await this.loadViews();
       } catch (e) {
