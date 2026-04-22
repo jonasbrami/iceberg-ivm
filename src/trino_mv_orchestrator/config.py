@@ -87,6 +87,40 @@ class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
 
 
+def validate_chunk_compatibility(chunk: str | None, query: str) -> None:
+    """Validate a ``full_refresh_chunk`` against a view's query.
+
+    No-op when ``chunk`` is ``None`` or empty string (the "single-shot"
+    marker used by the HTTP layer). Raises ``ValueError`` on any of:
+
+    - unknown granularity
+    - granularity that doesn't cleanly contain the view's own buckets
+    - view query missing a direct ``date_trunc(...) AS <alias>`` projection
+    """
+    if not chunk:
+        return
+    parsed = parse_view_query(query)
+    if chunk not in VALID_GRANULARITIES:
+        raise ValueError(
+            f"full_refresh_chunk: {chunk!r} is not a valid granularity; "
+            f"expected one of {sorted(VALID_GRANULARITIES)}"
+        )
+    allowed = _CHUNK_COMPATIBILITY[parsed.granularity]
+    if chunk not in allowed:
+        raise ValueError(
+            f"full_refresh_chunk: {chunk!r} is not compatible with the "
+            f"view's date_trunc granularity {parsed.granularity!r}; "
+            f"allowed values: {sorted(allowed)}"
+        )
+    if parsed.bucket_alias is None:
+        raise ValueError(
+            "full_refresh_chunk requires date_trunc("
+            f"{parsed.granularity!r}, {parsed.filter_column}) to appear "
+            "as a direct projection with an alias (the target needs a "
+            "column to read as the resume point)"
+        )
+
+
 def _parse_view(raw: dict) -> ViewConfig:
     missing = {"name", "query"} - raw.keys()
     if missing:
@@ -98,29 +132,10 @@ def _parse_view(raw: dict) -> ViewConfig:
 
     # Full query validation — source_table, filter_column, granularity,
     # merge_keys are all derived here at load time.  Raises on any violation.
-    parsed = parse_view_query(raw["query"])
+    parse_view_query(raw["query"])
 
     chunk = raw.get("full_refresh_chunk")
-    if chunk is not None:
-        if chunk not in VALID_GRANULARITIES:
-            raise ValueError(
-                f"full_refresh_chunk: {chunk!r} is not a valid granularity; "
-                f"expected one of {sorted(VALID_GRANULARITIES)}"
-            )
-        allowed = _CHUNK_COMPATIBILITY[parsed.granularity]
-        if chunk not in allowed:
-            raise ValueError(
-                f"full_refresh_chunk: {chunk!r} is not compatible with the "
-                f"view's date_trunc granularity {parsed.granularity!r}; "
-                f"allowed values: {sorted(allowed)}"
-            )
-        if parsed.bucket_alias is None:
-            raise ValueError(
-                "full_refresh_chunk requires date_trunc("
-                f"{parsed.granularity!r}, {parsed.filter_column}) to appear "
-                "as a direct projection with an alias (the target needs a "
-                "column to read as the resume point)"
-            )
+    validate_chunk_compatibility(chunk, raw["query"])
 
     return ViewConfig(
         name=raw["name"],

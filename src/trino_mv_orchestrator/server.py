@@ -24,11 +24,13 @@ from trino_mv_orchestrator.config import (
     load_config,
     load_views,
     save_views,
+    validate_chunk_compatibility,
     validate_identifier,
     validate_qualified_name,
 )
 from trino_mv_orchestrator.detector import RefreshAction, detect_changes
 from trino_mv_orchestrator.executor import (
+    ChunkProgress,
     QueryInfo,
     execute_chunked_full_refresh,
     execute_full_refresh,
@@ -74,6 +76,27 @@ SOURCE_SNAPSHOT = Gauge(
     ["view"],
 )
 
+# Per-chunk metrics for chunked first-run full refreshes. ``mv_refresh_total``
+# / ``mv_refresh_duration_seconds`` only tick once when the whole backfill
+# commits (often after hours), so on their own they give zero operational
+# visibility into an in-flight backfill. These counters and the histogram
+# fire once per committed chunk, giving Prometheus an honest throughput view.
+CHUNKS_COMPLETED = Counter(
+    "mv_chunks_completed_total",
+    "Completed chunks in a chunked full refresh",
+    ["view"],
+)
+CHUNK_DURATION = Histogram(
+    "mv_chunk_duration_seconds",
+    "Per-chunk merge duration in a chunked full refresh",
+    ["view"],
+)
+CHUNK_ROWS = Counter(
+    "mv_chunk_rows_written_total",
+    "Rows written per chunk in a chunked full refresh",
+    ["view", "catalog", "schema", "table"],
+)
+
 
 def _parse_table_labels(table: str) -> dict[str, str]:
     """Split a qualified table name into a Prometheus label dict.
@@ -102,6 +125,12 @@ class ViewStatus:
     last_error: str | None = None
     total_refreshes: int = 0
     total_errors: int = 0
+    # Chunked-backfill progress. ``chunks_total`` is populated while a chunked
+    # refresh is in-flight and cleared when it commits cleanly. Kept orthogonal
+    # to ``total_refreshes`` (still "one refresh event ↔ one committed refresh")
+    # so existing consumers of the counter are not broken.
+    chunks_done: int = 0
+    chunks_total: int | None = None
     # Ring buffer of the last few refresh queries (MERGE / INSERT / DELETE).
     # In-memory only; cleared on process restart.
     recent_queries: list[QueryInfo] = field(default_factory=list)
@@ -274,15 +303,39 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
 
         if result.action == RefreshAction.FULL_REFRESH:
             if view.full_refresh_chunk:
-                def _set_range(rng: tuple) -> None:
-                    vs.last_range = f"[{rng[0]}, {rng[1]})"
+                # Set the action up-front (not after the whole backfill) so
+                # ``GET /api/views`` reflects what the view is actually doing.
+                vs.last_action = "chunked_full"
+                vs.chunks_done = 0
+                vs.chunks_total = None  # first on_chunk call populates it
+                chunk_labels = {"view": view.name, **source_labels}
+
+                def _on_chunk(p: ChunkProgress) -> None:
+                    # Update every observable per chunk — operators tailing
+                    # /api/views need duration, range, query IDs, and
+                    # chunks_done to move without waiting for the whole
+                    # backfill to finish.
+                    vs.last_range = f"[{p.chunk_range[0]}, {p.chunk_range[1]})"
+                    vs.last_refresh = time.time()
+                    vs.last_duration = p.query.elapsed_ms / 1000.0
+                    vs.last_error = None
+                    vs.chunks_done = p.chunks_done
+                    vs.chunks_total = p.chunks_total
+                    vs.recent_queries = (
+                        [p.query, *vs.recent_queries]
+                    )[:RECENT_QUERY_LIMIT]
+                    CHUNKS_COMPLETED.labels(view=view.name).inc()
+                    CHUNK_DURATION.labels(view=view.name).observe(
+                        p.query.elapsed_ms / 1000.0,
+                    )
+                    CHUNK_ROWS.labels(**chunk_labels).inc(p.query.processed_rows)
+
                 refresh_result = await execute_chunked_full_refresh(
                     cursor, view, target_table, parsed, value_columns,
                     chunk_granularity=view.full_refresh_chunk,
                     should_stop=lambda: s._stop,
-                    on_chunk=_set_range,
+                    on_chunk=_on_chunk,
                 )
-                vs.last_action = "chunked_full"
             else:
                 refresh_result = await execute_full_refresh(cursor, view, target_table)
                 vs.last_action = "full"
@@ -300,11 +353,11 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
 
         # Chunked refresh may stop mid-backfill on graceful shutdown. In
         # that case leave last_source_snapshot unset so the next tick
-        # resumes from target metadata.
+        # resumes from target metadata. ``_on_chunk`` has already populated
+        # last_refresh / last_duration / recent_queries for the committed
+        # chunks — leave chunks_total set so the UI can still show how far
+        # we got before shutdown.
         if refresh_result.interrupted:
-            vs.last_refresh = time.time()
-            vs.last_duration = refresh_result.elapsed
-            vs.recent_queries = (refresh_result.queries + vs.recent_queries)[:RECENT_QUERY_LIMIT]
             return
 
         await write_last_snapshot(cursor, target_table, result.current_snapshot)
@@ -313,9 +366,17 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
         vs.last_duration = refresh_result.elapsed
         vs.last_error = None
         vs.total_refreshes += 1
+        # Clear the in-flight marker once the backfill commits cleanly.
+        # chunks_done stays at the final count for historical display.
+        vs.chunks_total = None
         # Ring-buffer the refresh queries (MERGE / INSERT / DELETE) for the UI.
-        # Newest first, capped to RECENT_QUERY_LIMIT.
-        vs.recent_queries = (refresh_result.queries + vs.recent_queries)[:RECENT_QUERY_LIMIT]
+        # Newest first, capped to RECENT_QUERY_LIMIT. Chunked refreshes have
+        # already appended each chunk via _on_chunk, so skip the duplicate
+        # append here.
+        if not view.full_refresh_chunk or result.action != RefreshAction.FULL_REFRESH:
+            vs.recent_queries = (
+                refresh_result.queries + vs.recent_queries
+            )[:RECENT_QUERY_LIMIT]
         REFRESH_DURATION.labels(view=view.name).observe(refresh_result.elapsed)
         REFRESH_LAST_SUCCESS.labels(view=view.name).set(vs.last_refresh)
 
@@ -456,6 +517,7 @@ class ViewCreate(BaseModel):
     target_table: str | None = None
     target_partitioning: str | None = None
     refresh_interval_seconds: int = 60
+    full_refresh_chunk: str | None = None
 
     @field_validator("name")
     @classmethod
@@ -486,6 +548,7 @@ class ViewResponse(BaseModel):
     target_table: str | None = None
     target_partitioning: str | None = None
     refresh_interval_seconds: int = 60
+    full_refresh_chunk: str | None = None
     status: dict | None = None
 
 
@@ -498,6 +561,7 @@ def _view_to_response(v: ViewConfig, vs: ViewStatus | None) -> ViewResponse:
         merge_keys=parsed.merge_keys,
         target_table=v.target_table, target_partitioning=v.target_partitioning,
         refresh_interval_seconds=v.refresh_interval_seconds,
+        full_refresh_chunk=v.full_refresh_chunk,
         status=dataclasses.asdict(vs) if vs else None,
     )
 
@@ -530,6 +594,23 @@ VIEW_FORM_SCHEMA: list[dict] = [
      "placeholder": "inherits from source", "group": "target"},
     {"name": "refresh_interval_seconds", "label": "Refresh Interval", "type": "number",
      "required": False, "default": 60, "min": 1, "suffix": "seconds"},
+    {"name": "full_refresh_chunk", "label": "Full Refresh Chunk Size", "type": "select",
+     "required": False, "group": "target",
+     "options": [
+         {"value": "", "label": "— none (single-shot) —"},
+         {"value": "hour", "label": "hour"},
+         {"value": "day", "label": "day"},
+         {"value": "week", "label": "week"},
+         {"value": "month", "label": "month"},
+         {"value": "quarter", "label": "quarter"},
+         {"value": "year", "label": "year"},
+     ],
+     "help": (
+         "If set, the first-run backfill is split into chunks of this size "
+         "and each chunk is committed independently. Leave empty for a "
+         "single-shot refresh. Must be coarser-or-equal to the view's own "
+         "date_trunc granularity."
+     )},
 ]
 
 
@@ -603,10 +684,16 @@ def create_view(
     # make it into saved state.
     try:
         parse_view_query(body.query)
+        validate_chunk_compatibility(body.full_refresh_chunk, body.query)
     except ValueError as exc:
         raise HTTPException(422, str(exc))
 
-    new_view = ViewConfig(**body.model_dump())
+    # Normalize the UI's empty-string sentinel ("single-shot") to None so it
+    # round-trips through YAML the same way YAML-loaded views do.
+    payload = body.model_dump()
+    if not payload.get("full_refresh_chunk"):
+        payload["full_refresh_chunk"] = None
+    new_view = ViewConfig(**payload)
     new_views = list(s.config.views) + [new_view]
     new_cfg = Config(trino=s.config.trino, views=new_views, server=s.config.server)
     save_views(new_views, s.views_path)

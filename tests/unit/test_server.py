@@ -93,6 +93,7 @@ def test_view_schema(client):
     assert names == {
         "name", "query",
         "target_table", "target_partitioning", "refresh_interval_seconds",
+        "full_refresh_chunk",
     }
     for f in schema:
         assert "label" in f and "type" in f and "required" in f
@@ -100,6 +101,24 @@ def test_view_schema(client):
     assert "source_table" not in names
     assert "filter_column" not in names
     assert "merge_keys" not in names
+
+
+def test_view_schema_full_refresh_chunk_is_select_with_granularity_options(client):
+    """The UI renders full_refresh_chunk as a dropdown — the schema must expose
+    ``type: select`` and a granularity allow-list that matches the allow-list
+    validated server-side by ``validate_chunk_compatibility``."""
+    schema = client.get("/api/views/schema").json()
+    field = next(f for f in schema if f["name"] == "full_refresh_chunk")
+    assert field["type"] == "select"
+    assert field["required"] is False
+    option_values = [o["value"] for o in field["options"]]
+    # Empty-string option is the "single-shot" sentinel
+    assert "" in option_values
+    # Each other value must be a valid granularity
+    for v in option_values:
+        if v == "":
+            continue
+        assert v in {"hour", "day", "week", "month", "quarter", "year"}
 
 
 # ── CRUD ──
@@ -153,6 +172,98 @@ def test_delete_view(client, setup_state):
 
 def test_delete_not_found(client):
     assert client.delete("/api/views/nope").status_code == 404
+
+
+# ── full_refresh_chunk via the REST API (#32) ──
+
+_FULL_REFRESH_QUERY = (
+    "SELECT date_trunc('day', ts) AS d, a "
+    "FROM iceberg.db.t GROUP BY 1, 2"
+)
+
+
+def test_create_view_accepts_full_refresh_chunk(client, setup_state):
+    """POST must accept full_refresh_chunk, persist it, and echo it back."""
+    r = client.post("/api/views", json={
+        "name": "chunked_view",
+        "query": _FULL_REFRESH_QUERY,
+        "full_refresh_chunk": "day",
+    })
+    assert r.status_code == 201, r.text
+    assert r.json()["full_refresh_chunk"] == "day"
+    # Round-trips through ViewConfig (the source of truth for the executor)
+    new = next(v for v in setup_state.config.views if v.name == "chunked_view")
+    assert new.full_refresh_chunk == "day"
+    # GET /api/views surfaces the field too (so the UI can display it)
+    listed = next(v for v in client.get("/api/views").json() if v["name"] == "chunked_view")
+    assert listed["full_refresh_chunk"] == "day"
+
+
+def test_create_view_accepts_week_chunk_on_week_view(client, setup_state):
+    """Week-granularity views accept week chunks (the strictest row in the
+    compatibility matrix: week divides nothing but itself)."""
+    r = client.post("/api/views", json={
+        "name": "weekly",
+        "query": (
+            "SELECT date_trunc('week', ts) AS w, a "
+            "FROM iceberg.db.t GROUP BY 1, 2"
+        ),
+        "full_refresh_chunk": "week",
+    })
+    assert r.status_code == 201, r.text
+
+
+def test_create_view_rejects_incompatible_chunk(client):
+    """Month-granularity view + week chunk is a known-bad combo (weeks do not
+    cleanly contain months). The API must reject with 422, not silently accept."""
+    r = client.post("/api/views", json={
+        "name": "bad_chunk",
+        "query": (
+            "SELECT date_trunc('month', ts) AS m, a "
+            "FROM iceberg.db.t GROUP BY 1, 2"
+        ),
+        "full_refresh_chunk": "week",
+    })
+    assert r.status_code == 422
+    assert "full_refresh_chunk" in r.text
+
+
+def test_create_view_rejects_unknown_granularity(client):
+    """Freeform strings must not slip past the API — they'd crash the executor
+    downstream where walk_buckets assumes a valid granularity."""
+    r = client.post("/api/views", json={
+        "name": "bad_granularity",
+        "query": _FULL_REFRESH_QUERY,
+        "full_refresh_chunk": "fortnight",
+    })
+    assert r.status_code == 422
+
+
+def test_create_view_empty_string_chunk_treated_as_none(client, setup_state):
+    """The UI's select sends "" for the "single-shot" option. The API must
+    treat that as equivalent to omitting the field — the stored ViewConfig
+    must have None, not "" (otherwise the YAML round-trip and the executor's
+    ``if view.full_refresh_chunk:`` check would disagree)."""
+    r = client.post("/api/views", json={
+        "name": "single_shot",
+        "query": _FULL_REFRESH_QUERY,
+        "full_refresh_chunk": "",
+    })
+    assert r.status_code == 201
+    new = next(v for v in setup_state.config.views if v.name == "single_shot")
+    assert new.full_refresh_chunk is None
+
+
+def test_create_view_omits_chunk_defaults_to_none(client, setup_state):
+    """Omitting full_refresh_chunk (the common case, pre-#32 clients) is still
+    accepted and behaves like a single-shot refresh."""
+    r = client.post("/api/views", json={
+        "name": "no_chunk",
+        "query": _FULL_REFRESH_QUERY,
+    })
+    assert r.status_code == 201
+    new = next(v for v in setup_state.config.views if v.name == "no_chunk")
+    assert new.full_refresh_chunk is None
 
 
 # ── Trigger refresh ──
@@ -749,9 +860,11 @@ async def test_refresh_view_interrupt_skips_last_snapshot_write(setup_state):
     is a partial-progress event, not a successful refresh.
     Partial stats (last_refresh, last_duration, recent_queries) are still
     surfaced so the UI shows the work that did complete."""
+    from datetime import datetime, timezone
+
     from trino_mv_orchestrator import server as server_mod
     from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
-    from trino_mv_orchestrator.executor import QueryInfo, RefreshResult
+    from trino_mv_orchestrator.executor import ChunkProgress, QueryInfo, RefreshResult
     from trino_mv_orchestrator.introspect import ColumnInfo
 
     view = _install_chunked_view(setup_state)
@@ -766,15 +879,28 @@ async def test_refresh_view_interrupt_skips_last_snapshot_write(setup_state):
         return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
 
     async def fake_chunked(cursor, v, target, parsed, value_columns, **kwargs):
+        # Simulate the real executor: fire on_chunk for the one chunk that
+        # committed before the interrupt. Per-chunk status flows through
+        # that callback now — RefreshResult no longer replays it.
+        q = QueryInfo(
+            query_id="q1", info_uri="http://trino/q1",
+            stage="chunk_merge", started_at=1.0, elapsed_ms=250.0,
+            processed_rows=5, processed_bytes=128,
+        )
+        kwargs["on_chunk"](ChunkProgress(
+            chunk_range=(
+                datetime(2026, 4, 8, tzinfo=timezone.utc),
+                datetime(2026, 4, 9, tzinfo=timezone.utc),
+            ),
+            query=q,
+            chunks_done=1,
+            chunks_total=3,
+        ))
         return RefreshResult(
             elapsed=0.25,
             processed_rows=5,
             processed_bytes=128,
-            queries=[QueryInfo(
-                query_id="q1", info_uri="http://trino/q1",
-                stage="chunk_merge", started_at=1.0, elapsed_ms=100.0,
-                processed_rows=5, processed_bytes=128,
-            )],
+            queries=[q],
             interrupted=True,
         )
 
@@ -795,8 +921,99 @@ async def test_refresh_view_interrupt_skips_last_snapshot_write(setup_state):
     vs = setup_state.view_statuses[view.name]
     assert vs.last_action == "chunked_full"
     assert vs.total_refreshes == 0    # interrupt is not a successful refresh
-    # Partial stats surfaced
+    # Partial stats surfaced — populated by _on_chunk, not the interrupt tail.
     assert len(vs.recent_queries) == 1
     assert vs.recent_queries[0].stage == "chunk_merge"
-    assert vs.last_duration == 0.25
+    assert vs.last_duration == pytest.approx(0.25)
     assert vs.last_refresh is not None
+    # Chunked progress stays visible on interrupt so the UI can show how far
+    # the backfill got before shutdown.
+    assert vs.chunks_done == 1
+    assert vs.chunks_total == 3
+
+
+async def test_chunked_refresh_updates_status_per_chunk(setup_state):
+    """Each committed chunk must push progress into ViewStatus *during* the
+    backfill — not only at the end. Issue #33: a multi-hour backfill should
+    not leave ``last_duration`` / ``recent_queries`` frozen at the pre-backfill
+    values."""
+    from datetime import datetime, timezone
+
+    from trino_mv_orchestrator import server as server_mod
+    from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
+    from trino_mv_orchestrator.executor import ChunkProgress, QueryInfo, RefreshResult
+    from trino_mv_orchestrator.introspect import ColumnInfo
+
+    view = _install_chunked_view(setup_state)
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
+
+    async def fake_detect(*a, **kw):
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=1)
+
+    async def fake_discover(cursor, query):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+
+    observed: list[tuple[int, int | None, int]] = []
+
+    async def fake_chunked(cursor, v, target, parsed, value_columns, **kwargs):
+        queries = []
+        for i in range(1, 4):
+            q = QueryInfo(
+                query_id=f"q{i}", info_uri=f"http://trino/q{i}",
+                stage="chunk_merge", started_at=float(i),
+                elapsed_ms=100.0 * i, processed_rows=i, processed_bytes=10 * i,
+            )
+            queries.append(q)
+            kwargs["on_chunk"](ChunkProgress(
+                chunk_range=(
+                    datetime(2026, 4, 7 + i, tzinfo=timezone.utc),
+                    datetime(2026, 4, 8 + i, tzinfo=timezone.utc),
+                ),
+                query=q, chunks_done=i, chunks_total=3,
+            ))
+            vs = setup_state.view_statuses[v.name]
+            observed.append((vs.chunks_done, vs.chunks_total, len(vs.recent_queries)))
+        return RefreshResult(elapsed=0.6, processed_rows=6, processed_bytes=60, queries=queries)
+
+    async def fake_write(cursor, target, snap_id): pass
+    async def fake_read(cursor, target): return None
+
+    with patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()), \
+         patch.object(server_mod, "discover_columns", fake_discover), \
+         patch.object(server_mod, "read_last_snapshot", fake_read), \
+         patch.object(server_mod, "write_last_snapshot", fake_write), \
+         patch.object(server_mod, "detect_changes", fake_detect), \
+         patch.object(server_mod, "execute_chunked_full_refresh", fake_chunked):
+        await server_mod.refresh_view(setup_state, view)
+
+    # Progress advanced with each chunk, not only after all three committed.
+    assert observed == [(1, 3, 1), (2, 3, 2), (3, 3, 3)]
+
+    vs = setup_state.view_statuses[view.name]
+    # last_action flipped to chunked_full at start, stays there through completion.
+    assert vs.last_action == "chunked_full"
+    # After clean completion, chunks_total is cleared but chunks_done keeps the
+    # final count for historical display.
+    assert vs.chunks_total is None
+    assert vs.chunks_done == 3
+    # total_refreshes ticks once per backfill (not per chunk) — existing
+    # consumers of that counter keep their invariant.
+    assert vs.total_refreshes == 1
+    # recent_queries has all three, newest first — _on_chunk prepends each.
+    assert [q.query_id for q in vs.recent_queries] == ["q3", "q2", "q1"]
+
+
+def test_chunk_metrics_defined():
+    """Per-chunk Prometheus metrics are registered so operators can build
+    chunked-backfill dashboards without scraping stdout."""
+    from trino_mv_orchestrator import server as server_mod
+    assert hasattr(server_mod, "CHUNKS_COMPLETED")
+    assert hasattr(server_mod, "CHUNK_DURATION")
+    assert hasattr(server_mod, "CHUNK_ROWS")
+    # Show up on the /metrics endpoint (they're lazy but prometheus_client
+    # registers them eagerly).
+    from fastapi.testclient import TestClient
+    text = TestClient(server_mod.app, raise_server_exceptions=False).get("/metrics").text
+    assert "mv_chunks_completed_total" in text
+    assert "mv_chunk_duration_seconds" in text
+    assert "mv_chunk_rows_written_total" in text
