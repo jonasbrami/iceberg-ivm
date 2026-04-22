@@ -346,7 +346,8 @@ class TestExecuteChunkedFullRefresh:
                 [],
             ],
         )
-        captured: list[tuple[datetime, datetime]] = []
+        from trino_mv_orchestrator.executor import ChunkProgress
+        captured: list[ChunkProgress] = []
         r = await execute_chunked_full_refresh(
             cursor, view, "iceberg.out.mv", parsed,
             value_columns=["volume"],
@@ -354,8 +355,58 @@ class TestExecuteChunkedFullRefresh:
             on_chunk=captured.append,
         )
         assert len(captured) == len(r.queries) == 2
-        assert captured[0][0] == datetime(2026, 4, 8, tzinfo=timezone.utc)
-        assert captured[-1][1] == datetime(2026, 4, 10, tzinfo=timezone.utc)
+        # Range bookkeeping — first chunk starts at source min, last chunk ends
+        # at source max (bucket-aligned).
+        assert captured[0].chunk_range[0] == datetime(2026, 4, 8, tzinfo=timezone.utc)
+        assert captured[-1].chunk_range[1] == datetime(2026, 4, 10, tzinfo=timezone.utc)
+        # Progress counters are 1-indexed and the total is stable across calls.
+        assert [p.chunks_done for p in captured] == [1, 2]
+        assert {p.chunks_total for p in captured} == {2}
+        # Each payload carries the concrete QueryInfo for that chunk (so the
+        # status consumer can surface query_id / duration / rows without
+        # inspecting RefreshResult after the fact).
+        assert captured[0].query is r.queries[0]
+        assert captured[-1].query is r.queries[-1]
+        assert captured[0].query.stage == "chunk_merge"
+
+    async def test_on_chunk_callback_reports_total_on_interrupt(self):
+        """When ``should_stop`` fires mid-backfill, the last emitted payload
+        must still carry the original ``chunks_total`` (so the UI can show
+        e.g. ``3/68`` not ``3/3``)."""
+        view = _chunked_view()
+        parsed = parse_view_query(view.query)
+        cursor = MockCursorWithStats(
+            stats={"processedRows": 1},
+            fetchall_responses=[
+                [_files_row("ts", "2026-04-08T10:00:00+00:00",
+                                 "2026-04-10T15:00:00+00:00")],
+                [],
+            ],
+        )
+        from trino_mv_orchestrator.executor import ChunkProgress
+        captured: list[ChunkProgress] = []
+        # Stop after the first chunk fires.
+        stop_flag = {"tripped": False}
+
+        def _stop() -> bool:
+            return stop_flag["tripped"]
+
+        def _capture(p: ChunkProgress) -> None:
+            captured.append(p)
+            stop_flag["tripped"] = True
+
+        r = await execute_chunked_full_refresh(
+            cursor, view, "iceberg.out.mv", parsed,
+            value_columns=["volume"],
+            chunk_granularity="day",
+            should_stop=_stop,
+            on_chunk=_capture,
+        )
+        assert r.interrupted is True
+        assert len(captured) == 1
+        # Total reflects what the backfill *would* have done, not what ran.
+        assert captured[0].chunks_total == 3
+        assert captured[0].chunks_done == 1
 
     async def test_fully_caught_up_target_emits_no_merges(self):
         """Target has ingested through Apr 10 — same as source max. No chunks

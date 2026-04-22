@@ -48,6 +48,22 @@ class RefreshResult:
     interrupted: bool = False
 
 
+@dataclass
+class ChunkProgress:
+    """Per-chunk progress payload delivered to ``on_chunk`` callbacks.
+
+    Carries everything a status consumer needs to update ``ViewStatus``
+    after each chunk commit (so an operator can observe a long backfill
+    without tailing ``docker logs``): the range just committed, the
+    ``QueryInfo`` for that chunk's MERGE (query_id, duration, row counts),
+    and counters (1-indexed).
+    """
+    chunk_range: tuple[datetime, datetime]
+    query: QueryInfo
+    chunks_done: int       # 1-indexed
+    chunks_total: int
+
+
 def _extract_stats(cursor) -> dict:
     """Extract processedRows/processedBytes from Trino cursor stats."""
     stats = getattr(cursor, "stats", None) or {}
@@ -177,7 +193,7 @@ async def execute_chunked_full_refresh(
     *,
     chunk_granularity: str,
     should_stop: Callable[[], bool] = lambda: False,
-    on_chunk: Callable[[tuple[datetime, datetime]], None] = lambda _: None,
+    on_chunk: Callable[[ChunkProgress], None] = lambda _: None,
 ) -> RefreshResult:
     """Chunked first-run full refresh.
 
@@ -231,7 +247,13 @@ async def execute_chunked_full_refresh(
     )
 
     result = RefreshResult(elapsed=0.0)
-    for chunk_start, chunk_end in walk_buckets(resume, backfill_end, chunk_granularity):
+    # Materialize the chunk list up front so ``on_chunk`` can report
+    # ``chunks_total`` — operators need a denominator to estimate ETA of a
+    # multi-hour backfill. ``walk_buckets`` yields datetime pairs over a
+    # bounded span, so the list is cheap (1 tuple per bucket).
+    chunks = list(walk_buckets(resume, backfill_end, chunk_granularity))
+    total = len(chunks)
+    for i, (chunk_start, chunk_end) in enumerate(chunks, start=1):
         source_query = inject_range_filter(
             view.query, parsed.filter_column, chunk_start, chunk_end,
         )
@@ -239,13 +261,19 @@ async def execute_chunked_full_refresh(
             target_table, source_query, parsed.merge_keys, value_columns,
         )
         log.info(
-            "%s: chunk [%s, %s) — MERGE", view.name, chunk_start, chunk_end,
+            "%s: chunk %d/%d [%s, %s) — MERGE",
+            view.name, i, total, chunk_start, chunk_end,
         )
         q = await _execute_tracked(cursor, merge_sql, stage="chunk_merge")
         result.queries.append(q)
         result.processed_rows += q.processed_rows
         result.processed_bytes += q.processed_bytes
-        on_chunk((chunk_start, chunk_end))
+        on_chunk(ChunkProgress(
+            chunk_range=(chunk_start, chunk_end),
+            query=q,
+            chunks_done=i,
+            chunks_total=total,
+        ))
         if should_stop():
             log.info("%s: chunked refresh interrupted after [%s, %s)",
                      view.name, chunk_start, chunk_end)
