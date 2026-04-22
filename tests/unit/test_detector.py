@@ -8,10 +8,13 @@ from trino_mv_orchestrator.detector import (
     UnexpectedOperationError,
     _parse_ts,
     detect_changes,
+    expand_to_bucket_bounds,
     get_current_snapshot,
     get_new_files_column_range,
     get_snapshots_since,
-    expand_to_bucket_bounds,
+    get_source_column_range,
+    get_target_bucket_max,
+    walk_buckets,
 )
 
 
@@ -604,3 +607,166 @@ class TestDetectChanges:
         ])
         with pytest.raises(UnexpectedOperationError):
             await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
+
+
+# ── walk_buckets ──
+
+
+class TestWalkBuckets:
+    def test_empty_range(self):
+        ts = datetime(2026, 4, 8, tzinfo=timezone.utc)
+        assert list(walk_buckets(ts, ts, "day")) == []
+        assert list(walk_buckets(ts, ts - timedelta(days=1), "day")) == []
+
+    def test_day_simple(self):
+        chunks = list(walk_buckets(
+            datetime(2026, 4, 8, tzinfo=timezone.utc),
+            datetime(2026, 4, 11, tzinfo=timezone.utc),
+            "day",
+        ))
+        assert chunks == [
+            (datetime(2026, 4, 8, tzinfo=timezone.utc), datetime(2026, 4, 9, tzinfo=timezone.utc)),
+            (datetime(2026, 4, 9, tzinfo=timezone.utc), datetime(2026, 4, 10, tzinfo=timezone.utc)),
+            (datetime(2026, 4, 10, tzinfo=timezone.utc), datetime(2026, 4, 11, tzinfo=timezone.utc)),
+        ]
+
+    def test_hour_spanning_day(self):
+        chunks = list(walk_buckets(
+            datetime(2026, 4, 8, 22, tzinfo=timezone.utc),
+            datetime(2026, 4, 9, 2, tzinfo=timezone.utc),
+            "hour",
+        ))
+        assert len(chunks) == 4
+        assert chunks[0][0] == datetime(2026, 4, 8, 22, tzinfo=timezone.utc)
+        assert chunks[-1][1] == datetime(2026, 4, 9, 2, tzinfo=timezone.utc)
+        # half-open and contiguous
+        for a, b in zip(chunks, chunks[1:]):
+            assert a[1] == b[0]
+
+    def test_month_spanning_year(self):
+        chunks = list(walk_buckets(
+            datetime(2026, 11, 1, tzinfo=timezone.utc),
+            datetime(2027, 2, 1, tzinfo=timezone.utc),
+            "month",
+        ))
+        assert chunks == [
+            (datetime(2026, 11, 1, tzinfo=timezone.utc), datetime(2026, 12, 1, tzinfo=timezone.utc)),
+            (datetime(2026, 12, 1, tzinfo=timezone.utc), datetime(2027, 1, 1, tzinfo=timezone.utc)),
+            (datetime(2027, 1, 1, tzinfo=timezone.utc), datetime(2027, 2, 1, tzinfo=timezone.utc)),
+        ]
+
+    def test_quarter_three_months_per_step(self):
+        chunks = list(walk_buckets(
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2027, 1, 1, tzinfo=timezone.utc),
+            "quarter",
+        ))
+        assert len(chunks) == 4
+        assert chunks[0] == (
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 4, 1, tzinfo=timezone.utc),
+        )
+        assert chunks[-1] == (
+            datetime(2026, 10, 1, tzinfo=timezone.utc),
+            datetime(2027, 1, 1, tzinfo=timezone.utc),
+        )
+
+    def test_year_step(self):
+        chunks = list(walk_buckets(
+            datetime(2024, 1, 1, tzinfo=timezone.utc),
+            datetime(2027, 1, 1, tzinfo=timezone.utc),
+            "year",
+        ))
+        assert chunks == [
+            (datetime(2024, 1, 1, tzinfo=timezone.utc), datetime(2025, 1, 1, tzinfo=timezone.utc)),
+            (datetime(2025, 1, 1, tzinfo=timezone.utc), datetime(2026, 1, 1, tzinfo=timezone.utc)),
+            (datetime(2026, 1, 1, tzinfo=timezone.utc), datetime(2027, 1, 1, tzinfo=timezone.utc)),
+        ]
+
+    def test_unsupported_granularity_raises(self):
+        with pytest.raises(ValueError, match="unsupported granularity"):
+            list(walk_buckets(
+                datetime(2026, 1, 1, tzinfo=timezone.utc),
+                datetime(2026, 2, 1, tzinfo=timezone.utc),
+                "decade",
+            ))
+
+    def test_misaligned_start_clamps_last_chunk_to_end(self):
+        """If the caller passes an unaligned ``start`` or ``end``, walk_buckets
+        still steps forward by the granularity step but clamps the last
+        chunk's upper bound to ``end``. Practically callers always align
+        via ``expand_to_bucket_bounds`` first, but the clamp keeps the
+        function from yielding a chunk that extends past ``end``."""
+        # start on Apr 8 10:30, end on Apr 10 05:15, step = 1 day
+        chunks = list(walk_buckets(
+            datetime(2026, 4, 8, 10, 30, tzinfo=timezone.utc),
+            datetime(2026, 4, 10, 5, 15, tzinfo=timezone.utc),
+            "day",
+        ))
+        # The last yielded upper bound is clamped to end (Apr 10 05:15),
+        # not extended to Apr 11 10:30.
+        assert chunks[-1][1] == datetime(2026, 4, 10, 5, 15, tzinfo=timezone.utc)
+        # And contiguity still holds.
+        for a, b in zip(chunks, chunks[1:]):
+            assert a[1] == b[0]
+
+
+# ── get_source_column_range ──
+
+
+class TestGetSourceColumnRange:
+    async def test_reads_from_files_system_table(self):
+        cursor = MockCursor([[
+            ({"ts": {"lower_bound": "2024-01-01T00:00:00+00:00",
+                     "upper_bound": "2024-01-02T00:00:00+00:00"}},),
+            ({"ts": {"lower_bound": "2026-04-01T00:00:00+00:00",
+                     "upper_bound": "2026-04-21T23:59:59+00:00"}},),
+        ]])
+        result = await get_source_column_range(cursor, "iceberg.db.t", "ts")
+        assert result is not None
+        lo, hi = result
+        assert lo == datetime(2024, 1, 1, tzinfo=timezone.utc)
+        assert hi == datetime(2026, 4, 21, 23, 59, 59, tzinfo=timezone.utc)
+        # Queries $files, not $all_entries — $all_entries would only return
+        # files added BY a single commit, not the live set.
+        assert 'iceberg.db."t$files"' in cursor.executed_sql[0]
+        assert "$all_entries" not in cursor.executed_sql[0]
+
+    async def test_empty_table(self):
+        cursor = MockCursor([[]])
+        assert await get_source_column_range(cursor, "db.t", "ts") is None
+
+    async def test_raises_when_filter_column_absent(self):
+        cursor = MockCursor([[
+            ({"other": {"lower_bound": "1", "upper_bound": "2"}},),
+        ]])
+        with pytest.raises(MissingFilterColumnError):
+            await get_source_column_range(cursor, "db.t", "ts")
+
+
+# ── get_target_bucket_max ──
+
+
+class TestGetTargetBucketMax:
+    async def test_reads_max_upper_bound(self):
+        cursor = MockCursor([[
+            ({"minute": {"lower_bound": "2026-04-08T00:00:00+00:00",
+                         "upper_bound": "2026-04-08T23:59:00+00:00"}},),
+            ({"minute": {"lower_bound": "2026-04-09T00:00:00+00:00",
+                         "upper_bound": "2026-04-09T23:59:00+00:00"}},),
+        ]])
+        result = await get_target_bucket_max(cursor, "iceberg.out.mv", "minute")
+        assert result == datetime(2026, 4, 9, 23, 59, tzinfo=timezone.utc)
+
+    async def test_empty_target_returns_none(self):
+        cursor = MockCursor([[]])
+        assert await get_target_bucket_max(cursor, "db.t", "minute") is None
+
+    async def test_bucket_column_absent_returns_none(self):
+        """Target has files but none carry metrics for the bucket column —
+        treat as empty resume (not an error), since the target may be a
+        fresh table whose first chunk is still in flight."""
+        cursor = MockCursor([[
+            ({"other": {"lower_bound": "1", "upper_bound": "2"}},),
+        ]])
+        assert await get_target_bucket_max(cursor, "db.t", "minute") is None

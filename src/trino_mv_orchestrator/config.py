@@ -11,10 +11,24 @@ import yaml
 from trino_mv_orchestrator.query_parser import (
     IDENTIFIER_RE,
     QUALIFIED_NAME_RE,
+    VALID_GRANULARITIES,
     parse_view_query,
 )
 
 log = logging.getLogger(__name__)
+
+# full_refresh_chunk must be coarser-or-equal to the view's own granularity
+# *and* cleanly contain its buckets. Weeks do not divide months, and months
+# do not divide weeks, so the relation is a partial order, not a total one.
+_CHUNK_COMPATIBILITY: dict[str, frozenset[str]] = {
+    "minute":  frozenset({"minute", "hour", "day", "week", "month", "quarter", "year"}),
+    "hour":    frozenset({"hour", "day", "week", "month", "quarter", "year"}),
+    "day":     frozenset({"day", "week", "month", "quarter", "year"}),
+    "week":    frozenset({"week"}),
+    "month":   frozenset({"month", "quarter", "year"}),
+    "quarter": frozenset({"quarter", "year"}),
+    "year":    frozenset({"year"}),
+}
 
 # Trino credentials are *only* read from these environment variables.
 # No defaults, no YAML overrides — keeping secrets out of the repo and
@@ -44,6 +58,11 @@ class ViewConfig:
     target_table: str | None = None
     target_partitioning: str | None = None
     refresh_interval_seconds: int = 60
+    # Granularity string ("day", "month", …) controlling the size of each
+    # chunk in the first-run chunked backfill. ``None`` → legacy single-shot
+    # full refresh. Validated against the view's own date_trunc granularity
+    # at load time.
+    full_refresh_chunk: str | None = None
 
 
 @dataclass(frozen=True)
@@ -79,7 +98,29 @@ def _parse_view(raw: dict) -> ViewConfig:
 
     # Full query validation — source_table, filter_column, granularity,
     # merge_keys are all derived here at load time.  Raises on any violation.
-    parse_view_query(raw["query"])
+    parsed = parse_view_query(raw["query"])
+
+    chunk = raw.get("full_refresh_chunk")
+    if chunk is not None:
+        if chunk not in VALID_GRANULARITIES:
+            raise ValueError(
+                f"full_refresh_chunk: {chunk!r} is not a valid granularity; "
+                f"expected one of {sorted(VALID_GRANULARITIES)}"
+            )
+        allowed = _CHUNK_COMPATIBILITY[parsed.granularity]
+        if chunk not in allowed:
+            raise ValueError(
+                f"full_refresh_chunk: {chunk!r} is not compatible with the "
+                f"view's date_trunc granularity {parsed.granularity!r}; "
+                f"allowed values: {sorted(allowed)}"
+            )
+        if parsed.bucket_alias is None:
+            raise ValueError(
+                "full_refresh_chunk requires date_trunc("
+                f"{parsed.granularity!r}, {parsed.filter_column}) to appear "
+                "as a direct projection with an alias (the target needs a "
+                "column to read as the resume point)"
+            )
 
     return ViewConfig(
         name=raw["name"],
@@ -87,6 +128,7 @@ def _parse_view(raw: dict) -> ViewConfig:
         target_table=raw.get("target_table"),
         target_partitioning=raw.get("target_partitioning"),
         refresh_interval_seconds=raw.get("refresh_interval_seconds", 60),
+        full_refresh_chunk=chunk,
     )
 
 
@@ -179,6 +221,8 @@ def save_views(views: list[ViewConfig], path: str | Path) -> None:
             vd["target_table"] = v.target_table
         if v.target_partitioning:
             vd["target_partitioning"] = v.target_partitioning
+        if v.full_refresh_chunk:
+            vd["full_refresh_chunk"] = v.full_refresh_chunk
         data["views"].append(vd)
     p.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
     log.info("saved %d view(s) to %s", len(views), p)

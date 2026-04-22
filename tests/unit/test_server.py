@@ -649,3 +649,154 @@ def test_create_view_rejects_legacy_range_filter(client, setup_state):
     })
     assert r.status_code == 422
     assert "range_filter" in r.json()["detail"]
+
+
+# ── refresh_view: chunked full refresh dispatch + interrupt ──
+
+
+def _chunked_view_config():
+    from trino_mv_orchestrator.config import ViewConfig
+    return ViewConfig(
+        name="test_view",
+        query=(
+            "SELECT date_trunc('day', ts) AS d, a "
+            "FROM iceberg.db.trades GROUP BY 1, 2"
+        ),
+        target_table="iceberg.out.mv",
+        full_refresh_chunk="day",
+    )
+
+
+def _install_chunked_view(s):
+    """Swap setup_state's view for one with full_refresh_chunk='day'."""
+    from trino_mv_orchestrator.config import Config
+    view = _chunked_view_config()
+    s.config = Config(trino=s.config.trino, views=[view], server=s.config.server)
+    return view
+
+
+class _FakeConn:
+    async def cursor(self): return _FakeCursor()
+    async def close(self): pass
+
+
+class _FakeCursor:
+    stats = {}
+    async def execute(self, sql): pass
+    async def fetchone(self): return None
+    async def fetchall(self): return []
+
+
+async def test_refresh_view_dispatches_to_chunked_when_configured(setup_state):
+    """When ``view.full_refresh_chunk`` is set, ``refresh_view`` must call
+    ``execute_chunked_full_refresh`` (not ``execute_full_refresh``),
+    surface ``last_action = "chunked_full"``, and still write
+    ``last_source_snapshot`` on completion."""
+    from trino_mv_orchestrator import server as server_mod
+    from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
+    from trino_mv_orchestrator.executor import RefreshResult
+    from trino_mv_orchestrator.introspect import ColumnInfo
+
+    view = _install_chunked_view(setup_state)
+    chunked_calls: list[str] = []
+    full_calls: list[str] = []
+    write_calls: list[int] = []
+
+    async def fake_detect(*a, **kw):
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=42)
+
+    async def fake_discover(cursor, query):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+
+    async def fake_chunked(cursor, v, target, parsed, value_columns, **kwargs):
+        chunked_calls.append(v.name)
+        # chunk_granularity must be forwarded from the view config
+        assert kwargs["chunk_granularity"] == "day"
+        assert callable(kwargs["should_stop"])
+        assert callable(kwargs["on_chunk"])
+        return RefreshResult(elapsed=0.1, processed_rows=1)
+
+    async def fake_full(cursor, v, target):
+        full_calls.append(v.name)
+        return RefreshResult(elapsed=0.1)
+
+    async def fake_write(cursor, target, snap_id):
+        write_calls.append(snap_id)
+
+    async def fake_read(cursor, target): return None
+
+    with patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()), \
+         patch.object(server_mod, "discover_columns", fake_discover), \
+         patch.object(server_mod, "read_last_snapshot", fake_read), \
+         patch.object(server_mod, "write_last_snapshot", fake_write), \
+         patch.object(server_mod, "detect_changes", fake_detect), \
+         patch.object(server_mod, "execute_chunked_full_refresh", fake_chunked), \
+         patch.object(server_mod, "execute_full_refresh", fake_full):
+        await server_mod.refresh_view(setup_state, view)
+
+    assert chunked_calls == ["test_view"]
+    assert full_calls == []   # single-shot path NOT taken
+    assert write_calls == [42]  # last_source_snapshot still written on completion
+    vs = setup_state.view_statuses[view.name]
+    assert vs.last_action == "chunked_full"
+    assert vs.last_error is None
+
+
+async def test_refresh_view_interrupt_skips_last_snapshot_write(setup_state):
+    """When the chunked refresh returns ``interrupted=True``, ``refresh_view``
+    must skip ``write_last_snapshot`` (so the next tick resumes from target
+    metadata) and must NOT increment ``total_refreshes`` — an interrupt
+    is a partial-progress event, not a successful refresh.
+    Partial stats (last_refresh, last_duration, recent_queries) are still
+    surfaced so the UI shows the work that did complete."""
+    from trino_mv_orchestrator import server as server_mod
+    from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
+    from trino_mv_orchestrator.executor import QueryInfo, RefreshResult
+    from trino_mv_orchestrator.introspect import ColumnInfo
+
+    view = _install_chunked_view(setup_state)
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
+
+    write_calls: list[int] = []
+
+    async def fake_detect(*a, **kw):
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=99)
+
+    async def fake_discover(cursor, query):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+
+    async def fake_chunked(cursor, v, target, parsed, value_columns, **kwargs):
+        return RefreshResult(
+            elapsed=0.25,
+            processed_rows=5,
+            processed_bytes=128,
+            queries=[QueryInfo(
+                query_id="q1", info_uri="http://trino/q1",
+                stage="chunk_merge", started_at=1.0, elapsed_ms=100.0,
+                processed_rows=5, processed_bytes=128,
+            )],
+            interrupted=True,
+        )
+
+    async def fake_write(cursor, target, snap_id):
+        write_calls.append(snap_id)
+
+    async def fake_read(cursor, target): return None
+
+    with patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()), \
+         patch.object(server_mod, "discover_columns", fake_discover), \
+         patch.object(server_mod, "read_last_snapshot", fake_read), \
+         patch.object(server_mod, "write_last_snapshot", fake_write), \
+         patch.object(server_mod, "detect_changes", fake_detect), \
+         patch.object(server_mod, "execute_chunked_full_refresh", fake_chunked):
+        await server_mod.refresh_view(setup_state, view)
+
+    assert write_calls == []   # no last_source_snapshot write on interrupt
+    vs = setup_state.view_statuses[view.name]
+    assert vs.last_action == "chunked_full"
+    assert vs.total_refreshes == 0    # interrupt is not a successful refresh
+    # Partial stats surfaced
+    assert len(vs.recent_queries) == 1
+    assert vs.recent_queries[0].stage == "chunk_merge"
+    assert vs.last_duration == 0.25
+    assert vs.last_refresh is not None
