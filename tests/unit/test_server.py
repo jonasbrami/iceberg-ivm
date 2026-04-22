@@ -7,7 +7,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from trino_mv_orchestrator.config import Config, load_config, load_views
-from trino_mv_orchestrator.server import AppState, ViewStatus, app, get_app_state
+from trino_mv_orchestrator.query_history import QueryHistory
+from trino_mv_orchestrator.server import RECENT_QUERY_LIMIT, AppState, ViewStatus, app, get_app_state
 
 
 STATIC_CONFIG_YAML = textwrap.dedent("""\
@@ -677,6 +678,92 @@ async def test_refresh_view_appends_recent_queries(setup_state, client):
            status_queries[1]["info_uri"].endswith("20260417_000000_00001_xyz")
 
 
+async def test_refresh_persists_queries_and_hydrates_on_restart(
+    setup_state, tmp_path,
+):
+    """End-to-end: attaching a QueryHistory to AppState must cause refresh_view
+    to persist QueryInfo rows, and a fresh ViewStatus with an empty
+    recent_queries must re-hydrate from the DB via hydrate_recent_queries."""
+    from trino_mv_orchestrator import server as server_mod
+    from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
+    from trino_mv_orchestrator.executor import QueryInfo, RefreshResult
+    from trino_mv_orchestrator.introspect import ColumnInfo
+
+    view = setup_state.config.views[0]
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+
+    class FakeConn:
+        async def cursor(self): return FakeCursor()
+        async def close(self): pass
+
+    class FakeCursor:
+        stats = {}
+        async def execute(self, sql): pass
+        async def fetchone(self): return None
+        async def fetchall(self): return []
+
+    async def fake_write(cursor, target, snap_id): pass
+    async def fake_read(cursor, target): return None
+    async def fake_detect(*a, **kw):
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=1)
+    async def fake_discover(cursor, query):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+    async def fake_full(cursor, v, target):
+        return RefreshResult(
+            elapsed=0.5, processed_rows=1, processed_bytes=64,
+            queries=[
+                QueryInfo(
+                    query_id="persisted_qid", info_uri="http://trino/persisted_qid",
+                    stage="full_insert", started_at=10.0, elapsed_ms=250.0,
+                    processed_rows=1, processed_bytes=64,
+                ),
+            ],
+        )
+
+    try:
+        with patch.object(server_mod, "get_trino_connection", lambda s: FakeConn()), \
+             patch.object(server_mod, "discover_columns", fake_discover), \
+             patch.object(server_mod, "read_last_snapshot", fake_read), \
+             patch.object(server_mod, "write_last_snapshot", fake_write), \
+             patch.object(server_mod, "detect_changes", fake_detect), \
+             patch.object(server_mod, "execute_full_refresh", fake_full):
+            await server_mod.refresh_view(setup_state, view)
+
+        vs = setup_state.view_statuses[view.name]
+        assert [q.query_id for q in vs.recent_queries] == ["persisted_qid"]
+
+        # Simulate a restart: ViewStatus is fresh, DB survives.
+        setup_state.view_statuses[view.name] = ViewStatus(name=view.name)
+        await server_mod.hydrate_recent_queries(setup_state)
+        rehydrated = setup_state.view_statuses[view.name].recent_queries
+        assert [q.query_id for q in rehydrated] == ["persisted_qid"]
+    finally:
+        await h.close()
+
+
+async def test_delete_view_purges_history(setup_state, tmp_path, client):
+    from trino_mv_orchestrator.executor import QueryInfo
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+    try:
+        await h.append("test_view", [QueryInfo(
+            query_id="x", info_uri="http://trino/x", stage="merge",
+            started_at=1.0, elapsed_ms=1.0,
+        )])
+        assert len(await h.recent("test_view")) == 1
+
+        r = client.delete("/api/views/test_view")
+        assert r.status_code == 204
+        assert await h.recent("test_view") == []
+    finally:
+        await h.close()
+
+
 # ── Metrics presence ──
 
 def test_new_metrics_defined():
@@ -887,7 +974,7 @@ async def test_refresh_view_interrupt_skips_last_snapshot_write(setup_state):
             stage="chunk_merge", started_at=1.0, elapsed_ms=250.0,
             processed_rows=5, processed_bytes=128,
         )
-        kwargs["on_chunk"](ChunkProgress(
+        await kwargs["on_chunk"](ChunkProgress(
             chunk_range=(
                 datetime(2026, 4, 8, tzinfo=timezone.utc),
                 datetime(2026, 4, 9, tzinfo=timezone.utc),
@@ -964,7 +1051,7 @@ async def test_chunked_refresh_updates_status_per_chunk(setup_state):
                 elapsed_ms=100.0 * i, processed_rows=i, processed_bytes=10 * i,
             )
             queries.append(q)
-            kwargs["on_chunk"](ChunkProgress(
+            await kwargs["on_chunk"](ChunkProgress(
                 chunk_range=(
                     datetime(2026, 4, 7 + i, tzinfo=timezone.utc),
                     datetime(2026, 4, 8 + i, tzinfo=timezone.utc),

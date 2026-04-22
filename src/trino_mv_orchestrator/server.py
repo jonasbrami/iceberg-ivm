@@ -40,6 +40,7 @@ from trino_mv_orchestrator.introspect import (
     build_create_table_sql,
     discover_columns,
 )
+from trino_mv_orchestrator.query_history import QueryHistory
 from trino_mv_orchestrator.query_parser import parse_view_query
 from trino_mv_orchestrator.state import read_last_snapshot, write_last_snapshot
 
@@ -158,6 +159,7 @@ class AppState:
     views_mtime: float = 0
     view_statuses: dict[str, ViewStatus] = field(default_factory=dict)
     view_runtimes: dict[str, ViewRuntime] = field(default_factory=dict)
+    history: QueryHistory | None = None
     _stop: bool = False
 
 
@@ -243,6 +245,21 @@ def reload_config(s: AppState) -> bool:
         return False
 
 
+async def hydrate_recent_queries(s: AppState) -> None:
+    """Populate ``ViewStatus.recent_queries`` from the persisted DB.
+
+    Called once at startup (after ``history`` is opened) and whenever a
+    fresh ``ViewStatus`` is seeded for a reloaded view. Cheap — one
+    indexed query per view, capped to ``RECENT_QUERY_LIMIT``.
+    """
+    if s.history is None or s.config is None:
+        return
+    for v in s.config.views:
+        vs = s.view_statuses.setdefault(v.name, ViewStatus(name=v.name))
+        if not vs.recent_queries:
+            vs.recent_queries = await s.history.recent(v.name)
+
+
 async def refresh_view(s: AppState, view: ViewConfig) -> None:
     conn = get_trino_connection(s)
     cursor = await conn.cursor()
@@ -310,7 +327,7 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
                 vs.chunks_total = None  # first on_chunk call populates it
                 chunk_labels = {"view": view.name, **source_labels}
 
-                def _on_chunk(p: ChunkProgress) -> None:
+                async def _on_chunk(p: ChunkProgress) -> None:
                     # Update every observable per chunk — operators tailing
                     # /api/views need duration, range, query IDs, and
                     # chunks_done to move without waiting for the whole
@@ -321,9 +338,13 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
                     vs.last_error = None
                     vs.chunks_done = p.chunks_done
                     vs.chunks_total = p.chunks_total
-                    vs.recent_queries = (
-                        [p.query, *vs.recent_queries]
-                    )[:RECENT_QUERY_LIMIT]
+                    if s.history is not None:
+                        await s.history.append(view.name, [p.query])
+                        vs.recent_queries = await s.history.recent(view.name)
+                    else:
+                        vs.recent_queries = (
+                            [p.query, *vs.recent_queries]
+                        )[:RECENT_QUERY_LIMIT]
                     CHUNKS_COMPLETED.labels(view=view.name).inc()
                     CHUNK_DURATION.labels(view=view.name).observe(
                         p.query.elapsed_ms / 1000.0,
@@ -374,9 +395,13 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
         # already appended each chunk via _on_chunk, so skip the duplicate
         # append here.
         if not view.full_refresh_chunk or result.action != RefreshAction.FULL_REFRESH:
-            vs.recent_queries = (
-                refresh_result.queries + vs.recent_queries
-            )[:RECENT_QUERY_LIMIT]
+            if s.history is not None:
+                await s.history.append(view.name, refresh_result.queries)
+                vs.recent_queries = await s.history.recent(view.name)
+            else:
+                vs.recent_queries = (
+                    refresh_result.queries + vs.recent_queries
+                )[:RECENT_QUERY_LIMIT]
         REFRESH_DURATION.labels(view=view.name).observe(refresh_result.elapsed)
         REFRESH_LAST_SUCCESS.labels(view=view.name).set(vs.last_refresh)
 
@@ -491,19 +516,35 @@ async def lifespan(app: FastAPI):
         reload_config(s)
         app.state.s = s
 
+    if s.history is None and s.config is not None:
+        # Resolve relative state_db_path against the config file's directory
+        # so a docker-mounted /app/config.yaml puts state.db next to it
+        # without extra flags.
+        db_path = Path(s.config.server.state_db_path)
+        if not db_path.is_absolute():
+            db_path = s.config_path.parent / db_path
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        s.history = QueryHistory(db_path, RECENT_QUERY_LIMIT)
+        await s.history.open()
+        await hydrate_recent_queries(s)
+
     log.info(
         "starting supervisor — %d views configured",
         len(s.config.views) if s.config else 0,
     )
     task = asyncio.create_task(supervisor(s))
-    yield
-    log.info("shutting down supervisor")
-    s._stop = True
-    task.cancel()
     try:
-        await task
-    except asyncio.CancelledError:
-        pass
+        yield
+    finally:
+        log.info("shutting down supervisor")
+        s._stop = True
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        if s.history is not None:
+            await s.history.close()
 
 
 app = FastAPI(title="trino-mv-orchestrator", lifespan=lifespan)
@@ -707,7 +748,7 @@ def create_view(
 
 
 @app.delete("/api/views/{name}", status_code=204)
-def delete_view(name: str, s: AppState = Depends(get_app_state)):
+async def delete_view(name: str, s: AppState = Depends(get_app_state)):
     if not s.config:
         raise HTTPException(500, "config not loaded")
     if not any(v.name == name for v in s.config.views):
@@ -719,6 +760,8 @@ def delete_view(name: str, s: AppState = Depends(get_app_state)):
     s.views_mtime = s.views_path.stat().st_mtime
     s.view_statuses.pop(name, None)
     s.view_runtimes.pop(name, None)
+    if s.history is not None:
+        await s.history.delete_view(name)
     VIEWS_CONFIGURED.set(len(new_views))
     log.info("deleted view %r via API", name)
 

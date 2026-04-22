@@ -388,7 +388,8 @@ Every subsequent cycle is incremental unless you drop the target table.
 ### Deployment notes
 
 - **Single-instance.** The orchestrator is not HA. One process per target catalog/schema. Two instances against the same targets would race on `ALTER TABLE SET PROPERTIES` and produce conflicting MERGEs.
-- **Crash-safe.** State lives in Iceberg, not in the orchestrator. Kill/restart leaves no cleanup.
+- **Crash-safe.** Refresh-correctness state lives in Iceberg, not in the orchestrator. Kill/restart leaves no cleanup.
+- **Persist the SQLite state DB.** The UI's "recent queries" panel is backed by a SQLite file (`server.state_db_path`, default `state.db` next to `config.yaml`). If you run in docker, mount a volume at that path — otherwise the file is recreated empty on every container replacement and history disappears. Example: `-v mv-state:/app/state.db`.
 - **What to monitor** (all labels `view`):
   - `rate(mv_refresh_errors_total[5m]) > 0` — refresh is failing.
   - `time() - mv_refresh_last_success_timestamp > 3 * refresh_interval_seconds` — view is stalled.

@@ -69,6 +69,11 @@ class ViewConfig:
 class ServerConfig:
     port: int = 8000
     config_reload_interval_seconds: int = 30
+    # SQLite file that persists the UI's "recent queries" ring buffer
+    # across restarts. Resolved relative to the config file's directory
+    # when non-absolute, so the default colocates the DB with config.yaml
+    # without surprising deployments that mount the config dir as a volume.
+    state_db_path: str = "state.db"
 
 
 @dataclass(frozen=True)
@@ -188,6 +193,7 @@ def load_config(path: str | Path) -> Config:
     server = ServerConfig(
         port=server_raw.get("port", 8000),
         config_reload_interval_seconds=server_raw.get("config_reload_interval_seconds", 30),
+        state_db_path=server_raw.get("state_db_path", "state.db"),
     )
 
     cfg = Config(trino=trino, views=[], server=server)
