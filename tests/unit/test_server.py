@@ -95,6 +95,9 @@ def test_view_schema(client):
         "name", "query",
         "target_table", "target_partitioning", "refresh_interval_seconds",
         "full_refresh_chunk",
+        "optimize_interval_seconds", "optimize_file_size_threshold",
+        "expire_snapshots_interval_seconds", "expire_snapshots_retention",
+        "remove_orphan_files_interval_seconds", "remove_orphan_files_retention",
     }
     for f in schema:
         assert "label" in f and "type" in f and "required" in f
@@ -102,6 +105,18 @@ def test_view_schema(client):
     assert "source_table" not in names
     assert "filter_column" not in names
     assert "merge_keys" not in names
+
+
+def test_view_schema_maintenance_fields_grouped(client):
+    """All six maintenance fields share the 'maintenance' group so the UI
+    can render them as a dedicated section."""
+    schema = client.get("/api/views/schema").json()
+    maint = [f for f in schema if f.get("group") == "maintenance"]
+    assert {f["name"] for f in maint} == {
+        "optimize_interval_seconds", "optimize_file_size_threshold",
+        "expire_snapshots_interval_seconds", "expire_snapshots_retention",
+        "remove_orphan_files_interval_seconds", "remove_orphan_files_retention",
+    }
 
 
 def test_view_schema_full_refresh_chunk_is_select_with_granularity_options(client):
@@ -335,6 +350,222 @@ def test_create_view_omits_chunk_defaults_to_none(client, setup_state):
     assert r.status_code == 201
     new = next(v for v in setup_state.config.views if v.name == "no_chunk")
     assert new.full_refresh_chunk is None
+
+
+# ── Iceberg maintenance via the REST API ──
+
+
+def test_create_view_accepts_maintenance_fields(client, setup_state):
+    r = client.post("/api/views", json={
+        "name": "maintained",
+        "query": _FULL_REFRESH_QUERY,
+        "optimize_interval_seconds": 3600,
+        "optimize_file_size_threshold": "128MB",
+        "expire_snapshots_interval_seconds": 86400,
+        "expire_snapshots_retention": "14d",
+        "remove_orphan_files_interval_seconds": 604800,
+        "remove_orphan_files_retention": "30d",
+    })
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["optimize_interval_seconds"] == 3600
+    assert body["optimize_file_size_threshold"] == "128MB"
+    assert body["expire_snapshots_retention"] == "14d"
+    new = next(v for v in setup_state.config.views if v.name == "maintained")
+    assert new.optimize_interval_seconds == 3600
+    assert new.optimize_file_size_threshold == "128MB"
+
+
+def test_create_view_rejects_bad_retention(client):
+    r = client.post("/api/views", json={
+        "name": "bad_ret",
+        "query": _FULL_REFRESH_QUERY,
+        "expire_snapshots_interval_seconds": 3600,
+        "expire_snapshots_retention": "forever",
+    })
+    assert r.status_code == 422
+    assert "duration" in r.text
+
+
+def test_create_view_rejects_negative_interval(client):
+    r = client.post("/api/views", json={
+        "name": "bad_iv",
+        "query": _FULL_REFRESH_QUERY,
+        "optimize_interval_seconds": -10,
+    })
+    assert r.status_code == 422
+
+
+def test_update_view_applies_maintenance_change(client, setup_state):
+    """Maintenance fields are mutable via PUT."""
+    r = client.put("/api/views/test_view", json={
+        "name": "test_view",
+        "query": _EXISTING_QUERY,
+        "optimize_interval_seconds": 7200,
+    })
+    assert r.status_code == 200, r.text
+    updated = next(v for v in setup_state.config.views if v.name == "test_view")
+    assert updated.optimize_interval_seconds == 7200
+
+
+def test_create_view_empty_file_size_threshold_treated_as_none(client, setup_state):
+    """Empty string from the UI input must round-trip as None in ViewConfig."""
+    r = client.post("/api/views", json={
+        "name": "no_thr",
+        "query": _FULL_REFRESH_QUERY,
+        "optimize_file_size_threshold": "",
+    })
+    assert r.status_code == 201
+    new = next(v for v in setup_state.config.views if v.name == "no_thr")
+    assert new.optimize_file_size_threshold is None
+
+
+async def test_refresh_view_runs_maintenance(setup_state):
+    """Piggyback: after a successful refresh, due maintenance ops must run
+    on the same cursor and be surfaced in ViewStatus.maintenance."""
+    from trino_mv_orchestrator import server as server_mod
+    from trino_mv_orchestrator.config import Config, ViewConfig
+    from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
+    from trino_mv_orchestrator.executor import QueryInfo, RefreshResult
+    from trino_mv_orchestrator.introspect import ColumnInfo
+
+    v = ViewConfig(
+        name="test_view",
+        query=_EXISTING_QUERY,
+        optimize_interval_seconds=1,
+        expire_snapshots_interval_seconds=1,
+        expire_snapshots_retention="7d",
+    )
+    setup_state.config = Config(
+        trino=setup_state.config.trino, views=[v],
+        server=setup_state.config.server,
+    )
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view")
+
+    async def fake_detect(*a, **kw):
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=1)
+
+    async def fake_discover(cursor, query):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+
+    async def fake_full(cursor, view, target):
+        return RefreshResult(elapsed=0.1, processed_rows=1, processed_bytes=10)
+
+    async def fake_write(cursor, target, snap_id): pass
+    async def fake_read(cursor, target): return None
+
+    maintenance_calls: list[tuple[str, dict]] = []
+
+    async def fake_maintenance(cursor, target, op, params):
+        maintenance_calls.append((op, params))
+        return QueryInfo(
+            query_id=f"q_{op}", info_uri=f"http://trino/q_{op}",
+            stage=f"maintenance_{op}", started_at=1.0, elapsed_ms=5.0,
+        )
+
+    with patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()), \
+         patch.object(server_mod, "discover_columns", fake_discover), \
+         patch.object(server_mod, "read_last_snapshot", fake_read), \
+         patch.object(server_mod, "write_last_snapshot", fake_write), \
+         patch.object(server_mod, "detect_changes", fake_detect), \
+         patch.object(server_mod, "execute_full_refresh", fake_full), \
+         patch.object(server_mod, "execute_maintenance", fake_maintenance):
+        await server_mod.refresh_view(setup_state, v)
+
+    # Both configured ops ran exactly once, in declared order, with the
+    # right parameter shape.
+    assert [op for op, _ in maintenance_calls] == ["optimize", "expire_snapshots"]
+    assert dict(maintenance_calls) == {
+        "optimize": {},
+        "expire_snapshots": {"retention_threshold": "7d"},
+    }
+    vs = setup_state.view_statuses["test_view"]
+    assert vs.maintenance["optimize"].last_run is not None
+    assert vs.maintenance["optimize"].total_runs == 1
+    assert vs.maintenance["expire_snapshots"].total_runs == 1
+    # The maintenance queries appear alongside refresh queries in recent_queries
+    stages = {q.stage for q in vs.recent_queries}
+    assert "maintenance_optimize" in stages
+    assert "maintenance_expire_snapshots" in stages
+
+
+async def test_maintain_view_respects_interval(setup_state):
+    """When last_run is within the interval, the op is skipped — no SQL runs."""
+    from trino_mv_orchestrator import server as server_mod
+    from trino_mv_orchestrator.config import ViewConfig
+
+    v = ViewConfig(
+        name="test_view",
+        query=_EXISTING_QUERY,
+        optimize_interval_seconds=3600,  # 1h
+    )
+    vs = ViewStatus(name="test_view")
+    # Just ran 10s ago — 1h interval should gate it off.
+    vs.maintenance["optimize"] = server_mod.MaintenanceOpStatus(last_run=__import__("time").time() - 10)
+    setup_state.view_statuses["test_view"] = vs
+
+    calls: list[str] = []
+
+    async def fake_maintenance(cursor, target, op, params):
+        calls.append(op)
+        raise AssertionError("should not have run")
+
+    with patch.object(server_mod, "execute_maintenance", fake_maintenance):
+        await server_mod.maintain_view(setup_state, v, cursor=None, target_table="t")
+
+    assert calls == []
+
+
+async def test_maintain_view_persists_last_run_to_history(setup_state, tmp_path):
+    """Scheduling must survive restart — last_run is written to maintenance_state."""
+    from trino_mv_orchestrator import server as server_mod
+    from trino_mv_orchestrator.config import ViewConfig
+    from trino_mv_orchestrator.executor import QueryInfo
+    from trino_mv_orchestrator.query_history import QueryHistory
+
+    v = ViewConfig(
+        name="test_view",
+        query=_EXISTING_QUERY,
+        optimize_interval_seconds=60,
+    )
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view")
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+    try:
+        async def fake_maintenance(cursor, target, op, params):
+            return QueryInfo(
+                query_id="q1", info_uri="http://trino/q1",
+                stage=f"maintenance_{op}", started_at=1.0, elapsed_ms=5.0,
+            )
+
+        with patch.object(server_mod, "execute_maintenance", fake_maintenance):
+            await server_mod.maintain_view(setup_state, v, cursor=None, target_table="t")
+
+        persisted = await h.all_maintenance("test_view")
+        assert "optimize" in persisted
+        assert persisted["optimize"] > 0
+    finally:
+        await h.close()
+
+
+async def test_hydrate_rehydrates_maintenance_last_run(setup_state, tmp_path):
+    """On startup, maintenance state is read from SQLite so intervals survive restarts."""
+    from trino_mv_orchestrator import server as server_mod
+    from trino_mv_orchestrator.query_history import QueryHistory
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+    try:
+        await h.record_maintenance("test_view", "optimize", 12345.0)
+        # Fresh ViewStatus, empty maintenance dict — hydrate must populate it.
+        setup_state.view_statuses["test_view"] = ViewStatus(name="test_view")
+        await server_mod.hydrate_recent_queries(setup_state)
+        vs = setup_state.view_statuses["test_view"]
+        assert vs.maintenance["optimize"].last_run == 12345.0
+    finally:
+        await h.close()
 
 
 # ── Trigger refresh ──

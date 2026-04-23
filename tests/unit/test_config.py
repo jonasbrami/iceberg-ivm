@@ -8,7 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from trino_mv_orchestrator.config import ViewConfig, load_config, load_views, save_views
+from trino_mv_orchestrator.config import (
+    ViewConfig,
+    load_config,
+    load_views,
+    save_views,
+    validate_maintenance_config,
+)
 
 
 def write_config(tmp_path: Path, content: str) -> Path:
@@ -329,3 +335,121 @@ def test_wrapped_date_trunc_accepted_without_chunk(tmp_path):
     )
     views = load_views(write_views(tmp_path, wrapped))
     assert views[0].full_refresh_chunk is None
+
+
+# ── Iceberg maintenance config ──
+
+
+_MAINTENANCE_YAML = """\
+views:
+  - name: v
+    query: "SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1"
+    optimize_interval_seconds: 3600
+    optimize_file_size_threshold: 128MB
+    expire_snapshots_interval_seconds: 86400
+    expire_snapshots_retention: 14d
+    remove_orphan_files_interval_seconds: 604800
+    remove_orphan_files_retention: 30d
+"""
+
+
+def test_maintenance_defaults_to_disabled(tmp_path):
+    """Views without maintenance fields load with all intervals at 0."""
+    minimal = (
+        "views:\n"
+        "  - name: v\n"
+        "    query: \"SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1\"\n"
+    )
+    v = load_views(write_views(tmp_path, minimal))[0]
+    assert v.optimize_interval_seconds == 0
+    assert v.optimize_file_size_threshold is None
+    assert v.expire_snapshots_interval_seconds == 0
+    assert v.expire_snapshots_retention == "7d"
+    assert v.remove_orphan_files_interval_seconds == 0
+    assert v.remove_orphan_files_retention == "7d"
+
+
+def test_maintenance_fields_loaded(tmp_path):
+    v = load_views(write_views(tmp_path, _MAINTENANCE_YAML))[0]
+    assert v.optimize_interval_seconds == 3600
+    assert v.optimize_file_size_threshold == "128MB"
+    assert v.expire_snapshots_interval_seconds == 86400
+    assert v.expire_snapshots_retention == "14d"
+    assert v.remove_orphan_files_interval_seconds == 604800
+    assert v.remove_orphan_files_retention == "30d"
+
+
+def test_maintenance_round_trip(tmp_path):
+    views = [ViewConfig(
+        name="v",
+        query="SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1",
+        optimize_interval_seconds=3600,
+        optimize_file_size_threshold="128MB",
+        expire_snapshots_interval_seconds=86400,
+        expire_snapshots_retention="14d",
+    )]
+    p = tmp_path / "views.yaml"
+    save_views(views, p)
+    loaded = load_views(p)[0]
+    assert loaded.optimize_interval_seconds == 3600
+    assert loaded.optimize_file_size_threshold == "128MB"
+    assert loaded.expire_snapshots_interval_seconds == 86400
+    assert loaded.expire_snapshots_retention == "14d"
+
+
+def test_save_views_omits_maintenance_defaults(tmp_path):
+    """Disabled ops and default retention values don't appear in YAML — the
+    common empty-maintenance view stays a short diff."""
+    views = [ViewConfig(
+        name="v",
+        query="SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1",
+    )]
+    p = tmp_path / "views.yaml"
+    save_views(views, p)
+    text = p.read_text()
+    assert "optimize_interval_seconds" not in text
+    assert "optimize_file_size_threshold" not in text
+    assert "expire_snapshots_interval_seconds" not in text
+    assert "expire_snapshots_retention" not in text
+    assert "remove_orphan_files_interval_seconds" not in text
+
+
+@pytest.mark.parametrize("field,value", [
+    ("optimize_interval_seconds", -1),
+    ("expire_snapshots_interval_seconds", -60),
+    ("remove_orphan_files_interval_seconds", -3600),
+])
+def test_maintenance_rejects_negative_interval(field, value):
+    with pytest.raises(ValueError, match=">= 0"):
+        validate_maintenance_config({field: value})
+
+
+@pytest.mark.parametrize("field,value", [
+    ("expire_snapshots_retention", "1 day"),
+    ("expire_snapshots_retention", "7"),
+    ("expire_snapshots_retention", "1w"),   # weeks not accepted by Trino
+    ("remove_orphan_files_retention", "forever"),
+])
+def test_maintenance_rejects_bad_retention(field, value):
+    with pytest.raises(ValueError, match="valid Trino duration"):
+        validate_maintenance_config({field: value})
+
+
+@pytest.mark.parametrize("value", ["128", "128m", "128 MB", "big"])
+def test_maintenance_rejects_bad_file_size_threshold(value):
+    with pytest.raises(ValueError, match="valid data size"):
+        validate_maintenance_config({"optimize_file_size_threshold": value})
+
+
+def test_maintenance_accepts_valid(tmp_path):
+    """Sanity: a fully-loaded maintenance YAML passes validation and parses."""
+    # Covered by test_maintenance_fields_loaded already, but an explicit
+    # smoke via validate_maintenance_config is cheap insurance.
+    validate_maintenance_config({
+        "optimize_interval_seconds": 3600,
+        "optimize_file_size_threshold": "128MB",
+        "expire_snapshots_interval_seconds": 86400,
+        "expire_snapshots_retention": "7d",
+        "remove_orphan_files_interval_seconds": 604800,
+        "remove_orphan_files_retention": "30d",
+    })
