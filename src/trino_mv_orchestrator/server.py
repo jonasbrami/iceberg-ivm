@@ -19,7 +19,6 @@ from prometheus_client import Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, field_validator
 
 from trino_mv_orchestrator.config import (
-    MAINTENANCE_OPS,
     Config,
     ViewConfig,
     load_config,
