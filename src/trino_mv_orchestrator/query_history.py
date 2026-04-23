@@ -34,6 +34,17 @@ CREATE TABLE IF NOT EXISTS query_history (
 );
 CREATE INDEX IF NOT EXISTS idx_query_history_view_started
     ON query_history (view, started_at DESC);
+
+-- Persists the last wall-clock time each maintenance op ran, per view.
+-- Separate from query_history because that table is a 50-row ring buffer
+-- per view — at a 60s refresh cadence maintenance rows would be evicted
+-- in under an hour and we'd re-run every op on restart.
+CREATE TABLE IF NOT EXISTS maintenance_state (
+    view      TEXT NOT NULL,
+    op        TEXT NOT NULL,
+    last_run  REAL NOT NULL,
+    PRIMARY KEY (view, op)
+);
 """
 
 
@@ -119,4 +130,25 @@ class QueryHistory:
     async def delete_view(self, view: str) -> None:
         assert self._db is not None, "QueryHistory.open() not called"
         await self._db.execute("DELETE FROM query_history WHERE view = ?", (view,))
+        await self._db.execute("DELETE FROM maintenance_state WHERE view = ?", (view,))
         await self._db.commit()
+
+    async def record_maintenance(self, view: str, op: str, last_run: float) -> None:
+        """Upsert the last-run timestamp for ``(view, op)``."""
+        assert self._db is not None, "QueryHistory.open() not called"
+        await self._db.execute(
+            "INSERT INTO maintenance_state (view, op, last_run) VALUES (?, ?, ?) "
+            "ON CONFLICT(view, op) DO UPDATE SET last_run = excluded.last_run",
+            (view, op, last_run),
+        )
+        await self._db.commit()
+
+    async def all_maintenance(self, view: str) -> dict[str, float]:
+        """Return ``{op: last_run}`` for every op recorded against ``view``."""
+        assert self._db is not None, "QueryHistory.open() not called"
+        async with self._db.execute(
+            "SELECT op, last_run FROM maintenance_state WHERE view = ?",
+            (view,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return {r[0]: r[1] for r in rows}

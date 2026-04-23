@@ -122,6 +122,27 @@ def build_merge_sql(
     )
 
 
+async def execute_maintenance(
+    cursor, target_table: str, op: str, params: dict[str, str],
+) -> QueryInfo:
+    """Run a single Iceberg maintenance op via ``ALTER TABLE ... EXECUTE``.
+
+    ``op`` is one of ``optimize`` / ``expire_snapshots`` / ``remove_orphan_files``.
+    ``params`` values are passed inline in Trino's named-arg syntax
+    (``key => 'val'``); callers must have validated them (see
+    ``config.validate_maintenance_config``) — we do not re-escape here because
+    Trino's parser does not accept escape sequences in string literals and
+    the only legitimate values are duration / DataSize literals.
+    """
+    if params:
+        args = ", ".join(f"{k} => '{v}'" for k, v in params.items())
+        sql = f"ALTER TABLE {target_table} EXECUTE {op}({args})"
+    else:
+        sql = f"ALTER TABLE {target_table} EXECUTE {op}"
+    log.info("%s: maintenance — %s", target_table, sql)
+    return await _execute_tracked(cursor, sql, stage=f"maintenance_{op}")
+
+
 async def execute_full_refresh(cursor, view: ViewConfig, target_table: str) -> RefreshResult:
     """Full refresh: DELETE all + INSERT all. Returns RefreshResult."""
     start = time.monotonic()

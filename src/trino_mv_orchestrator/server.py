@@ -19,6 +19,7 @@ from prometheus_client import Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, field_validator
 
 from trino_mv_orchestrator.config import (
+    MAINTENANCE_OPS,
     Config,
     ViewConfig,
     load_config,
@@ -26,6 +27,7 @@ from trino_mv_orchestrator.config import (
     save_views,
     validate_chunk_compatibility,
     validate_identifier,
+    validate_maintenance_config,
     validate_qualified_name,
 )
 from trino_mv_orchestrator.detector import RefreshAction, detect_changes
@@ -35,6 +37,7 @@ from trino_mv_orchestrator.executor import (
     execute_chunked_full_refresh,
     execute_full_refresh,
     execute_incremental_refresh,
+    execute_maintenance,
 )
 from trino_mv_orchestrator.introspect import (
     build_create_table_sql,
@@ -117,6 +120,22 @@ RECENT_QUERY_LIMIT = 50
 
 
 @dataclass
+class MaintenanceOpStatus:
+    """Per-op runtime status for one view (e.g. optimize, expire_snapshots).
+
+    ``last_run`` is wall-clock epoch seconds — persisted to SQLite via
+    ``QueryHistory.record_maintenance`` so scheduling survives process
+    restarts (a 7d retention interval is meaningless if every restart
+    resets it to ``None`` and re-runs immediately).
+    """
+    last_run: float | None = None
+    last_duration: float | None = None
+    last_error: str | None = None
+    total_runs: int = 0
+    total_errors: int = 0
+
+
+@dataclass
 class ViewStatus:
     name: str
     last_refresh: float | None = None
@@ -135,6 +154,9 @@ class ViewStatus:
     # Ring buffer of the last few refresh queries (MERGE / INSERT / DELETE).
     # In-memory only; cleared on process restart.
     recent_queries: list[QueryInfo] = field(default_factory=list)
+    # Per-maintenance-op status, keyed by op name (see config.MAINTENANCE_OPS).
+    # ``last_run`` within each entry is hydrated from SQLite on startup.
+    maintenance: dict[str, MaintenanceOpStatus] = field(default_factory=dict)
 
 
 @dataclass
@@ -246,11 +268,15 @@ def reload_config(s: AppState) -> bool:
 
 
 async def hydrate_recent_queries(s: AppState) -> None:
-    """Populate ``ViewStatus.recent_queries`` from the persisted DB.
+    """Populate ``ViewStatus.recent_queries`` and per-op maintenance state
+    from the persisted DB.
 
     Called once at startup (after ``history`` is opened) and whenever a
     fresh ``ViewStatus`` is seeded for a reloaded view. Cheap — one
     indexed query per view, capped to ``RECENT_QUERY_LIMIT``.
+
+    Also seeds ``maintenance[op].last_run`` from ``maintenance_state`` so
+    the scheduler doesn't re-run a just-run op after a restart.
     """
     if s.history is None or s.config is None:
         return
@@ -258,6 +284,57 @@ async def hydrate_recent_queries(s: AppState) -> None:
         vs = s.view_statuses.setdefault(v.name, ViewStatus(name=v.name))
         if not vs.recent_queries:
             vs.recent_queries = await s.history.recent(v.name)
+        if not vs.maintenance:
+            for op, last_run in (await s.history.all_maintenance(v.name)).items():
+                vs.maintenance[op] = MaintenanceOpStatus(last_run=last_run)
+
+
+async def maintain_view(
+    s: AppState, view: ViewConfig, cursor, target_table: str,
+) -> None:
+    """Run any due Iceberg maintenance ops for ``view``.
+
+    Called from ``refresh_view`` after a successful refresh on the same
+    cursor/session. Serialising with refresh avoids Iceberg commit
+    conflicts for free — asyncio is single-threaded and ``view_worker`` is
+    the sole caller of ``refresh_view`` per view.
+
+    ``0`` interval means the op is disabled. Last-run times are persisted
+    so restarts resume the schedule rather than re-running immediately.
+    """
+    ops = [
+        ("optimize", view.optimize_interval_seconds,
+            {"file_size_threshold": view.optimize_file_size_threshold}
+            if view.optimize_file_size_threshold else {}),
+        ("expire_snapshots", view.expire_snapshots_interval_seconds,
+            {"retention_threshold": view.expire_snapshots_retention}),
+        ("remove_orphan_files", view.remove_orphan_files_interval_seconds,
+            {"retention_threshold": view.remove_orphan_files_retention}),
+    ]
+    vs = s.view_statuses.setdefault(view.name, ViewStatus(name=view.name))
+    now = time.time()
+    for op, interval, params in ops:
+        if interval <= 0:
+            continue
+        ms = vs.maintenance.setdefault(op, MaintenanceOpStatus())
+        if ms.last_run is not None and now - ms.last_run < interval:
+            continue
+        try:
+            qi = await execute_maintenance(cursor, target_table, op, params)
+            ms.last_run = time.time()
+            ms.last_duration = qi.elapsed_ms / 1000.0
+            ms.last_error = None
+            ms.total_runs += 1
+            if s.history is not None:
+                await s.history.append(view.name, [qi])
+                await s.history.record_maintenance(view.name, op, ms.last_run)
+                vs.recent_queries = await s.history.recent(view.name)
+            else:
+                vs.recent_queries = ([qi, *vs.recent_queries])[:RECENT_QUERY_LIMIT]
+        except Exception as e:
+            ms.last_error = str(e)
+            ms.total_errors += 1
+            log.exception("%s: maintenance %s failed", view.name, op)
 
 
 async def refresh_view(s: AppState, view: ViewConfig) -> None:
@@ -316,6 +393,7 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
                 and result.current_snapshot != last_snap
             ):
                 await write_last_snapshot(cursor, target_table, result.current_snapshot)
+            await maintain_view(s, view, cursor, target_table)
             return
 
         if result.action == RefreshAction.FULL_REFRESH:
@@ -409,6 +487,8 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
         lbl = {"view": view.name, **source_labels}
         REFRESH_BYTES.labels(**lbl).inc(refresh_result.processed_bytes)
         REFRESH_ROWS.labels(**lbl).inc(refresh_result.processed_rows)
+
+        await maintain_view(s, view, cursor, target_table)
 
     except Exception as e:
         vs.last_error = str(e)
@@ -559,6 +639,12 @@ class ViewCreate(BaseModel):
     target_partitioning: str | None = None
     refresh_interval_seconds: int = 60
     full_refresh_chunk: str | None = None
+    optimize_interval_seconds: int = 0
+    optimize_file_size_threshold: str | None = None
+    expire_snapshots_interval_seconds: int = 0
+    expire_snapshots_retention: str = "7d"
+    remove_orphan_files_interval_seconds: int = 0
+    remove_orphan_files_retention: str = "7d"
 
     @field_validator("name")
     @classmethod
@@ -590,6 +676,12 @@ class ViewResponse(BaseModel):
     target_partitioning: str | None = None
     refresh_interval_seconds: int = 60
     full_refresh_chunk: str | None = None
+    optimize_interval_seconds: int = 0
+    optimize_file_size_threshold: str | None = None
+    expire_snapshots_interval_seconds: int = 0
+    expire_snapshots_retention: str = "7d"
+    remove_orphan_files_interval_seconds: int = 0
+    remove_orphan_files_retention: str = "7d"
     status: dict | None = None
 
 
@@ -603,6 +695,12 @@ def _view_to_response(v: ViewConfig, vs: ViewStatus | None) -> ViewResponse:
         target_table=v.target_table, target_partitioning=v.target_partitioning,
         refresh_interval_seconds=v.refresh_interval_seconds,
         full_refresh_chunk=v.full_refresh_chunk,
+        optimize_interval_seconds=v.optimize_interval_seconds,
+        optimize_file_size_threshold=v.optimize_file_size_threshold,
+        expire_snapshots_interval_seconds=v.expire_snapshots_interval_seconds,
+        expire_snapshots_retention=v.expire_snapshots_retention,
+        remove_orphan_files_interval_seconds=v.remove_orphan_files_interval_seconds,
+        remove_orphan_files_retention=v.remove_orphan_files_retention,
         status=dataclasses.asdict(vs) if vs else None,
     )
 
@@ -651,6 +749,45 @@ VIEW_FORM_SCHEMA: list[dict] = [
          "and each chunk is committed independently. Leave empty for a "
          "single-shot refresh. Must be coarser-or-equal to the view's own "
          "date_trunc granularity."
+     )},
+
+    # ── Iceberg table maintenance. 0 disables each op; runs right after a
+    #    successful refresh on the same Trino session so no commit conflict.
+    {"name": "optimize_interval_seconds", "label": "Optimize Every",
+     "type": "number", "required": False, "default": 0, "min": 0,
+     "suffix": "seconds", "group": "maintenance",
+     "help": (
+         "0 disables. Runs ALTER TABLE ... EXECUTE optimize to compact "
+         "small files (useful for MVs that do many MERGE writes)."
+     )},
+    {"name": "optimize_file_size_threshold", "label": "Optimize File Size Threshold",
+     "type": "string", "required": False, "group": "maintenance",
+     "placeholder": "e.g. 128MB (default: Trino's 100MB)"},
+    {"name": "expire_snapshots_interval_seconds", "label": "Expire Snapshots Every",
+     "type": "number", "required": False, "default": 0, "min": 0,
+     "suffix": "seconds", "group": "maintenance",
+     "help": (
+         "0 disables. Runs ALTER TABLE ... EXECUTE expire_snapshots to "
+         "drop old snapshots and their data files."
+     )},
+    {"name": "expire_snapshots_retention", "label": "Expire Snapshots Retention",
+     "type": "string", "required": False, "default": "7d", "group": "maintenance",
+     "help": (
+         "Trino duration (e.g. '7d', '24h'). Must be ≥ the catalog's "
+         "iceberg.expire-snapshots.min-retention (default 7d)."
+     )},
+    {"name": "remove_orphan_files_interval_seconds", "label": "Remove Orphan Files Every",
+     "type": "number", "required": False, "default": 0, "min": 0,
+     "suffix": "seconds", "group": "maintenance",
+     "help": (
+         "0 disables. Runs ALTER TABLE ... EXECUTE remove_orphan_files "
+         "to delete files not referenced by metadata."
+     )},
+    {"name": "remove_orphan_files_retention", "label": "Remove Orphan Files Retention",
+     "type": "string", "required": False, "default": "7d", "group": "maintenance",
+     "help": (
+         "Trino duration (e.g. '7d'). Must be ≥ the catalog's "
+         "iceberg.remove-orphan-files.min-retention."
      )},
 ]
 
@@ -726,6 +863,7 @@ def create_view(
     try:
         parse_view_query(body.query)
         validate_chunk_compatibility(body.full_refresh_chunk, body.query)
+        validate_maintenance_config(body.model_dump())
     except ValueError as exc:
         raise HTTPException(422, str(exc))
 
@@ -734,6 +872,8 @@ def create_view(
     payload = body.model_dump()
     if not payload.get("full_refresh_chunk"):
         payload["full_refresh_chunk"] = None
+    if not payload.get("optimize_file_size_threshold"):
+        payload["optimize_file_size_threshold"] = None
     new_view = ViewConfig(**payload)
     new_views = list(s.config.views) + [new_view]
     new_cfg = Config(trino=s.config.trino, views=new_views, server=s.config.server)
@@ -770,12 +910,15 @@ def update_view(
 
     try:
         validate_chunk_compatibility(body.full_refresh_chunk, body.query)
+        validate_maintenance_config(body.model_dump())
     except ValueError as exc:
         raise HTTPException(422, str(exc))
 
     payload = body.model_dump()
     if not payload.get("full_refresh_chunk"):
         payload["full_refresh_chunk"] = None
+    if not payload.get("optimize_file_size_threshold"):
+        payload["optimize_file_size_threshold"] = None
     updated = ViewConfig(**payload)
     new_views = [updated if v.name == name else v for v in s.config.views]
     new_cfg = Config(trino=s.config.trino, views=new_views, server=s.config.server)

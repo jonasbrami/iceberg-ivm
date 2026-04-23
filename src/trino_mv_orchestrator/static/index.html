@@ -346,6 +346,26 @@
             <span x-text="view.status?.last_error"></span>
           </div>
 
+          <!-- Maintenance chips: one per op configured with an interval.
+               Shown only when an op has actually run once (last_run != null),
+               so disabled ops don't clutter the card. Red-tint on error. -->
+          <div x-show="view.status?.maintenance && Object.keys(view.status.maintenance).length > 0"
+               class="flex flex-wrap gap-x-[18px] gap-y-[6px] mt-3 pt-[12px]
+                      border-t border-[rgba(15,15,30,0.06)]">
+            <span class="text-[9.5px] font-mono text-[#9090a8] uppercase tracking-[0.08em]">Maintenance</span>
+            <template x-for="[op, s] in Object.entries(view.status?.maintenance ?? {})" :key="op">
+              <div x-show="s?.last_run" class="flex items-baseline gap-[6px]"
+                   :class="s?.last_error ? 'text-red-700' : 'text-[#3a3a52]'"
+                   :title="s?.last_error || ''">
+                <span class="text-[9.5px] font-mono uppercase tracking-[0.08em]"
+                      :class="s?.last_error ? 'text-red-700/85' : 'text-purple-700/85'"
+                      x-text="op.replace(/_/g, ' ')"></span>
+                <span class="text-[12px] font-mono tabular-nums"
+                      x-text="s?.last_run ? timeAgo(s.last_run) : '—'"></span>
+              </div>
+            </template>
+          </div>
+
           <!-- Query (collapsible) -->
           <details class="group mt-3">
             <summary class="flex items-center gap-[5px] w-fit cursor-pointer select-none
@@ -388,7 +408,9 @@
                                   ? 'bg-indigo-500/[0.10] text-indigo-700 border border-indigo-500/[0.25]'
                                   : q.stage === 'full_insert'
                                     ? 'bg-emerald-500/[0.10] text-emerald-800 border border-emerald-500/[0.25]'
-                                    : 'bg-[rgba(15,15,30,0.05)] text-[#666684] border border-[rgba(15,15,30,0.10)]'"
+                                    : q.stage?.startsWith('maintenance_')
+                                      ? 'bg-purple-500/[0.10] text-purple-700 border border-purple-500/[0.25]'
+                                      : 'bg-[rgba(15,15,30,0.05)] text-[#666684] border border-[rgba(15,15,30,0.10)]'"
                         x-text="q.stage"></span>
 
                   <!-- query id -->

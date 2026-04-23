@@ -8,6 +8,7 @@ from trino_mv_orchestrator.executor import (
     execute_chunked_full_refresh,
     execute_full_refresh,
     execute_incremental_refresh,
+    execute_maintenance,
 )
 from trino_mv_orchestrator.query_parser import parse_view_query
 
@@ -412,6 +413,48 @@ class TestExecuteChunkedFullRefresh:
         assert captured[0].chunks_total == 3
         assert captured[0].chunks_done == 1
 
+class TestExecuteMaintenance:
+    async def test_optimize_without_params(self):
+        cursor = MockCursorWithStats(stats={"processedRows": 0})
+        q = await execute_maintenance(cursor, "iceberg.out.mv", "optimize", {})
+        assert cursor.executed == ["ALTER TABLE iceberg.out.mv EXECUTE optimize"]
+        assert q.stage == "maintenance_optimize"
+        assert q.query_id
+
+    async def test_optimize_with_file_size_threshold(self):
+        cursor = MockCursorWithStats()
+        await execute_maintenance(
+            cursor, "iceberg.out.mv", "optimize",
+            {"file_size_threshold": "128MB"},
+        )
+        assert cursor.executed == [
+            "ALTER TABLE iceberg.out.mv EXECUTE optimize(file_size_threshold => '128MB')",
+        ]
+
+    async def test_expire_snapshots_with_retention(self):
+        cursor = MockCursorWithStats()
+        q = await execute_maintenance(
+            cursor, "iceberg.out.mv", "expire_snapshots",
+            {"retention_threshold": "7d"},
+        )
+        assert cursor.executed == [
+            "ALTER TABLE iceberg.out.mv EXECUTE expire_snapshots(retention_threshold => '7d')",
+        ]
+        assert q.stage == "maintenance_expire_snapshots"
+
+    async def test_remove_orphan_files_with_retention(self):
+        cursor = MockCursorWithStats()
+        q = await execute_maintenance(
+            cursor, "iceberg.out.mv", "remove_orphan_files",
+            {"retention_threshold": "30d"},
+        )
+        assert cursor.executed == [
+            "ALTER TABLE iceberg.out.mv EXECUTE remove_orphan_files(retention_threshold => '30d')",
+        ]
+        assert q.stage == "maintenance_remove_orphan_files"
+
+
+class TestExecuteChunkedFullRefreshEdge:
     async def test_fully_caught_up_target_emits_no_merges(self):
         """Target has ingested through Apr 10 — same as source max. No chunks
         should be emitted; next tick will observe last_source_snapshot=None
