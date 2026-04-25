@@ -573,7 +573,7 @@ async def test_maintain_view_persists_last_run_to_history(setup_state, tmp_path)
 
         persisted = await h.all_maintenance("test_view")
         assert "optimize" in persisted
-        assert persisted["optimize"] > 0
+        assert persisted["optimize"]["last_run"] > 0
     finally:
         await h.close()
 
@@ -587,10 +587,10 @@ async def test_hydrate_rehydrates_maintenance_last_run(setup_state, tmp_path):
     await h.open()
     setup_state.history = h
     try:
-        await h.record_maintenance("test_view", "optimize", 12345.0)
+        await h.upsert_maintenance("test_view", "optimize", {"last_run": 12345.0})
         # Fresh ViewStatus, empty maintenance dict — hydrate must populate it.
         setup_state.view_statuses["test_view"] = ViewStatus(name="test_view")
-        await server_mod.hydrate_recent_queries(setup_state)
+        await server_mod.hydrate_view_state(setup_state)
         vs = setup_state.view_statuses["test_view"]
         assert vs.maintenance["optimize"].last_run == 12345.0
     finally:
@@ -1000,7 +1000,7 @@ async def test_refresh_persists_queries_and_hydrates_on_restart(
 ):
     """End-to-end: attaching a QueryHistory to AppState must cause refresh_view
     to persist QueryInfo rows, and a fresh ViewStatus with an empty
-    recent_queries must re-hydrate from the DB via hydrate_recent_queries."""
+    recent_queries must re-hydrate from the DB via hydrate_view_state."""
     from trino_mv_orchestrator import server as server_mod
     from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
     from trino_mv_orchestrator.executor import QueryInfo
@@ -1049,7 +1049,7 @@ async def test_refresh_persists_queries_and_hydrates_on_restart(
 
         # Simulate a restart: ViewStatus is fresh, DB survives.
         setup_state.view_statuses[view.name] = ViewStatus(name=view.name)
-        await server_mod.hydrate_recent_queries(setup_state)
+        await server_mod.hydrate_view_state(setup_state)
         rehydrated = setup_state.view_statuses[view.name].recent_queries
         assert [q.query_id for q in rehydrated] == ["persisted_qid"]
     finally:
@@ -1067,11 +1067,342 @@ async def test_delete_view_purges_history(setup_state, tmp_path, client):
             query_id="x", info_uri="http://trino/x", stage="merge",
             started_at=1.0, elapsed_ms=1.0,
         )])
+        await h.upsert_view_status("test_view", {"total_refreshes": 9})
         assert len(await h.recent("test_view")) == 1
+        assert await h.get_view_status("test_view") is not None
 
         r = client.delete("/api/views/test_view")
         assert r.status_code == 204
         assert await h.recent("test_view") == []
+        assert await h.get_view_status("test_view") is None
+    finally:
+        await h.close()
+
+
+# ── Issue #40: ViewStatus counters survive restart ──
+
+
+async def test_refresh_persists_view_status_counters(setup_state, tmp_path):
+    """After a refresh, ``view_status`` must hold the new counters so a
+    restart re-hydrates them (the bug from issue #40 was that ``total_refreshes``,
+    ``last_refresh``, ``chunks_done`` etc. all reset to zero on every restart)."""
+    from trino_mv_orchestrator import server as server_mod
+    from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
+    from trino_mv_orchestrator.executor import QueryInfo
+    from trino_mv_orchestrator.introspect import ColumnInfo
+
+    view = setup_state.config.views[0]
+    setup_state._stop = False  # fixture defaults to True; refresh_view bails on stop
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+
+    class FakeConn:
+        async def cursor(self): return FakeCursor()
+        async def close(self): pass
+
+    class FakeCursor:
+        stats = {}
+        async def execute(self, sql): pass
+        async def fetchone(self): return None
+        async def fetchall(self): return []
+
+    async def fake_write(c, t, snap_id): pass
+    async def fake_read(c, t): return None
+    async def fake_detect(*a, **kw):
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=1)
+    async def fake_discover(c, q):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+    async def fake_execute_refresh(*a, **kw):
+        yield QueryInfo(
+            query_id="q1", info_uri="http://trino/q1",
+            stage="merge", started_at=10.0, elapsed_ms=250.0,
+            processed_rows=1, processed_bytes=64, chunks_done=1, chunks_total=1,
+        )
+
+    try:
+        with patch.object(server_mod, "get_trino_connection", lambda s: FakeConn()), \
+             patch.object(server_mod, "discover_columns", fake_discover), \
+             patch.object(server_mod, "read_last_snapshot", fake_read), \
+             patch.object(server_mod, "write_last_snapshot", fake_write), \
+             patch.object(server_mod, "detect_changes", fake_detect), \
+             patch.object(server_mod, "execute_refresh", fake_execute_refresh):
+            await server_mod.refresh_view(setup_state, view)
+
+        persisted = await h.get_view_status(view.name)
+        assert persisted is not None
+        assert persisted["total_refreshes"] == 4   # fixture seeded 3 + this run
+        assert persisted["last_action"] == "full"
+        assert persisted["last_refresh"] is not None
+        assert persisted["last_duration"] == pytest.approx(0.25)
+        assert persisted["chunks_total"] is None
+    finally:
+        await h.close()
+
+
+async def test_hydrate_view_state_restores_persisted_counters(setup_state, tmp_path):
+    """A fresh ViewStatus (counters at zero) must adopt the persisted
+    snapshot — that's the user-visible fix for issue #40."""
+    from trino_mv_orchestrator import server as server_mod
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+    try:
+        await h.upsert_view_status("test_view", {
+            "last_refresh": 1776916823.87,
+            "last_duration": 2.76,
+            "last_action": "skip",
+            "last_range": "[2026-04-23 03:50:00, 2026-04-23 04:01:00)",
+            "last_error": None,
+            "total_refreshes": 99,
+            "total_errors": 0,
+            "chunks_done": 68,
+            "chunks_total": 68,
+        })
+
+        # Simulate a restart: ViewStatus is fresh, DB survives.
+        setup_state.view_statuses["test_view"] = ViewStatus(name="test_view")
+        await server_mod.hydrate_view_state(setup_state)
+
+        vs = setup_state.view_statuses["test_view"]
+        assert vs.total_refreshes == 99
+        assert vs.last_refresh == 1776916823.87
+        assert vs.last_duration == 2.76
+        assert vs.last_action == "skip"
+        assert vs.last_range == "[2026-04-23 03:50:00, 2026-04-23 04:01:00)"
+        assert vs.chunks_done == 68
+        assert vs.chunks_total == 68
+    finally:
+        await h.close()
+
+
+async def test_refresh_then_restart_round_trips_total_refreshes(setup_state, tmp_path):
+    """End-to-end: refresh once, simulate restart (drop ViewStatus, re-hydrate),
+    and ``total_refreshes`` survives. This is the headline fix for issue #40."""
+    from trino_mv_orchestrator import server as server_mod
+    from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
+    from trino_mv_orchestrator.executor import QueryInfo
+    from trino_mv_orchestrator.introspect import ColumnInfo
+
+    view = setup_state.config.views[0]
+    setup_state.view_statuses[view.name] = ViewStatus(name=view.name)
+    setup_state._stop = False  # fixture defaults to True; refresh_view bails on stop
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+
+    class FakeConn:
+        async def cursor(self): return FakeCursor()
+        async def close(self): pass
+
+    class FakeCursor:
+        stats = {}
+        async def execute(self, sql): pass
+        async def fetchone(self): return None
+        async def fetchall(self): return []
+
+    async def fake_write(c, t, snap_id): pass
+    async def fake_read(c, t): return None
+    async def fake_detect(*a, **kw):
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=1)
+    async def fake_discover(c, q):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+    async def fake_execute_refresh(*a, **kw):
+        yield QueryInfo(
+            query_id="q1", info_uri="http://trino/q1",
+            stage="merge", started_at=1.0, elapsed_ms=10.0,
+            processed_rows=1, processed_bytes=8, chunks_done=1, chunks_total=1,
+        )
+
+    try:
+        with patch.object(server_mod, "get_trino_connection", lambda s: FakeConn()), \
+             patch.object(server_mod, "discover_columns", fake_discover), \
+             patch.object(server_mod, "read_last_snapshot", fake_read), \
+             patch.object(server_mod, "write_last_snapshot", fake_write), \
+             patch.object(server_mod, "detect_changes", fake_detect), \
+             patch.object(server_mod, "execute_refresh", fake_execute_refresh):
+            await server_mod.refresh_view(setup_state, view)
+
+        assert setup_state.view_statuses[view.name].total_refreshes == 1
+
+        # Simulate a process restart: drop the in-memory status, re-hydrate.
+        setup_state.view_statuses[view.name] = ViewStatus(name=view.name)
+        await server_mod.hydrate_view_state(setup_state)
+        assert setup_state.view_statuses[view.name].total_refreshes == 1
+        assert setup_state.view_statuses[view.name].last_action == "full"
+    finally:
+        await h.close()
+
+
+async def test_refresh_failure_persists_last_error(setup_state, tmp_path):
+    """A refresh that raises must persist ``last_error`` / ``total_errors``
+    so the UI doesn't lose the failure on restart (issue #40 explicitly
+    flags this as desirable)."""
+    from trino_mv_orchestrator import server as server_mod
+    from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
+    from trino_mv_orchestrator.introspect import ColumnInfo
+
+    view = setup_state.config.views[0]
+    setup_state.view_statuses[view.name] = ViewStatus(name=view.name)
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+
+    class FakeConn:
+        async def cursor(self): return FakeCursor()
+        async def close(self): pass
+
+    class FakeCursor:
+        stats = {}
+        async def execute(self, sql): pass
+        async def fetchone(self): return None
+        async def fetchall(self): return []
+
+    async def fake_read(c, t): return None
+    async def fake_detect(*a, **kw):
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=1)
+    async def fake_discover(c, q):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+    async def fake_execute_refresh(*a, **kw):
+        raise RuntimeError("trino exploded")
+        yield  # pragma: no cover (make it a generator)
+
+    try:
+        with patch.object(server_mod, "get_trino_connection", lambda s: FakeConn()), \
+             patch.object(server_mod, "discover_columns", fake_discover), \
+             patch.object(server_mod, "read_last_snapshot", fake_read), \
+             patch.object(server_mod, "detect_changes", fake_detect), \
+             patch.object(server_mod, "execute_refresh", fake_execute_refresh):
+            await server_mod.refresh_view(setup_state, view)
+
+        persisted = await h.get_view_status(view.name)
+        assert persisted is not None
+        assert persisted["last_error"] == "trino exploded"
+        assert persisted["total_errors"] == 1
+    finally:
+        await h.close()
+
+
+async def test_post_restart_no_change_clears_chunks_total(setup_state, tmp_path):
+    """A NO_CHANGE tick after a restart that hydrated mid-backfill state
+    must clear ``chunks_total``. Otherwise the UI keeps showing a phantom
+    backfill in flight after the source caught up."""
+    from trino_mv_orchestrator import server as server_mod
+    from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
+    from trino_mv_orchestrator.introspect import ColumnInfo
+
+    view = setup_state.config.views[0]
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+    try:
+        # Pretend the previous process was killed mid-backfill.
+        await h.upsert_view_status(view.name, {
+            "last_action": "chunked_full",
+            "chunks_done": 5,
+            "chunks_total": 10,
+            "total_refreshes": 0,
+        })
+        setup_state.view_statuses[view.name] = ViewStatus(name=view.name)
+        await server_mod.hydrate_view_state(setup_state)
+        assert setup_state.view_statuses[view.name].chunks_total == 10
+
+        class FakeConn:
+            async def cursor(self): return FakeCursor()
+            async def close(self): pass
+
+        class FakeCursor:
+            stats = {}
+            async def execute(self, sql): pass
+            async def fetchone(self): return None
+            async def fetchall(self): return []
+
+        async def fake_read(c, t): return 1
+        async def fake_detect(*a, **kw):
+            return ChangeResult(action=RefreshAction.NO_CHANGE, current_snapshot=1)
+        async def fake_discover(c, q):
+            return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+
+        with patch.object(server_mod, "get_trino_connection", lambda s: FakeConn()), \
+             patch.object(server_mod, "discover_columns", fake_discover), \
+             patch.object(server_mod, "read_last_snapshot", fake_read), \
+             patch.object(server_mod, "detect_changes", fake_detect):
+            await server_mod.refresh_view(setup_state, view)
+
+        vs = setup_state.view_statuses[view.name]
+        assert vs.last_action == "skip"
+        assert vs.chunks_total is None, (
+            "stale chunks_total from a mid-backfill restart was not cleared"
+        )
+    finally:
+        await h.close()
+
+
+async def test_maintenance_persists_full_field_dict(setup_state, tmp_path):
+    """``maintain_view`` must persist every MaintenanceOpStatus field, not
+    just last_run — so total_runs / last_duration etc. survive restart."""
+    from trino_mv_orchestrator import server as server_mod
+    from trino_mv_orchestrator.config import ViewConfig
+    from trino_mv_orchestrator.executor import QueryInfo
+
+    v = ViewConfig(
+        name="test_view",
+        query=_EXISTING_QUERY,
+        target_table="iceberg.analytics.test_view",
+        optimize_interval_seconds=60,
+    )
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view")
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+    try:
+        async def fake_maintenance(cursor, target, op, params):
+            return QueryInfo(
+                query_id="q1", info_uri="http://trino/q1",
+                stage=f"maintenance_{op}", started_at=1.0, elapsed_ms=42.0,
+            )
+
+        with patch.object(server_mod, "execute_maintenance", fake_maintenance):
+            await server_mod.maintain_view(setup_state, v, cursor=None, target_table="t")
+
+        persisted = await h.all_maintenance("test_view")
+        assert "optimize" in persisted
+        op = persisted["optimize"]
+        assert op["last_run"] > 0
+        assert op["last_duration"] == pytest.approx(0.042)
+        assert op["total_runs"] == 1
+        assert op["total_errors"] == 0
+        assert op["last_error"] is None
+    finally:
+        await h.close()
+
+
+async def test_hydrate_restores_full_maintenance_state(setup_state, tmp_path):
+    """Hydration must rebuild every MaintenanceOpStatus field, not just last_run."""
+    from trino_mv_orchestrator import server as server_mod
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+    try:
+        await h.upsert_maintenance("test_view", "optimize", {
+            "last_run": 12345.0,
+            "last_duration": 5.0,
+            "last_error": "some failure",
+            "total_runs": 4,
+            "total_errors": 1,
+        })
+        setup_state.view_statuses["test_view"] = ViewStatus(name="test_view")
+        await server_mod.hydrate_view_state(setup_state)
+        ms = setup_state.view_statuses["test_view"].maintenance["optimize"]
+        assert ms.last_run == 12345.0
+        assert ms.last_duration == 5.0
+        assert ms.last_error == "some failure"
+        assert ms.total_runs == 4
+        assert ms.total_errors == 1
     finally:
         await h.close()
 

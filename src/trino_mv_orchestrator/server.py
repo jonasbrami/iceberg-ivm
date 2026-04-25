@@ -79,7 +79,7 @@ class MaintenanceOpStatus:
     """Per-op runtime status for one view (e.g. optimize, expire_snapshots).
 
     ``last_run`` is wall-clock epoch seconds — persisted to SQLite via
-    ``QueryHistory.record_maintenance`` so scheduling survives process
+    ``QueryHistory.upsert_maintenance`` so scheduling survives process
     restarts (a 7d retention interval is meaningless if every restart
     resets it to ``None`` and re-runs immediately).
     """
@@ -212,16 +212,61 @@ def reload_config(s: AppState) -> None:
         log.exception("failed to reload config")
 
 
-async def hydrate_recent_queries(s: AppState) -> None:
-    """Populate ``ViewStatus.recent_queries`` and per-op maintenance state
-    from the persisted DB.
+def _view_status_persist_fields(vs: ViewStatus) -> dict:
+    """Project ``vs`` to the dict shape stored in ``view_status``.
+
+    ``recent_queries`` and ``maintenance`` are persisted separately
+    (their own tables) and intentionally excluded so we never
+    accidentally cross the boundary.
+    """
+    return {
+        "last_refresh":    vs.last_refresh,
+        "last_duration":   vs.last_duration,
+        "last_action":     vs.last_action,
+        "last_range":      vs.last_range,
+        "last_error":      vs.last_error,
+        "total_refreshes": vs.total_refreshes,
+        "total_errors":    vs.total_errors,
+        "chunks_done":     vs.chunks_done,
+        "chunks_total":    vs.chunks_total,
+    }
+
+
+async def _persist_view_status(s: AppState, view_name: str, vs: ViewStatus) -> None:
+    """Mirror ``vs`` to ``view_status`` if a history is attached.
+
+    Called from every refresh/maintenance mutation site — write rate is
+    negligible (a few inserts per refresh, seconds apart) so we don't
+    batch. Silently no-ops in tests that don't attach a QueryHistory.
+    """
+    if s.history is None:
+        return
+    await s.history.upsert_view_status(view_name, _view_status_persist_fields(vs))
+
+
+def _maintenance_persist_fields(ms: MaintenanceOpStatus) -> dict:
+    """Project ``ms`` to the dict shape stored in ``maintenance_state``."""
+    return {
+        "last_run":      ms.last_run,
+        "last_duration": ms.last_duration,
+        "last_error":    ms.last_error,
+        "total_runs":    ms.total_runs,
+        "total_errors":  ms.total_errors,
+    }
+
+
+async def hydrate_view_state(s: AppState) -> None:
+    """Populate ``ViewStatus`` from the persisted DB.
 
     Called once at startup (after ``history`` is opened) and whenever a
     fresh ``ViewStatus`` is seeded for a reloaded view. Cheap — one
     indexed query per view, capped to ``RECENT_QUERY_LIMIT``.
 
-    Also seeds ``maintenance[op].last_run`` from ``maintenance_state`` so
-    the scheduler doesn't re-run a just-run op after a restart.
+    Three sources are merged:
+
+    * ``query_history``     → ``vs.recent_queries``
+    * ``view_status``       → scalar status fields (counters, last_*)
+    * ``maintenance_state`` → ``vs.maintenance[op]``
     """
     if s.history is None or s.config is None:
         return
@@ -229,9 +274,18 @@ async def hydrate_recent_queries(s: AppState) -> None:
         vs = s.view_statuses.setdefault(v.name, ViewStatus(name=v.name))
         if not vs.recent_queries:
             vs.recent_queries = await s.history.recent(v.name)
+        # Status scalars: only hydrate on a fresh ViewStatus (default values)
+        # to avoid clobbering an already-running view's in-memory counters.
+        # The fixed sentinel here is total_refreshes==0 and last_refresh is None.
+        persisted = await s.history.get_view_status(v.name)
+        if persisted is not None and vs.total_refreshes == 0 and vs.last_refresh is None:
+            for k, val in persisted.items():
+                # last_action defaults to "pending"; respect persisted value
+                # only if it's there. setattr handles all known fields safely.
+                setattr(vs, k, val)
         if not vs.maintenance:
-            for op, last_run in (await s.history.all_maintenance(v.name)).items():
-                vs.maintenance[op] = MaintenanceOpStatus(last_run=last_run)
+            for op, fields in (await s.history.all_maintenance(v.name)).items():
+                vs.maintenance[op] = MaintenanceOpStatus(**fields)
 
 
 async def maintain_view(
@@ -267,11 +321,21 @@ async def maintain_view(
             ms.total_runs += 1
             await _record_query(s, view.name, vs, qi)
             if s.history is not None:
-                await s.history.record_maintenance(view.name, op, ms.last_run)
+                await s.history.upsert_maintenance(
+                    view.name, op, _maintenance_persist_fields(ms),
+                )
         except Exception as e:
             ms.last_error = str(e)
             ms.total_errors += 1
             log.exception("%s: maintenance %s failed", view.name, op)
+            # Persist the failure too so total_errors / last_error survive
+            # restart. Skipped if last_run is still None (initial failure
+            # before any successful run) — the table requires a non-null
+            # last_run and there's no useful timestamp to record yet.
+            if s.history is not None and ms.last_run is not None:
+                await s.history.upsert_maintenance(
+                    view.name, op, _maintenance_persist_fields(ms),
+                )
 
 
 async def _record_query(s: AppState, view_name: str, vs: ViewStatus, q: QueryInfo) -> None:
@@ -317,11 +381,19 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
 
         if result.action == RefreshAction.NO_CHANGE:
             vs.last_action = "skip"
+            # Clear any lingering in-flight chunked-backfill progress that may
+            # have been hydrated from view_status after a mid-backfill restart.
+            # If the source has caught up while the orchestrator was down, the
+            # next tick is NO_CHANGE — but the persisted chunks_total would
+            # still claim a backfill is in flight. The committed bookmark
+            # (last_source_snapshot) is the source of truth here.
+            vs.chunks_total = None
             REFRESH_TOTAL.labels(view=view.name, type="skip").inc()
             # Advance state past empty-append / compaction-only snapshots so
             # we don't re-detect them every cycle.
             if result.current_snapshot is not None and result.current_snapshot != last_snap:
                 await write_last_snapshot(cursor, target_table, result.current_snapshot)
+            await _persist_view_status(s, view.name, vs)
             await maintain_view(s, view, cursor, target_table)
             return
 
@@ -356,6 +428,7 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
             vs.chunks_done = q.chunks_done
             vs.chunks_total = q.chunks_total if q.chunks_total > 1 else None
             await _record_query(s, view.name, vs, q)
+            await _persist_view_status(s, view.name, vs)
             if q.chunks_total > 1:
                 CHUNKS_COMPLETED.labels(view=view.name).inc()
                 CHUNK_DURATION.labels(view=view.name).observe(q.elapsed_ms / 1000.0)
@@ -379,6 +452,7 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
         REFRESH_LAST_SUCCESS.labels(view=view.name).set(vs.last_refresh or time.time())
         REFRESH_BYTES.labels(view=view.name).inc(total_bytes)
         REFRESH_ROWS.labels(view=view.name).inc(total_rows)
+        await _persist_view_status(s, view.name, vs)
         await maintain_view(s, view, cursor, target_table)
 
     except Exception as e:
@@ -386,6 +460,7 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
         vs.total_errors += 1
         REFRESH_ERRORS.labels(view=view.name).inc()
         log.exception("%s: refresh failed", view.name)
+        await _persist_view_status(s, view.name, vs)
     finally:
         await conn.close()
 
@@ -526,7 +601,7 @@ async def lifespan(app: FastAPI):
         db_path.parent.mkdir(parents=True, exist_ok=True)
         s.history = QueryHistory(db_path, RECENT_QUERY_LIMIT)
         await s.history.open()
-        await hydrate_recent_queries(s)
+        await hydrate_view_state(s)
 
     log.info(
         "starting supervisor — %d views configured",
