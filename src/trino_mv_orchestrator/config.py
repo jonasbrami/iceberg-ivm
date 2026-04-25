@@ -84,9 +84,12 @@ class ServerConfig:
     port: int = 8000
     config_reload_interval_seconds: int = 30
     # SQLite file that persists the UI's "recent queries" ring buffer
-    # across restarts. Resolved relative to the config file's directory
-    # when non-absolute, so the default colocates the DB with config.yaml
-    # without surprising deployments that mount the config dir as a volume.
+    # across restarts. Absolute values are used as-is. For non-absolute
+    # values, the default resolution anchors on the *views file's*
+    # directory (which the Dockerfile expects to be a host bind-mount
+    # and is therefore persistent by construction), falling back to the
+    # config file's directory when that directory doesn't exist or isn't
+    # writable. See ``server.resolve_state_db_path`` and issue #39.
     state_db_path: str = "state.db"
 
 
