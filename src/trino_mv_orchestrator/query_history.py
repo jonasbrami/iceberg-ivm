@@ -261,14 +261,6 @@ class QueryHistory:
         )
         await self._db.commit()
 
-    async def record_maintenance(self, view: str, op: str, last_run: float) -> None:
-        """Compatibility shim around :meth:`upsert_maintenance`.
-
-        Predates #40; some tests still call it with just ``last_run``. New
-        code should call ``upsert_maintenance`` with the full field dict.
-        """
-        await self.upsert_maintenance(view, op, {"last_run": last_run})
-
     async def all_maintenance(self, view: str) -> dict[str, dict]:
         """Return ``{op: {col: value, ...}}`` for every op recorded against ``view``.
 

@@ -587,10 +587,10 @@ async def test_hydrate_rehydrates_maintenance_last_run(setup_state, tmp_path):
     await h.open()
     setup_state.history = h
     try:
-        await h.record_maintenance("test_view", "optimize", 12345.0)
+        await h.upsert_maintenance("test_view", "optimize", {"last_run": 12345.0})
         # Fresh ViewStatus, empty maintenance dict — hydrate must populate it.
         setup_state.view_statuses["test_view"] = ViewStatus(name="test_view")
-        await server_mod.hydrate_recent_queries(setup_state)
+        await server_mod.hydrate_view_state(setup_state)
         vs = setup_state.view_statuses["test_view"]
         assert vs.maintenance["optimize"].last_run == 12345.0
     finally:
@@ -1000,7 +1000,7 @@ async def test_refresh_persists_queries_and_hydrates_on_restart(
 ):
     """End-to-end: attaching a QueryHistory to AppState must cause refresh_view
     to persist QueryInfo rows, and a fresh ViewStatus with an empty
-    recent_queries must re-hydrate from the DB via hydrate_recent_queries."""
+    recent_queries must re-hydrate from the DB via hydrate_view_state."""
     from trino_mv_orchestrator import server as server_mod
     from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
     from trino_mv_orchestrator.executor import QueryInfo
@@ -1049,7 +1049,7 @@ async def test_refresh_persists_queries_and_hydrates_on_restart(
 
         # Simulate a restart: ViewStatus is fresh, DB survives.
         setup_state.view_statuses[view.name] = ViewStatus(name=view.name)
-        await server_mod.hydrate_recent_queries(setup_state)
+        await server_mod.hydrate_view_state(setup_state)
         rehydrated = setup_state.view_statuses[view.name].recent_queries
         assert [q.query_id for q in rehydrated] == ["persisted_qid"]
     finally:

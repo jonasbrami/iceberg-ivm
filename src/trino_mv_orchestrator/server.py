@@ -79,7 +79,7 @@ class MaintenanceOpStatus:
     """Per-op runtime status for one view (e.g. optimize, expire_snapshots).
 
     ``last_run`` is wall-clock epoch seconds — persisted to SQLite via
-    ``QueryHistory.record_maintenance`` so scheduling survives process
+    ``QueryHistory.upsert_maintenance`` so scheduling survives process
     restarts (a 7d retention interval is meaningless if every restart
     resets it to ``None`` and re-runs immediately).
     """
@@ -286,11 +286,6 @@ async def hydrate_view_state(s: AppState) -> None:
         if not vs.maintenance:
             for op, fields in (await s.history.all_maintenance(v.name)).items():
                 vs.maintenance[op] = MaintenanceOpStatus(**fields)
-
-
-# Backwards-compat alias for tests (and any external imports) that still
-# reference the pre-#40 name. New code should call ``hydrate_view_state``.
-hydrate_recent_queries = hydrate_view_state
 
 
 async def maintain_view(

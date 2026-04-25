@@ -98,23 +98,23 @@ async def test_append_empty_list_is_noop(history):
 
 
 async def test_record_and_read_maintenance(history):
-    await history.record_maintenance("v", "optimize", 1234.5)
+    await history.upsert_maintenance("v", "optimize", {"last_run": 1234.5})
     persisted = await history.all_maintenance("v")
     assert persisted["optimize"]["last_run"] == 1234.5
 
 
-async def test_record_maintenance_upserts(history):
+async def test_upsert_maintenance_overwrites(history):
     """A second record for the same (view, op) overwrites the prior value."""
-    await history.record_maintenance("v", "optimize", 1.0)
-    await history.record_maintenance("v", "optimize", 9999.0)
+    await history.upsert_maintenance("v", "optimize", {"last_run": 1.0})
+    await history.upsert_maintenance("v", "optimize", {"last_run": 9999.0})
     persisted = await history.all_maintenance("v")
     assert persisted["optimize"]["last_run"] == 9999.0
 
 
 async def test_all_maintenance_isolated_per_view(history):
-    await history.record_maintenance("a", "optimize", 1.0)
-    await history.record_maintenance("b", "optimize", 2.0)
-    await history.record_maintenance("a", "expire_snapshots", 3.0)
+    await history.upsert_maintenance("a", "optimize", {"last_run": 1.0})
+    await history.upsert_maintenance("b", "optimize", {"last_run": 2.0})
+    await history.upsert_maintenance("a", "expire_snapshots", {"last_run": 3.0})
     a = await history.all_maintenance("a")
     b = await history.all_maintenance("b")
     assert {op: row["last_run"] for op, row in a.items()} == {
@@ -124,8 +124,8 @@ async def test_all_maintenance_isolated_per_view(history):
 
 
 async def test_delete_view_purges_maintenance_state(history):
-    await history.record_maintenance("a", "optimize", 1.0)
-    await history.record_maintenance("b", "optimize", 2.0)
+    await history.upsert_maintenance("a", "optimize", {"last_run": 1.0})
+    await history.upsert_maintenance("b", "optimize", {"last_run": 2.0})
     await history.delete_view("a")
     assert await history.all_maintenance("a") == {}
     persisted_b = await history.all_maintenance("b")
@@ -136,7 +136,7 @@ async def test_maintenance_state_survives_reopen(tmp_path):
     path = tmp_path / "state.db"
     h1 = QueryHistory(path, limit=5)
     await h1.open()
-    await h1.record_maintenance("v", "optimize", 42.0)
+    await h1.upsert_maintenance("v", "optimize", {"last_run": 42.0})
     await h1.close()
 
     h2 = QueryHistory(path, limit=5)
