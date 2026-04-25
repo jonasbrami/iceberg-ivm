@@ -99,24 +99,28 @@ async def test_append_empty_list_is_noop(history):
 
 async def test_record_and_read_maintenance(history):
     await history.record_maintenance("v", "optimize", 1234.5)
-    assert await history.all_maintenance("v") == {"optimize": 1234.5}
+    persisted = await history.all_maintenance("v")
+    assert persisted["optimize"]["last_run"] == 1234.5
 
 
 async def test_record_maintenance_upserts(history):
     """A second record for the same (view, op) overwrites the prior value."""
     await history.record_maintenance("v", "optimize", 1.0)
     await history.record_maintenance("v", "optimize", 9999.0)
-    assert await history.all_maintenance("v") == {"optimize": 9999.0}
+    persisted = await history.all_maintenance("v")
+    assert persisted["optimize"]["last_run"] == 9999.0
 
 
 async def test_all_maintenance_isolated_per_view(history):
     await history.record_maintenance("a", "optimize", 1.0)
     await history.record_maintenance("b", "optimize", 2.0)
     await history.record_maintenance("a", "expire_snapshots", 3.0)
-    assert await history.all_maintenance("a") == {
+    a = await history.all_maintenance("a")
+    b = await history.all_maintenance("b")
+    assert {op: row["last_run"] for op, row in a.items()} == {
         "optimize": 1.0, "expire_snapshots": 3.0,
     }
-    assert await history.all_maintenance("b") == {"optimize": 2.0}
+    assert {op: row["last_run"] for op, row in b.items()} == {"optimize": 2.0}
 
 
 async def test_delete_view_purges_maintenance_state(history):
@@ -124,7 +128,8 @@ async def test_delete_view_purges_maintenance_state(history):
     await history.record_maintenance("b", "optimize", 2.0)
     await history.delete_view("a")
     assert await history.all_maintenance("a") == {}
-    assert await history.all_maintenance("b") == {"optimize": 2.0}
+    persisted_b = await history.all_maintenance("b")
+    assert persisted_b["optimize"]["last_run"] == 2.0
 
 
 async def test_maintenance_state_survives_reopen(tmp_path):
@@ -137,6 +142,197 @@ async def test_maintenance_state_survives_reopen(tmp_path):
     h2 = QueryHistory(path, limit=5)
     await h2.open()
     try:
-        assert await h2.all_maintenance("v") == {"optimize": 42.0}
+        persisted = await h2.all_maintenance("v")
+        assert persisted["optimize"]["last_run"] == 42.0
     finally:
         await h2.close()
+
+
+async def test_all_maintenance_returns_full_field_dict(history):
+    """``all_maintenance`` exposes every persisted column, not just last_run.
+
+    Surface for issue #40 — UI / hydration need total_runs / total_errors
+    / last_error / last_duration too.
+    """
+    await history.upsert_maintenance("v", "optimize", {
+        "last_run": 1234.5,
+        "last_duration": 12.5,
+        "last_error": None,
+        "total_runs": 7,
+        "total_errors": 1,
+    })
+    persisted = await history.all_maintenance("v")
+    assert persisted["optimize"] == {
+        "last_run": 1234.5,
+        "last_duration": 12.5,
+        "last_error": None,
+        "total_runs": 7,
+        "total_errors": 1,
+    }
+
+
+async def test_upsert_maintenance_round_trip_all_fields(history):
+    """Upsert + read round-trips every column, including the failure-path fields."""
+    await history.upsert_maintenance("v", "expire_snapshots", {
+        "last_run": 100.0,
+        "last_duration": 0.0,
+        "last_error": "boom",
+        "total_runs": 3,
+        "total_errors": 2,
+    })
+    persisted = await history.all_maintenance("v")
+    assert persisted["expire_snapshots"]["last_error"] == "boom"
+    assert persisted["expire_snapshots"]["total_errors"] == 2
+    # And it's actually upsert, not insert-only:
+    await history.upsert_maintenance("v", "expire_snapshots", {
+        "last_run": 200.0,
+        "last_duration": 1.5,
+        "last_error": None,
+        "total_runs": 4,
+        "total_errors": 2,
+    })
+    persisted = await history.all_maintenance("v")
+    assert persisted["expire_snapshots"]["last_run"] == 200.0
+    assert persisted["expire_snapshots"]["last_error"] is None
+
+
+async def test_upsert_maintenance_requires_last_run(history):
+    """``last_run`` is NOT NULL — calling without one is a programming error."""
+    with pytest.raises(ValueError):
+        await history.upsert_maintenance("v", "optimize", {"last_duration": 1.0})
+
+
+# ── view_status ──
+
+
+async def test_get_view_status_returns_none_for_unknown_view(history):
+    assert await history.get_view_status("never_seen") is None
+
+
+async def test_upsert_and_get_view_status_round_trip(history):
+    fields = {
+        "last_refresh": 1234.5,
+        "last_duration": 2.5,
+        "last_action": "incremental",
+        "last_range": "[2026-04-23, 2026-04-24)",
+        "last_error": None,
+        "total_refreshes": 99,
+        "total_errors": 1,
+        "chunks_done": 68,
+        "chunks_total": None,
+    }
+    await history.upsert_view_status("v", fields)
+    got = await history.get_view_status("v")
+    assert got == fields
+
+
+async def test_upsert_view_status_overwrites_prior(history):
+    """A second upsert for the same view replaces the earlier value."""
+    await history.upsert_view_status("v", {"total_refreshes": 1, "last_action": "full"})
+    await history.upsert_view_status("v", {"total_refreshes": 2, "last_action": "skip"})
+    got = await history.get_view_status("v")
+    assert got["total_refreshes"] == 2
+    assert got["last_action"] == "skip"
+
+
+async def test_upsert_view_status_ignores_unknown_keys(history):
+    """``recent_queries`` / ``maintenance`` live in their own tables — passing
+    them through dataclasses.asdict() must not break the upsert."""
+    await history.upsert_view_status("v", {
+        "total_refreshes": 5,
+        "recent_queries": [],         # not a column
+        "maintenance": {},            # not a column
+        "name": "v",                  # not a column
+    })
+    got = await history.get_view_status("v")
+    assert got["total_refreshes"] == 5
+
+
+async def test_view_status_survives_reopen(tmp_path):
+    path = tmp_path / "state.db"
+    h1 = QueryHistory(path, limit=5)
+    await h1.open()
+    await h1.upsert_view_status("v", {
+        "total_refreshes": 99, "last_refresh": 1.0, "chunks_done": 42,
+    })
+    await h1.close()
+
+    h2 = QueryHistory(path, limit=5)
+    await h2.open()
+    try:
+        got = await h2.get_view_status("v")
+        assert got["total_refreshes"] == 99
+        assert got["chunks_done"] == 42
+    finally:
+        await h2.close()
+
+
+async def test_delete_view_purges_view_status(history):
+    await history.upsert_view_status("a", {"total_refreshes": 1})
+    await history.upsert_view_status("b", {"total_refreshes": 2})
+    await history.delete_view("a")
+    assert await history.get_view_status("a") is None
+    assert (await history.get_view_status("b"))["total_refreshes"] == 2
+
+
+# ── migration from a pre-#40 v1 schema ──
+
+
+async def test_migration_adds_missing_maintenance_columns(tmp_path):
+    """Existing v1 DBs only have (view, op, last_run). On open(), missing
+    columns must be added in-place rather than crashing or wiping the row.
+    """
+    import aiosqlite
+
+    path = tmp_path / "state.db"
+    # Hand-craft a v1 schema as it existed before #40.
+    db = await aiosqlite.connect(str(path))
+    try:
+        await db.execute(
+            "CREATE TABLE maintenance_state ("
+            "  view TEXT NOT NULL, op TEXT NOT NULL, last_run REAL NOT NULL,"
+            "  PRIMARY KEY (view, op))"
+        )
+        await db.execute(
+            "INSERT INTO maintenance_state (view, op, last_run) VALUES (?, ?, ?)",
+            ("legacy_view", "optimize", 100.0),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    h = QueryHistory(path, limit=5)
+    await h.open()  # must not raise
+    try:
+        # Schema now has all five non-PK columns plus (view, op).
+        # ``PRAGMA table_info`` returns one row per column; the second tuple
+        # element (index 1) is the column name.
+        async with h._db.execute("PRAGMA table_info(maintenance_state)") as cur:
+            cols = {row[1] for row in await cur.fetchall()}
+        assert cols == {
+            "view", "op", "last_run",
+            "last_duration", "last_error", "total_runs", "total_errors",
+        }
+        # And the existing row survived with sane defaults for new columns.
+        persisted = await h.all_maintenance("legacy_view")
+        assert persisted["optimize"]["last_run"] == 100.0
+        assert persisted["optimize"]["total_runs"] == 0
+        assert persisted["optimize"]["total_errors"] == 0
+        assert persisted["optimize"]["last_error"] is None
+        assert persisted["optimize"]["last_duration"] is None
+    finally:
+        await h.close()
+
+
+async def test_migration_is_idempotent(tmp_path):
+    """Re-opening an already-migrated DB must not error (ALTER TABLE ADD
+    COLUMN errors if the column already exists — the migration helper
+    must guard against that)."""
+    path = tmp_path / "state.db"
+    h1 = QueryHistory(path, limit=5)
+    await h1.open()
+    await h1.close()
+
+    h2 = QueryHistory(path, limit=5)
+    await h2.open()  # must not raise
+    await h2.close()
