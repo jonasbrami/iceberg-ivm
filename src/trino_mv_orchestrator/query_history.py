@@ -115,34 +115,8 @@ class QueryHistory:
     async def open(self) -> None:
         self._db = await aiosqlite.connect(self.db_path)
         await self._db.executescript(_SCHEMA)
-        await self._migrate()
         await self._db.commit()
         log.info("query history opened at %s (limit=%d per view)", self.db_path, self.limit)
-
-    async def _migrate(self) -> None:
-        """Bring an existing v1 DB up to the current schema in-place.
-
-        v1 only had ``maintenance_state(view, op, last_run)`` — pre-#40 deployments
-        running this build will hit a SQLite file with the missing columns.
-        ``ALTER TABLE ADD COLUMN`` is idempotent only if we first check existence
-        via ``PRAGMA table_info``; running the same ALTER twice errors.
-        """
-        async with self._db.execute("PRAGMA table_info(maintenance_state)") as cur:
-            existing = {row[1] for row in await cur.fetchall()}
-        # Columns added since v1. Order matches the CREATE TABLE above so a
-        # post-migration ``PRAGMA table_info`` matches a fresh-DB ordering.
-        additions = [
-            ("last_duration",  "REAL"),
-            ("last_error",     "TEXT"),
-            ("total_runs",     "INTEGER NOT NULL DEFAULT 0"),
-            ("total_errors",   "INTEGER NOT NULL DEFAULT 0"),
-        ]
-        for name, decl in additions:
-            if name not in existing:
-                await self._db.execute(
-                    f"ALTER TABLE maintenance_state ADD COLUMN {name} {decl}"
-                )
-                log.info("migrated maintenance_state: added column %s", name)
 
     async def close(self) -> None:
         if self._db is not None:
