@@ -8,11 +8,7 @@ import pytest
 
 from trino_mv_orchestrator.config import ViewConfig
 from trino_mv_orchestrator.detector import RefreshAction, detect_changes
-from trino_mv_orchestrator.executor import (
-    execute_chunked_full_refresh,
-    execute_full_refresh,
-    execute_incremental_refresh,
-)
+from trino_mv_orchestrator.executor import execute_refresh
 from trino_mv_orchestrator.introspect import ColumnInfo, build_create_table_sql, discover_columns
 from trino_mv_orchestrator.query_parser import parse_view_query
 from trino_mv_orchestrator.state import read_last_snapshot, write_last_snapshot
@@ -55,6 +51,21 @@ async def query_bars(cursor):
     return [dict(zip(["symbol", "minute", "open", "high", "low", "close", "volume", "trade_count"], r)) for r in await cursor.fetchall()]
 
 
+async def _value_cols(cursor) -> list[str]:
+    cols = await discover_columns(cursor, VIEW.query)
+    return [c.name for c in cols if c.name not in PARSED.merge_keys]
+
+
+async def _drain(agen, *, stop_after: int | None = None) -> list:
+    """Consume the async generator, optionally breaking after ``stop_after`` items."""
+    items = []
+    async for q in agen:
+        items.append(q)
+        if stop_after is not None and len(items) >= stop_after:
+            break
+    return items
+
+
 class TestIntrospection:
     async def test_discover_columns(self, trino_conn):
         cursor = await trino_conn.cursor()
@@ -77,12 +88,13 @@ class TestFullRefresh:
         await insert_trades(cursor, "2026-04-09", [("AAPL", "09:30:00", 152.0, 100)])
 
         cols = await discover_columns(cursor, VIEW.query)
+        value_cols = [c.name for c in cols if c.name not in PARSED.merge_keys]
         await cursor.execute(build_create_table_sql(TARGET_TABLE, cols, "ARRAY['day(minute)']"))
 
         result = await detect_changes(cursor, SOURCE_TABLE, "ts", "minute", last_snapshot=None)
         assert result.action == RefreshAction.FULL_REFRESH
 
-        await execute_full_refresh(cursor, VIEW, TARGET_TABLE)
+        await _drain(execute_refresh(cursor, VIEW, TARGET_TABLE, PARSED, value_cols))
         bars = await query_bars(cursor)
         assert len(bars) == 3
         b = [b for b in bars if "09:30" in str(b["minute"])][0]
@@ -97,10 +109,10 @@ class TestIncrementalRefresh:
         await cursor.execute(CREATE_SOURCE)
         await insert_trades(cursor, "2026-04-08", [("AAPL", "09:30:00", 150.0, 100)])
 
+        value_cols = await _value_cols(cursor)
         cols = await discover_columns(cursor, VIEW.query)
-        value_cols = [c.name for c in cols if c.name not in PARSED.merge_keys]
         await cursor.execute(build_create_table_sql(TARGET_TABLE, cols, "ARRAY['day(minute)']"))
-        await execute_full_refresh(cursor, VIEW, TARGET_TABLE)
+        await _drain(execute_refresh(cursor, VIEW, TARGET_TABLE, PARSED, value_cols))
 
         result = await detect_changes(cursor, SOURCE_TABLE, "ts", "minute", last_snapshot=None)
         await write_last_snapshot(cursor, TARGET_TABLE, result.current_snapshot)
@@ -111,10 +123,10 @@ class TestIncrementalRefresh:
         assert result.action == RefreshAction.INCREMENTAL
         assert result.filter_range is not None
 
-        await execute_incremental_refresh(
-            cursor, VIEW, TARGET_TABLE,
-            PARSED.filter_column, PARSED.merge_keys, value_cols, result.filter_range,
-        )
+        await _drain(execute_refresh(
+            cursor, VIEW, TARGET_TABLE, PARSED, value_cols,
+            incremental_range=result.filter_range,
+        ))
         assert len(await query_bars(cursor)) == 2
 
     async def test_same_day_update(self, trino_conn):
@@ -122,10 +134,10 @@ class TestIncrementalRefresh:
         await cursor.execute(CREATE_SOURCE)
         await insert_trades(cursor, "2026-04-08", [("AAPL", "09:30:00", 150.0, 100)])
 
+        value_cols = await _value_cols(cursor)
         cols = await discover_columns(cursor, VIEW.query)
-        value_cols = [c.name for c in cols if c.name not in PARSED.merge_keys]
         await cursor.execute(build_create_table_sql(TARGET_TABLE, cols, "ARRAY['day(minute)']"))
-        await execute_full_refresh(cursor, VIEW, TARGET_TABLE)
+        await _drain(execute_refresh(cursor, VIEW, TARGET_TABLE, PARSED, value_cols))
 
         result = await detect_changes(cursor, SOURCE_TABLE, "ts", "minute", last_snapshot=None)
         await write_last_snapshot(cursor, TARGET_TABLE, result.current_snapshot)
@@ -135,10 +147,10 @@ class TestIncrementalRefresh:
         result = await detect_changes(cursor, SOURCE_TABLE, "ts", "minute", last_snapshot=result.current_snapshot)
         assert result.action == RefreshAction.INCREMENTAL
 
-        await execute_incremental_refresh(
-            cursor, VIEW, TARGET_TABLE,
-            PARSED.filter_column, PARSED.merge_keys, value_cols, result.filter_range,
-        )
+        await _drain(execute_refresh(
+            cursor, VIEW, TARGET_TABLE, PARSED, value_cols,
+            incremental_range=result.filter_range,
+        ))
         bars = await query_bars(cursor)
         assert len(bars) == 1
         assert bars[0]["high"] == 160.0
@@ -175,9 +187,9 @@ CHUNKED_VIEW = ViewConfig(
 
 
 class TestChunkedFullRefresh:
-    async def _seed(self, cursor) -> list:
-        """Seed three days of trades across two symbols and return the
-        non-chunked full-refresh row count as the reference."""
+    async def _seed(self, cursor) -> list[str]:
+        """Seed three days of trades across two symbols and return the value
+        columns for the chunked MERGE."""
         await cursor.execute(CREATE_SOURCE)
         await insert_trades(cursor, "2026-04-08", [
             ("AAPL", "09:30:00", 150.0, 100),
@@ -201,71 +213,65 @@ class TestChunkedFullRefresh:
         cursor = await trino_conn.cursor()
         value_cols = await self._seed(cursor)
 
-        await execute_chunked_full_refresh(
+        chunked_qs = await _drain(execute_refresh(
             cursor, CHUNKED_VIEW, TARGET_TABLE, PARSED, value_cols,
-            chunk_granularity="day",
-        )
+        ))
+        assert all(q.stage == "chunk_merge" for q in chunked_qs)
+        assert len(chunked_qs) == 3
         chunked_bars = await query_bars(cursor)
 
-        # Rebuild target and run non-chunked for comparison
         await cursor.execute(f"DELETE FROM {TARGET_TABLE} WHERE true")
-        await execute_full_refresh(cursor, VIEW, TARGET_TABLE)
+        single_qs = await _drain(execute_refresh(
+            cursor, VIEW, TARGET_TABLE, PARSED, value_cols,
+        ))
+        assert len(single_qs) == 1
+        assert single_qs[0].stage == "merge"
         single_bars = await query_bars(cursor)
 
         assert chunked_bars == single_bars
 
     async def test_interrupt_and_resume(self, trino_conn):
-        """A ``should_stop`` fired after the first chunk must leave only
-        that chunk's data in target. A second call (without stop) must
-        resume from target metadata and complete the remaining chunks
-        without re-emitting the first."""
+        """Breaking out of the generator after the first chunk must leave only
+        that chunk's data in target. A second call must resume from target
+        metadata and complete the remaining chunks without re-emitting the
+        first."""
         cursor = await trino_conn.cursor()
         value_cols = await self._seed(cursor)
 
-        # First pass: stop after chunk 1 commits.
-        r1 = await execute_chunked_full_refresh(
-            cursor, CHUNKED_VIEW, TARGET_TABLE, PARSED, value_cols,
-            chunk_granularity="day",
-            should_stop=lambda: True,
+        first = await _drain(
+            execute_refresh(cursor, CHUNKED_VIEW, TARGET_TABLE, PARSED, value_cols),
+            stop_after=1,
         )
-        assert r1.interrupted
-        assert len(r1.queries) == 1
+        assert len(first) == 1
+        assert first[0].chunks_done == 1
+        assert first[0].chunks_total == 3
 
-        # Second pass: no stop; resumes from target metadata.
-        r2 = await execute_chunked_full_refresh(
+        second = await _drain(execute_refresh(
             cursor, CHUNKED_VIEW, TARGET_TABLE, PARSED, value_cols,
-            chunk_granularity="day",
-        )
-        assert not r2.interrupted
-        # Resume skipped the first chunk — only the remaining 2 days ran.
-        assert len(r2.queries) == 2
+        ))
+        assert len(second) == 2
 
-        # Final state must equal a fresh non-chunked refresh.
         resumed_bars = await query_bars(cursor)
         await cursor.execute(f"DELETE FROM {TARGET_TABLE} WHERE true")
-        await execute_full_refresh(cursor, VIEW, TARGET_TABLE)
+        await _drain(execute_refresh(cursor, VIEW, TARGET_TABLE, PARSED, value_cols))
         reference = await query_bars(cursor)
         assert resumed_bars == reference
 
     async def test_replay_is_idempotent(self, trino_conn):
         """Running the same chunked refresh twice (simulating a committed-
-        but-not-acked retry) must not duplicate rows — MERGE matches the
-        existing buckets and UPDATEs to the same values."""
+        but-not-acked retry) must not duplicate rows: resume from target
+        metadata sees everything already covered and emits zero chunks."""
         cursor = await trino_conn.cursor()
         value_cols = await self._seed(cursor)
 
-        await execute_chunked_full_refresh(
+        await _drain(execute_refresh(
             cursor, CHUNKED_VIEW, TARGET_TABLE, PARSED, value_cols,
-            chunk_granularity="day",
-        )
+        ))
         first = await query_bars(cursor)
 
-        # Run again from scratch — target already has everything. Resume
-        # should skip every chunk.
-        r2 = await execute_chunked_full_refresh(
+        replay = await _drain(execute_refresh(
             cursor, CHUNKED_VIEW, TARGET_TABLE, PARSED, value_cols,
-            chunk_granularity="day",
-        )
-        assert r2.queries == []
+        ))
+        assert replay == []
         second = await query_bars(cursor)
         assert first == second

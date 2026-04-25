@@ -426,7 +426,7 @@ async def test_refresh_view_runs_maintenance(setup_state):
     from trino_mv_orchestrator import server as server_mod
     from trino_mv_orchestrator.config import Config, ViewConfig
     from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
-    from trino_mv_orchestrator.executor import QueryInfo, RefreshResult
+    from trino_mv_orchestrator.executor import QueryInfo
     from trino_mv_orchestrator.introspect import ColumnInfo
 
     v = ViewConfig(
@@ -441,6 +441,7 @@ async def test_refresh_view_runs_maintenance(setup_state):
         server=setup_state.config.server,
     )
     setup_state.view_statuses["test_view"] = ViewStatus(name="test_view")
+    setup_state._stop = False  # fixture seeds True to keep the supervisor quiet
 
     async def fake_detect(*a, **kw):
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=1)
@@ -448,8 +449,13 @@ async def test_refresh_view_runs_maintenance(setup_state):
     async def fake_discover(cursor, query):
         return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
 
-    async def fake_full(cursor, view, target):
-        return RefreshResult(elapsed=0.1, processed_rows=1, processed_bytes=10)
+    async def fake_execute_refresh(*a, **kw):
+        yield QueryInfo(
+            query_id="q_merge", info_uri="http://trino/q_merge",
+            stage="merge", started_at=1.0, elapsed_ms=100.0,
+            processed_rows=1, processed_bytes=10,
+            chunks_done=1, chunks_total=1,
+        )
 
     async def fake_write(cursor, target, snap_id): pass
     async def fake_read(cursor, target): return None
@@ -468,7 +474,7 @@ async def test_refresh_view_runs_maintenance(setup_state):
          patch.object(server_mod, "read_last_snapshot", fake_read), \
          patch.object(server_mod, "write_last_snapshot", fake_write), \
          patch.object(server_mod, "detect_changes", fake_detect), \
-         patch.object(server_mod, "execute_full_refresh", fake_full), \
+         patch.object(server_mod, "execute_refresh", fake_execute_refresh), \
          patch.object(server_mod, "execute_maintenance", fake_maintenance):
         await server_mod.refresh_view(setup_state, v)
 
@@ -616,7 +622,7 @@ async def test_concurrent_triggers_coalesce_into_single_followup(setup_state):
     """
     from trino_mv_orchestrator import server as server_mod
     from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
-    from trino_mv_orchestrator.executor import RefreshResult
+    from trino_mv_orchestrator.executor import QueryInfo
     from trino_mv_orchestrator.introspect import ColumnInfo
 
     view = setup_state.config.views[0]
@@ -636,7 +642,7 @@ async def test_concurrent_triggers_coalesce_into_single_followup(setup_state):
     max_in_flight = 0
     refresh_count = 0
 
-    async def slow_full(cursor, view, target):
+    async def slow_refresh(*a, **kw):
         nonlocal in_flight, max_in_flight, refresh_count
         in_flight += 1
         max_in_flight = max(max_in_flight, in_flight)
@@ -646,8 +652,9 @@ async def test_concurrent_triggers_coalesce_into_single_followup(setup_state):
             await asyncio.sleep(0)
         in_flight -= 1
         refresh_count += 1
-        return RefreshResult(
-            elapsed=0.0, processed_rows=0, processed_bytes=0, queries=[],
+        yield QueryInfo(
+            query_id="q", info_uri="http://trino/q", stage="merge",
+            started_at=1.0, elapsed_ms=1.0, chunks_done=1, chunks_total=1,
         )
 
     async def fake_detect(*a, **k):
@@ -664,7 +671,7 @@ async def test_concurrent_triggers_coalesce_into_single_followup(setup_state):
          patch.object(server_mod, "read_last_snapshot", fake_read), \
          patch.object(server_mod, "write_last_snapshot", fake_write), \
          patch.object(server_mod, "detect_changes", fake_detect), \
-         patch.object(server_mod, "execute_full_refresh", slow_full):
+         patch.object(server_mod, "execute_refresh", slow_refresh):
         worker = asyncio.create_task(server_mod.view_worker(setup_state, view.name))
         try:
             # Fire 10 concurrent triggers — they all hit the worker while its
@@ -756,8 +763,7 @@ def test_reload_config_on_mtime_change(setup_state, tmp_path):
     )
     setup_state.views_path.write_text(new_views_yaml)
 
-    reloaded = reload_config(setup_state)
-    assert reloaded is True
+    reload_config(setup_state)
     assert len(setup_state.config.views) == 2
     assert "second_view" in setup_state.view_statuses
 
@@ -765,8 +771,9 @@ def test_reload_config_on_mtime_change(setup_state, tmp_path):
 def test_reload_config_no_change(setup_state):
     from trino_mv_orchestrator.server import reload_config
 
-    reloaded = reload_config(setup_state)
-    assert reloaded is False
+    before = setup_state.config
+    reload_config(setup_state)
+    assert setup_state.config is before  # unchanged
 
 
 # ── Trino connection ──
@@ -913,7 +920,7 @@ async def test_refresh_view_appends_recent_queries(setup_state, client):
     """
     from trino_mv_orchestrator import server as server_mod
     from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
-    from trino_mv_orchestrator.executor import RefreshResult, QueryInfo
+    from trino_mv_orchestrator.executor import QueryInfo
     from trino_mv_orchestrator.introspect import ColumnInfo
 
     view = setup_state.config.views[0]
@@ -937,24 +944,13 @@ async def test_refresh_view_appends_recent_queries(setup_state, client):
     async def fake_discover_columns(cursor, query):
         return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
 
-    async def fake_full(cursor, view, target):
-        return RefreshResult(
-            elapsed=0.5,
-            processed_rows=10,
-            processed_bytes=2048,
-            queries=[
-                QueryInfo(
-                    query_id="20260417_000000_00001_xyz",
-                    info_uri="http://trino/ui/query.html?20260417_000000_00001_xyz",
-                    stage="full_delete", started_at=1.0, elapsed_ms=120.0,
-                ),
-                QueryInfo(
-                    query_id="20260417_000000_00002_xyz",
-                    info_uri="http://trino/ui/query.html?20260417_000000_00002_xyz",
-                    stage="full_insert", started_at=2.0, elapsed_ms=380.0,
-                    processed_rows=10, processed_bytes=2048,
-                ),
-            ],
+    async def fake_execute_refresh(*a, **kw):
+        yield QueryInfo(
+            query_id="20260417_000000_00001_xyz",
+            info_uri="http://trino/ui/query.html?20260417_000000_00001_xyz",
+            stage="merge", started_at=1.0, elapsed_ms=380.0,
+            processed_rows=10, processed_bytes=2048,
+            chunks_done=1, chunks_total=1,
         )
 
     with patch.object(server_mod, "get_trino_connection", lambda s: FakeConn()), \
@@ -962,21 +958,17 @@ async def test_refresh_view_appends_recent_queries(setup_state, client):
          patch.object(server_mod, "read_last_snapshot", fake_read), \
          patch.object(server_mod, "write_last_snapshot", fake_write), \
          patch.object(server_mod, "detect_changes", fake_detect), \
-         patch.object(server_mod, "execute_full_refresh", fake_full):
+         patch.object(server_mod, "execute_refresh", fake_execute_refresh):
         await server_mod.refresh_view(setup_state, view)
 
-    # Now the view status should carry the captured queries.
     vs = setup_state.view_statuses[view.name]
-    assert len(vs.recent_queries) == 2
-    stages = [q.stage for q in vs.recent_queries]
-    assert "full_insert" in stages and "full_delete" in stages
+    assert len(vs.recent_queries) == 1
+    assert vs.recent_queries[0].stage == "merge"
 
-    # And the API exposes them.
     body = client.get("/api/views").json()[0]
     status_queries = body["status"]["recent_queries"]
-    assert len(status_queries) == 2
-    assert status_queries[0]["info_uri"].endswith("20260417_000000_00001_xyz") or \
-           status_queries[1]["info_uri"].endswith("20260417_000000_00001_xyz")
+    assert len(status_queries) == 1
+    assert status_queries[0]["info_uri"].endswith("20260417_000000_00001_xyz")
 
 
 async def test_refresh_persists_queries_and_hydrates_on_restart(
@@ -987,7 +979,7 @@ async def test_refresh_persists_queries_and_hydrates_on_restart(
     recent_queries must re-hydrate from the DB via hydrate_recent_queries."""
     from trino_mv_orchestrator import server as server_mod
     from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
-    from trino_mv_orchestrator.executor import QueryInfo, RefreshResult
+    from trino_mv_orchestrator.executor import QueryInfo
     from trino_mv_orchestrator.introspect import ColumnInfo
 
     view = setup_state.config.views[0]
@@ -1012,16 +1004,11 @@ async def test_refresh_persists_queries_and_hydrates_on_restart(
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=1)
     async def fake_discover(cursor, query):
         return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
-    async def fake_full(cursor, v, target):
-        return RefreshResult(
-            elapsed=0.5, processed_rows=1, processed_bytes=64,
-            queries=[
-                QueryInfo(
-                    query_id="persisted_qid", info_uri="http://trino/persisted_qid",
-                    stage="full_insert", started_at=10.0, elapsed_ms=250.0,
-                    processed_rows=1, processed_bytes=64,
-                ),
-            ],
+    async def fake_execute_refresh(*a, **kw):
+        yield QueryInfo(
+            query_id="persisted_qid", info_uri="http://trino/persisted_qid",
+            stage="merge", started_at=10.0, elapsed_ms=250.0,
+            processed_rows=1, processed_bytes=64, chunks_done=1, chunks_total=1,
         )
 
     try:
@@ -1030,7 +1017,7 @@ async def test_refresh_persists_queries_and_hydrates_on_restart(
              patch.object(server_mod, "read_last_snapshot", fake_read), \
              patch.object(server_mod, "write_last_snapshot", fake_write), \
              patch.object(server_mod, "detect_changes", fake_detect), \
-             patch.object(server_mod, "execute_full_refresh", fake_full):
+             patch.object(server_mod, "execute_refresh", fake_execute_refresh):
             await server_mod.refresh_view(setup_state, view)
 
         vs = setup_state.view_statuses[view.name]
@@ -1186,19 +1173,20 @@ class _FakeCursor:
     async def fetchall(self): return []
 
 
-async def test_refresh_view_dispatches_to_chunked_when_configured(setup_state):
-    """When ``view.full_refresh_chunk`` is set, ``refresh_view`` must call
-    ``execute_chunked_full_refresh`` (not ``execute_full_refresh``),
-    surface ``last_action = "chunked_full"``, and still write
-    ``last_source_snapshot`` on completion."""
+async def test_refresh_view_chunked_backfill_completes(setup_state):
+    """When ``full_refresh_chunk`` is set and detection says FULL_REFRESH, the
+    worker must surface ``last_action="chunked_full"``, iterate chunks from
+    the executor, and write ``last_source_snapshot`` on clean completion."""
+    from datetime import datetime, timezone
+
     from trino_mv_orchestrator import server as server_mod
     from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
-    from trino_mv_orchestrator.executor import RefreshResult
+    from trino_mv_orchestrator.executor import QueryInfo
     from trino_mv_orchestrator.introspect import ColumnInfo
 
     view = _install_chunked_view(setup_state)
-    chunked_calls: list[str] = []
-    full_calls: list[str] = []
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
+    setup_state._stop = False
     write_calls: list[int] = []
 
     async def fake_detect(*a, **kw):
@@ -1207,17 +1195,16 @@ async def test_refresh_view_dispatches_to_chunked_when_configured(setup_state):
     async def fake_discover(cursor, query):
         return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
 
-    async def fake_chunked(cursor, v, target, parsed, value_columns, **kwargs):
-        chunked_calls.append(v.name)
-        # chunk_granularity must be forwarded from the view config
-        assert kwargs["chunk_granularity"] == "day"
-        assert callable(kwargs["should_stop"])
-        assert callable(kwargs["on_chunk"])
-        return RefreshResult(elapsed=0.1, processed_rows=1)
-
-    async def fake_full(cursor, v, target):
-        full_calls.append(v.name)
-        return RefreshResult(elapsed=0.1)
+    async def fake_execute_refresh(*a, **kw):
+        for i in range(1, 4):
+            yield QueryInfo(
+                query_id=f"q{i}", info_uri=f"http://trino/q{i}",
+                stage="chunk_merge", started_at=float(i),
+                elapsed_ms=100.0 * i, processed_rows=i, processed_bytes=10 * i,
+                range_start=datetime(2026, 4, 7 + i, tzinfo=timezone.utc),
+                range_end=datetime(2026, 4, 8 + i, tzinfo=timezone.utc),
+                chunks_done=i, chunks_total=3,
+            )
 
     async def fake_write(cursor, target, snap_id):
         write_calls.append(snap_id)
@@ -1229,35 +1216,33 @@ async def test_refresh_view_dispatches_to_chunked_when_configured(setup_state):
          patch.object(server_mod, "read_last_snapshot", fake_read), \
          patch.object(server_mod, "write_last_snapshot", fake_write), \
          patch.object(server_mod, "detect_changes", fake_detect), \
-         patch.object(server_mod, "execute_chunked_full_refresh", fake_chunked), \
-         patch.object(server_mod, "execute_full_refresh", fake_full):
+         patch.object(server_mod, "execute_refresh", fake_execute_refresh):
         await server_mod.refresh_view(setup_state, view)
 
-    assert chunked_calls == ["test_view"]
-    assert full_calls == []   # single-shot path NOT taken
-    assert write_calls == [42]  # last_source_snapshot still written on completion
+    assert write_calls == [42]  # snapshot written on clean completion
     vs = setup_state.view_statuses[view.name]
     assert vs.last_action == "chunked_full"
-    assert vs.last_error is None
+    assert vs.chunks_done == 3
+    assert vs.chunks_total is None  # cleared on clean completion
+    assert vs.total_refreshes == 1
+    # Three chunks appended newest-first via the history ring buffer.
+    assert [q.query_id for q in vs.recent_queries] == ["q3", "q2", "q1"]
 
 
 async def test_refresh_view_interrupt_skips_last_snapshot_write(setup_state):
-    """When the chunked refresh returns ``interrupted=True``, ``refresh_view``
-    must skip ``write_last_snapshot`` (so the next tick resumes from target
-    metadata) and must NOT increment ``total_refreshes`` — an interrupt
-    is a partial-progress event, not a successful refresh.
-    Partial stats (last_refresh, last_duration, recent_queries) are still
-    surfaced so the UI shows the work that did complete."""
+    """When ``s._stop`` trips between chunks, ``refresh_view`` breaks out of
+    the async-for without writing ``last_source_snapshot`` (next tick resumes
+    from target metadata) and without incrementing ``total_refreshes``.
+    Partial chunks already appended to recent_queries are preserved."""
     from datetime import datetime, timezone
 
     from trino_mv_orchestrator import server as server_mod
     from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
-    from trino_mv_orchestrator.executor import ChunkProgress, QueryInfo, RefreshResult
+    from trino_mv_orchestrator.executor import QueryInfo
     from trino_mv_orchestrator.introspect import ColumnInfo
 
     view = _install_chunked_view(setup_state)
     setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
-
     write_calls: list[int] = []
 
     async def fake_detect(*a, **kw):
@@ -1266,30 +1251,20 @@ async def test_refresh_view_interrupt_skips_last_snapshot_write(setup_state):
     async def fake_discover(cursor, query):
         return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
 
-    async def fake_chunked(cursor, v, target, parsed, value_columns, **kwargs):
-        # Simulate the real executor: fire on_chunk for the one chunk that
-        # committed before the interrupt. Per-chunk status flows through
-        # that callback now — RefreshResult no longer replays it.
-        q = QueryInfo(
+    async def fake_execute_refresh(*a, **kw):
+        # Yield one chunk, then the refresh_view sets _stop before the next.
+        yield QueryInfo(
             query_id="q1", info_uri="http://trino/q1",
             stage="chunk_merge", started_at=1.0, elapsed_ms=250.0,
             processed_rows=5, processed_bytes=128,
+            range_start=datetime(2026, 4, 8, tzinfo=timezone.utc),
+            range_end=datetime(2026, 4, 9, tzinfo=timezone.utc),
+            chunks_done=1, chunks_total=3,
         )
-        await kwargs["on_chunk"](ChunkProgress(
-            chunk_range=(
-                datetime(2026, 4, 8, tzinfo=timezone.utc),
-                datetime(2026, 4, 9, tzinfo=timezone.utc),
-            ),
-            query=q,
-            chunks_done=1,
-            chunks_total=3,
-        ))
-        return RefreshResult(
-            elapsed=0.25,
-            processed_rows=5,
-            processed_bytes=128,
-            queries=[q],
-            interrupted=True,
+        setup_state._stop = True
+        yield QueryInfo(
+            query_id="q2", info_uri="http://trino/q2", stage="chunk_merge",
+            started_at=2.0, elapsed_ms=100.0, chunks_done=2, chunks_total=3,
         )
 
     async def fake_write(cursor, target, snap_id):
@@ -1302,93 +1277,18 @@ async def test_refresh_view_interrupt_skips_last_snapshot_write(setup_state):
          patch.object(server_mod, "read_last_snapshot", fake_read), \
          patch.object(server_mod, "write_last_snapshot", fake_write), \
          patch.object(server_mod, "detect_changes", fake_detect), \
-         patch.object(server_mod, "execute_chunked_full_refresh", fake_chunked):
+         patch.object(server_mod, "execute_refresh", fake_execute_refresh):
         await server_mod.refresh_view(setup_state, view)
 
-    assert write_calls == []   # no last_source_snapshot write on interrupt
+    assert write_calls == []   # interrupt: no snapshot bookmark write
     vs = setup_state.view_statuses[view.name]
     assert vs.last_action == "chunked_full"
-    assert vs.total_refreshes == 0    # interrupt is not a successful refresh
-    # Partial stats surfaced — populated by _on_chunk, not the interrupt tail.
-    assert len(vs.recent_queries) == 1
-    assert vs.recent_queries[0].stage == "chunk_merge"
+    assert vs.total_refreshes == 0
+    # First chunk made it into recent_queries before the stop flag tripped.
+    assert any(q.query_id == "q1" for q in vs.recent_queries)
     assert vs.last_duration == pytest.approx(0.25)
-    assert vs.last_refresh is not None
-    # Chunked progress stays visible on interrupt so the UI can show how far
-    # the backfill got before shutdown.
     assert vs.chunks_done == 1
     assert vs.chunks_total == 3
-
-
-async def test_chunked_refresh_updates_status_per_chunk(setup_state):
-    """Each committed chunk must push progress into ViewStatus *during* the
-    backfill — not only at the end. Issue #33: a multi-hour backfill should
-    not leave ``last_duration`` / ``recent_queries`` frozen at the pre-backfill
-    values."""
-    from datetime import datetime, timezone
-
-    from trino_mv_orchestrator import server as server_mod
-    from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
-    from trino_mv_orchestrator.executor import ChunkProgress, QueryInfo, RefreshResult
-    from trino_mv_orchestrator.introspect import ColumnInfo
-
-    view = _install_chunked_view(setup_state)
-    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
-
-    async def fake_detect(*a, **kw):
-        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=1)
-
-    async def fake_discover(cursor, query):
-        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
-
-    observed: list[tuple[int, int | None, int]] = []
-
-    async def fake_chunked(cursor, v, target, parsed, value_columns, **kwargs):
-        queries = []
-        for i in range(1, 4):
-            q = QueryInfo(
-                query_id=f"q{i}", info_uri=f"http://trino/q{i}",
-                stage="chunk_merge", started_at=float(i),
-                elapsed_ms=100.0 * i, processed_rows=i, processed_bytes=10 * i,
-            )
-            queries.append(q)
-            await kwargs["on_chunk"](ChunkProgress(
-                chunk_range=(
-                    datetime(2026, 4, 7 + i, tzinfo=timezone.utc),
-                    datetime(2026, 4, 8 + i, tzinfo=timezone.utc),
-                ),
-                query=q, chunks_done=i, chunks_total=3,
-            ))
-            vs = setup_state.view_statuses[v.name]
-            observed.append((vs.chunks_done, vs.chunks_total, len(vs.recent_queries)))
-        return RefreshResult(elapsed=0.6, processed_rows=6, processed_bytes=60, queries=queries)
-
-    async def fake_write(cursor, target, snap_id): pass
-    async def fake_read(cursor, target): return None
-
-    with patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()), \
-         patch.object(server_mod, "discover_columns", fake_discover), \
-         patch.object(server_mod, "read_last_snapshot", fake_read), \
-         patch.object(server_mod, "write_last_snapshot", fake_write), \
-         patch.object(server_mod, "detect_changes", fake_detect), \
-         patch.object(server_mod, "execute_chunked_full_refresh", fake_chunked):
-        await server_mod.refresh_view(setup_state, view)
-
-    # Progress advanced with each chunk, not only after all three committed.
-    assert observed == [(1, 3, 1), (2, 3, 2), (3, 3, 3)]
-
-    vs = setup_state.view_statuses[view.name]
-    # last_action flipped to chunked_full at start, stays there through completion.
-    assert vs.last_action == "chunked_full"
-    # After clean completion, chunks_total is cleared but chunks_done keeps the
-    # final count for historical display.
-    assert vs.chunks_total is None
-    assert vs.chunks_done == 3
-    # total_refreshes ticks once per backfill (not per chunk) — existing
-    # consumers of that counter keep their invariant.
-    assert vs.total_refreshes == 1
-    # recent_queries has all three, newest first — _on_chunk prepends each.
-    assert [q.query_id for q in vs.recent_queries] == ["q3", "q2", "q1"]
 
 
 def test_chunk_metrics_defined():

@@ -62,13 +62,10 @@ class QueryHistory:
         self._db: aiosqlite.Connection | None = None
 
     async def open(self) -> None:
-        # ``check_same_thread=False`` because aiosqlite's worker thread is
-        # not the thread that created this object.
         self._db = await aiosqlite.connect(self.db_path)
         await self._db.executescript(_SCHEMA)
         await self._db.commit()
-        log.info("query history opened at %s (limit=%d per view)",
-                 self.db_path, self.limit)
+        log.info("query history opened at %s (limit=%d per view)", self.db_path, self.limit)
 
     async def close(self) -> None:
         if self._db is not None:
@@ -79,7 +76,6 @@ class QueryHistory:
         """Insert ``queries`` for ``view`` and trim to ``self.limit``."""
         if not queries:
             return
-        assert self._db is not None, "QueryHistory.open() not called"
         await self._db.executemany(
             "INSERT INTO query_history "
             "(view, query_id, info_uri, stage, started_at, elapsed_ms, "
@@ -109,7 +105,6 @@ class QueryHistory:
 
     async def recent(self, view: str) -> list[QueryInfo]:
         """Return the newest-first list of at most ``self.limit`` queries."""
-        assert self._db is not None, "QueryHistory.open() not called"
         async with self._db.execute(
             "SELECT query_id, info_uri, stage, started_at, elapsed_ms, "
             "       processed_rows, processed_bytes "
@@ -128,14 +123,12 @@ class QueryHistory:
         ]
 
     async def delete_view(self, view: str) -> None:
-        assert self._db is not None, "QueryHistory.open() not called"
         await self._db.execute("DELETE FROM query_history WHERE view = ?", (view,))
         await self._db.execute("DELETE FROM maintenance_state WHERE view = ?", (view,))
         await self._db.commit()
 
     async def record_maintenance(self, view: str, op: str, last_run: float) -> None:
         """Upsert the last-run timestamp for ``(view, op)``."""
-        assert self._db is not None, "QueryHistory.open() not called"
         await self._db.execute(
             "INSERT INTO maintenance_state (view, op, last_run) VALUES (?, ?, ?) "
             "ON CONFLICT(view, op) DO UPDATE SET last_run = excluded.last_run",
@@ -145,7 +138,6 @@ class QueryHistory:
 
     async def all_maintenance(self, view: str) -> dict[str, float]:
         """Return ``{op: last_run}`` for every op recorded against ``view``."""
-        assert self._db is not None, "QueryHistory.open() not called"
         async with self._db.execute(
             "SELECT op, last_run FROM maintenance_state WHERE view = ?",
             (view,),

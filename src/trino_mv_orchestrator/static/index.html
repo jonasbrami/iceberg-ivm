@@ -52,9 +52,6 @@
     }
     .modal-enter { animation: modal-rise 0.26s cubic-bezier(0.16, 1, 0.3, 1) both; }
 
-    @keyframes spin-smooth { to { transform: rotate(360deg); } }
-    .spin { animation: spin-smooth 0.75s linear infinite; }
-
     /* ── Accent line at page top ────────────────────────────────── */
     body::before {
       content: '';
@@ -180,50 +177,15 @@
                 <h2 class="text-[14px] font-semibold font-mono text-[#0d0d18] tracking-[-0.01em]"
                     x-text="view.name"></h2>
 
-                <!-- pending (no status yet or explicitly pending) -->
-                <span x-show="!view.status || view.status.last_action === 'pending'"
-                      class="inline-flex items-center gap-[5px] text-[10px] tracking-[0.06em]
-                             uppercase font-mono px-[7px] py-[2px] rounded-full
-                             bg-[#f0f0f6] text-[#888ca0] border border-[rgba(15,15,30,0.06)]">
-                  <span class="w-[5px] h-[5px] rounded-full bg-[#c0c0d0] shrink-0"></span>
-                  pending
-                </span>
-
-                <!-- idle / skip -->
-                <span x-show="view.status?.last_action === 'skip'"
-                      class="inline-flex items-center gap-[5px] text-[10px] tracking-[0.06em]
-                             uppercase font-mono px-[7px] py-[2px] rounded-full
-                             bg-[#f0f0f6] text-[#666684] border border-[rgba(15,15,30,0.06)]">
-                  <span class="w-[5px] h-[5px] rounded-full bg-[#a8a8c0] shrink-0"></span>
-                  idle
-                </span>
-
-                <!-- incremental -->
-                <span x-show="view.status?.last_action === 'incremental'"
-                      class="inline-flex items-center gap-[5px] text-[10px] tracking-[0.06em]
-                             uppercase font-mono px-[7px] py-[2px] rounded-full
-                             bg-emerald-500/[0.10] text-emerald-700 border border-emerald-500/[0.3]">
-                  <span class="w-[5px] h-[5px] rounded-full bg-emerald-500 shrink-0 dot-pulse"></span>
-                  incremental
-                </span>
-
-                <!-- full -->
-                <span x-show="view.status?.last_action === 'full'"
-                      class="inline-flex items-center gap-[5px] text-[10px] tracking-[0.06em]
-                             uppercase font-mono px-[7px] py-[2px] rounded-full
-                             bg-amber-500/[0.12] text-amber-700 border border-amber-500/[0.3]">
-                  <span class="w-[5px] h-[5px] rounded-full bg-amber-500 shrink-0 dot-pulse"></span>
-                  full
-                </span>
-
-                <!-- error -->
-                <span x-show="view.status?.last_error"
-                      class="inline-flex items-center gap-[5px] text-[10px] tracking-[0.06em]
-                             uppercase font-mono px-[7px] py-[2px] rounded-full
-                             bg-red-500/[0.10] text-red-700 border border-red-500/[0.3]">
-                  <span class="w-[5px] h-[5px] rounded-full bg-red-500 shrink-0"></span>
-                  error
-                </span>
+                <template x-for="b in badges(view)" :key="b.label">
+                  <span class="inline-flex items-center gap-[5px] text-[10px] tracking-[0.06em]
+                               uppercase font-mono px-[7px] py-[2px] rounded-full border"
+                        :class="b.cls">
+                    <span class="w-[5px] h-[5px] rounded-full shrink-0"
+                          :class="b.dotCls + (b.pulse ? ' dot-pulse' : '')"></span>
+                    <span x-text="b.label"></span>
+                  </span>
+                </template>
               </div>
 
               <!-- Source → Target -->
@@ -256,7 +218,7 @@
                 </template>
                 <template x-if="refreshing[view.name]">
                   <span class="flex items-center gap-[5px]">
-                    <svg class="w-3 h-3 spin" viewBox="0 0 24 24" fill="none">
+                    <svg class="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none">
                       <circle cx="12" cy="12" r="9"
                               stroke="currentColor" stroke-width="2.5"
                               stroke-dasharray="56.55" stroke-dashoffset="42"
@@ -697,6 +659,25 @@ function app() {
     parseError: '',        // human-readable error from /api/views/parse
     parsing: false,        // in-flight indicator
     _parseTimer: null,     // debounce handle
+
+    // Status badges for one view. Rendered via <template x-for>.
+    badges(view) {
+      const st = view.status;
+      const out = [];
+      const action = st?.last_action || 'pending';
+      const tbl = {
+        pending:      {label: 'pending',     cls: 'bg-[#f0f0f6] text-[#888ca0] border-[rgba(15,15,30,0.06)]', dotCls: 'bg-[#c0c0d0]', pulse: false},
+        skip:         {label: 'idle',        cls: 'bg-[#f0f0f6] text-[#666684] border-[rgba(15,15,30,0.06)]', dotCls: 'bg-[#a8a8c0]', pulse: false},
+        incremental:  {label: 'incremental', cls: 'bg-emerald-500/[0.10] text-emerald-700 border-emerald-500/[0.3]', dotCls: 'bg-emerald-500', pulse: true},
+        full:         {label: 'full',        cls: 'bg-amber-500/[0.12] text-amber-700 border-amber-500/[0.3]',     dotCls: 'bg-amber-500',   pulse: true},
+        chunked_full: {label: 'backfill',    cls: 'bg-amber-500/[0.12] text-amber-700 border-amber-500/[0.3]',     dotCls: 'bg-amber-500',   pulse: true},
+      };
+      if (tbl[action]) out.push(tbl[action]);
+      if (st?.last_error) {
+        out.push({label: 'error', cls: 'bg-red-500/[0.10] text-red-700 border-red-500/[0.3]', dotCls: 'bg-red-500', pulse: false});
+      }
+      return out;
+    },
 
     get schemaRows() {
       // Group consecutive fields sharing the same non-null `group` into a single row.

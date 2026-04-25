@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import typing
 from contextlib import asynccontextmanager
 import dataclasses
 from dataclasses import dataclass, field
@@ -16,7 +17,7 @@ from aiotrino.auth import BasicAuthentication
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, create_model, field_validator
 
 from trino_mv_orchestrator.config import (
     Config,
@@ -31,12 +32,9 @@ from trino_mv_orchestrator.config import (
 )
 from trino_mv_orchestrator.detector import RefreshAction, detect_changes
 from trino_mv_orchestrator.executor import (
-    ChunkProgress,
     QueryInfo,
-    execute_chunked_full_refresh,
-    execute_full_refresh,
-    execute_incremental_refresh,
     execute_maintenance,
+    execute_refresh,
 )
 from trino_mv_orchestrator.introspect import (
     build_create_table_sql,
@@ -57,60 +55,17 @@ REFRESH_ERRORS = Counter("mv_refresh_errors_total", "Refresh errors", ["view"])
 CONFIG_RELOADS = Counter("mv_config_reload_total", "Config reload events")
 VIEWS_CONFIGURED = Gauge("mv_views_configured", "Number of configured views")
 
-# Enhanced metrics
-REFRESH_BYTES = Counter(
-    "mv_refresh_bytes_processed_total",
-    "Bytes processed during refresh queries",
-    ["view", "catalog", "schema", "table"],
-)
-REFRESH_ROWS = Counter(
-    "mv_refresh_rows_processed_total",
-    "Rows processed during refresh queries",
-    ["view", "catalog", "schema", "table"],
-)
-DETECTION_DURATION = Histogram(
-    "mv_detection_duration_seconds",
-    "Change detection duration",
-    ["view"],
-)
-SOURCE_SNAPSHOT = Gauge(
-    "mv_source_snapshot_id",
-    "Current source snapshot ID",
-    ["view"],
-)
+REFRESH_BYTES = Counter("mv_refresh_bytes_processed_total", "Bytes processed during refresh queries", ["view"])
+REFRESH_ROWS = Counter("mv_refresh_rows_processed_total", "Rows processed during refresh queries", ["view"])
+DETECTION_DURATION = Histogram("mv_detection_duration_seconds", "Change detection duration", ["view"])
+SOURCE_SNAPSHOT = Gauge("mv_source_snapshot_id", "Current source snapshot ID", ["view"])
 
-# Per-chunk metrics for chunked first-run full refreshes. ``mv_refresh_total``
-# / ``mv_refresh_duration_seconds`` only tick once when the whole backfill
-# commits (often after hours), so on their own they give zero operational
-# visibility into an in-flight backfill. These counters and the histogram
-# fire once per committed chunk, giving Prometheus an honest throughput view.
-CHUNKS_COMPLETED = Counter(
-    "mv_chunks_completed_total",
-    "Completed chunks in a chunked full refresh",
-    ["view"],
-)
-CHUNK_DURATION = Histogram(
-    "mv_chunk_duration_seconds",
-    "Per-chunk merge duration in a chunked full refresh",
-    ["view"],
-)
-CHUNK_ROWS = Counter(
-    "mv_chunk_rows_written_total",
-    "Rows written per chunk in a chunked full refresh",
-    ["view", "catalog", "schema", "table"],
-)
-
-
-def _parse_table_labels(table: str) -> dict[str, str]:
-    """Split a qualified table name into a Prometheus label dict.
-
-    Missing leading parts (bare ``tbl`` or ``schema.tbl``) become empty
-    strings so the label set keeps a stable shape.
-    """
-    parts = table.split(".")
-    padded = [""] * (3 - len(parts)) + parts
-    catalog, schema, tbl = padded[-3:]
-    return {"catalog": catalog, "schema": schema, "table": tbl}
+# Per-chunk metrics for chunked first-run full refreshes — mv_refresh_total /
+# mv_refresh_duration_seconds only tick once when the whole backfill commits
+# (often hours later), giving zero in-flight visibility on their own.
+CHUNKS_COMPLETED = Counter("mv_chunks_completed_total", "Completed chunks in a chunked full refresh", ["view"])
+CHUNK_DURATION = Histogram("mv_chunk_duration_seconds", "Per-chunk merge duration in a chunked full refresh", ["view"])
+CHUNK_ROWS = Counter("mv_chunk_rows_written_total", "Rows written per chunk in a chunked full refresh", ["view"])
 
 
 # ── Application state ──
@@ -236,15 +191,15 @@ def resolve_target_table(view: ViewConfig, cfg: Config) -> str:
     return view.target_table or f"{cfg.trino.catalog}.{cfg.trino.schema}.{view.name}"
 
 
-def reload_config(s: AppState) -> bool:
+def reload_config(s: AppState) -> None:
     try:
         config_mtime = s.config_path.stat().st_mtime
     except FileNotFoundError:
         log.warning("config file not found: %s", s.config_path)
-        return False
+        return
     views_mtime = s.views_path.stat().st_mtime if s.views_path.exists() else 0
     if config_mtime <= s.config_mtime and views_mtime <= s.views_mtime:
-        return False
+        return
     try:
         new_cfg = load_config(s.config_path)
         new_views = load_views(s.views_path)
@@ -253,17 +208,11 @@ def reload_config(s: AppState) -> bool:
         s.views_mtime = views_mtime
         VIEWS_CONFIGURED.set(len(new_views))
         CONFIG_RELOADS.inc()
-        log.info(
-            "config reloaded from %s + %s: %d views",
-            s.config_path, s.views_path, len(new_views),
-        )
+        log.info("config reloaded: %d views", len(new_views))
         for v in new_views:
-            if v.name not in s.view_statuses:
-                s.view_statuses[v.name] = ViewStatus(name=v.name)
-        return True
+            s.view_statuses.setdefault(v.name, ViewStatus(name=v.name))
     except Exception:
         log.exception("failed to reload config")
-        return False
 
 
 async def hydrate_recent_queries(s: AppState) -> None:
@@ -291,15 +240,10 @@ async def hydrate_recent_queries(s: AppState) -> None:
 async def maintain_view(
     s: AppState, view: ViewConfig, cursor, target_table: str,
 ) -> None:
-    """Run any due Iceberg maintenance ops for ``view``.
+    """Run any due Iceberg maintenance ops after a refresh, on the same cursor.
 
-    Called from ``refresh_view`` after a successful refresh on the same
-    cursor/session. Serialising with refresh avoids Iceberg commit
-    conflicts for free — asyncio is single-threaded and ``view_worker`` is
-    the sole caller of ``refresh_view`` per view.
-
-    ``0`` interval means the op is disabled. Last-run times are persisted
-    so restarts resume the schedule rather than re-running immediately.
+    Serialising with refresh avoids Iceberg commit conflicts. ``0`` interval =
+    disabled. Last-run times are persisted so restarts resume the schedule.
     """
     ops = [
         ("optimize", view.optimize_interval_seconds,
@@ -324,16 +268,26 @@ async def maintain_view(
             ms.last_duration = qi.elapsed_ms / 1000.0
             ms.last_error = None
             ms.total_runs += 1
+            await _record_query(s, view.name, vs, qi)
             if s.history is not None:
-                await s.history.append(view.name, [qi])
                 await s.history.record_maintenance(view.name, op, ms.last_run)
-                vs.recent_queries = await s.history.recent(view.name)
-            else:
-                vs.recent_queries = ([qi, *vs.recent_queries])[:RECENT_QUERY_LIMIT]
         except Exception as e:
             ms.last_error = str(e)
             ms.total_errors += 1
             log.exception("%s: maintenance %s failed", view.name, op)
+
+
+async def _record_query(s: AppState, view_name: str, vs: ViewStatus, q: QueryInfo) -> None:
+    """Persist ``q`` to history + refresh ``vs.recent_queries``.
+
+    When history is open (always in prod, sometimes not in tests) SQLite is
+    the source of truth; otherwise we fall back to the in-memory ring buffer.
+    """
+    if s.history is not None:
+        await s.history.append(view_name, [q])
+        vs.recent_queries = await s.history.recent(view_name)
+    else:
+        vs.recent_queries = ([q, *vs.recent_queries])[:RECENT_QUERY_LIMIT]
 
 
 async def refresh_view(s: AppState, view: ViewConfig) -> None:
@@ -342,151 +296,92 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
     vs = s.view_statuses.setdefault(view.name, ViewStatus(name=view.name))
 
     try:
-        # Derive source_table, filter_column, granularity, merge_keys
-        # from the query AST.  Cheap: sqlparse is O(μs) on a one-screen query.
         parsed = parse_view_query(view.query)
         target_table = resolve_target_table(view, s.config)
-        source_labels = _parse_table_labels(parsed.source_table)
 
-        # Auto-discover columns and create target. The target is unpartitioned
-        # by default — set view.target_partitioning explicitly to partition it.
-        # (Auto-inheriting the source's spec was fragile when the source
-        # partition column had been aliased away by date_trunc; see issue #22.)
+        # Create target on first run (unpartitioned by default; see #22).
         columns = await discover_columns(cursor, view.query)
-        create_sql = build_create_table_sql(
+        await cursor.execute(build_create_table_sql(
             target_table, columns, view.target_partitioning,
-        )
-        await cursor.execute(create_sql)
-
+        ))
         value_columns = [c.name for c in columns if c.name not in parsed.merge_keys]
 
-        # Read state
         last_snap = await read_last_snapshot(cursor, target_table)
 
-        # Detect changes via file-level column stats
-        detect_start = time.monotonic()
+        t0 = time.monotonic()
         result = await detect_changes(
-            cursor, parsed.source_table,
-            parsed.filter_column, parsed.granularity,
-            last_snap,
+            cursor, parsed.source_table, parsed.filter_column,
+            parsed.granularity, last_snap,
         )
-        detect_elapsed = time.monotonic() - detect_start
-        DETECTION_DURATION.labels(view=view.name).observe(detect_elapsed)
-        log.info(
-            "%s: change detection took %.3fs → %s",
-            view.name, detect_elapsed, result.action.name,
-        )
-
+        DETECTION_DURATION.labels(view=view.name).observe(time.monotonic() - t0)
+        log.info("%s: detection → %s (%.3fs)", view.name, result.action.name, time.monotonic() - t0)
         if result.current_snapshot is not None:
             SOURCE_SNAPSHOT.labels(view=view.name).set(result.current_snapshot)
 
         if result.action == RefreshAction.NO_CHANGE:
             vs.last_action = "skip"
             REFRESH_TOTAL.labels(view=view.name, type="skip").inc()
-            # Advance state past empty-append or compaction-only
-            # snapshots so we don't re-detect them every cycle. The
-            # unchanged-snapshot case (current_snapshot == last_snap)
-            # is a true no-op and doesn't need a write.
-            if (
-                result.current_snapshot is not None
-                and result.current_snapshot != last_snap
-            ):
+            # Advance state past empty-append / compaction-only snapshots so
+            # we don't re-detect them every cycle.
+            if result.current_snapshot is not None and result.current_snapshot != last_snap:
                 await write_last_snapshot(cursor, target_table, result.current_snapshot)
             await maintain_view(s, view, cursor, target_table)
             return
 
+        # Set vs.last_action up-front so /api/views reflects what's running,
+        # not what last finished — matters for multi-hour chunked backfills.
+        chunked = result.action == RefreshAction.FULL_REFRESH and view.full_refresh_chunk
         if result.action == RefreshAction.FULL_REFRESH:
-            if view.full_refresh_chunk:
-                # Set the action up-front (not after the whole backfill) so
-                # ``GET /api/views`` reflects what the view is actually doing.
-                vs.last_action = "chunked_full"
-                vs.chunks_done = 0
-                vs.chunks_total = None  # first on_chunk call populates it
-                chunk_labels = {"view": view.name, **source_labels}
-
-                async def _on_chunk(p: ChunkProgress) -> None:
-                    # Update every observable per chunk — operators tailing
-                    # /api/views need duration, range, query IDs, and
-                    # chunks_done to move without waiting for the whole
-                    # backfill to finish.
-                    vs.last_range = f"[{p.chunk_range[0]}, {p.chunk_range[1]})"
-                    vs.last_refresh = time.time()
-                    vs.last_duration = p.query.elapsed_ms / 1000.0
-                    vs.last_error = None
-                    vs.chunks_done = p.chunks_done
-                    vs.chunks_total = p.chunks_total
-                    if s.history is not None:
-                        await s.history.append(view.name, [p.query])
-                        vs.recent_queries = await s.history.recent(view.name)
-                    else:
-                        vs.recent_queries = (
-                            [p.query, *vs.recent_queries]
-                        )[:RECENT_QUERY_LIMIT]
-                    CHUNKS_COMPLETED.labels(view=view.name).inc()
-                    CHUNK_DURATION.labels(view=view.name).observe(
-                        p.query.elapsed_ms / 1000.0,
-                    )
-                    CHUNK_ROWS.labels(**chunk_labels).inc(p.query.processed_rows)
-
-                refresh_result = await execute_chunked_full_refresh(
-                    cursor, view, target_table, parsed, value_columns,
-                    chunk_granularity=view.full_refresh_chunk,
-                    should_stop=lambda: s._stop,
-                    on_chunk=_on_chunk,
-                )
-            else:
-                refresh_result = await execute_full_refresh(cursor, view, target_table)
-                vs.last_action = "full"
-                vs.last_range = None
-            REFRESH_TOTAL.labels(view=view.name, type="full").inc()
+            vs.last_action = "chunked_full" if chunked else "full"
+            vs.chunks_done = 0
+            vs.chunks_total = None
         else:
-            refresh_result = await execute_incremental_refresh(
-                cursor, view, target_table,
-                parsed.filter_column, parsed.merge_keys,
-                value_columns, result.filter_range,
-            )
             vs.last_action = "incremental"
-            vs.last_range = f"[{result.filter_range[0]}, {result.filter_range[1]})"
-            REFRESH_TOTAL.labels(view=view.name, type="incremental").inc()
 
-        # Chunked refresh may stop mid-backfill on graceful shutdown. In
-        # that case leave last_source_snapshot unset so the next tick
-        # resumes from target metadata. ``_on_chunk`` has already populated
-        # last_refresh / last_duration / recent_queries for the committed
-        # chunks — leave chunks_total set so the UI can still show how far
-        # we got before shutdown.
-        if refresh_result.interrupted:
-            return
+        incremental_range = result.filter_range if result.action == RefreshAction.INCREMENTAL else None
+        total_elapsed = 0.0
+        total_rows = 0
+        total_bytes = 0
+        total_queries = 0
 
+        async for q in execute_refresh(
+            cursor, view, target_table, parsed, value_columns,
+            incremental_range=incremental_range,
+        ):
+            total_elapsed += q.elapsed_ms / 1000.0
+            total_rows += q.processed_rows
+            total_bytes += q.processed_bytes
+            total_queries += 1
+            vs.last_refresh = time.time()
+            vs.last_duration = q.elapsed_ms / 1000.0
+            vs.last_error = None
+            vs.last_range = f"[{q.range_start}, {q.range_end})"
+            vs.chunks_done = q.chunks_done
+            vs.chunks_total = q.chunks_total if q.chunks_total > 1 else None
+            await _record_query(s, view.name, vs, q)
+            if q.chunks_total > 1:
+                CHUNKS_COMPLETED.labels(view=view.name).inc()
+                CHUNK_DURATION.labels(view=view.name).observe(q.elapsed_ms / 1000.0)
+                CHUNK_ROWS.labels(view=view.name).inc(q.processed_rows)
+            if s._stop:
+                # Graceful shutdown mid-backfill — leave last_source_snapshot
+                # unset so the next tick resumes from target metadata.
+                log.info("%s: refresh interrupted after chunk %d/%d",
+                         view.name, q.chunks_done, q.chunks_total)
+                return
+
+        # Non-chunked paths (full or incremental) and completed chunked backfills
+        # commit the source snapshot bookmark. Empty chunked runs (source empty,
+        # or fully caught up) also advance state — total_queries == 0 is fine.
+        REFRESH_TOTAL.labels(view=view.name,
+                             type="incremental" if incremental_range else "full").inc()
         await write_last_snapshot(cursor, target_table, result.current_snapshot)
-
-        vs.last_refresh = time.time()
-        vs.last_duration = refresh_result.elapsed
-        vs.last_error = None
         vs.total_refreshes += 1
-        # Clear the in-flight marker once the backfill commits cleanly.
-        # chunks_done stays at the final count for historical display.
         vs.chunks_total = None
-        # Ring-buffer the refresh queries (MERGE / INSERT / DELETE) for the UI.
-        # Newest first, capped to RECENT_QUERY_LIMIT. Chunked refreshes have
-        # already appended each chunk via _on_chunk, so skip the duplicate
-        # append here.
-        if not view.full_refresh_chunk or result.action != RefreshAction.FULL_REFRESH:
-            if s.history is not None:
-                await s.history.append(view.name, refresh_result.queries)
-                vs.recent_queries = await s.history.recent(view.name)
-            else:
-                vs.recent_queries = (
-                    refresh_result.queries + vs.recent_queries
-                )[:RECENT_QUERY_LIMIT]
-        REFRESH_DURATION.labels(view=view.name).observe(refresh_result.elapsed)
-        REFRESH_LAST_SUCCESS.labels(view=view.name).set(vs.last_refresh)
-
-        # Record bytes/rows with source table labels
-        lbl = {"view": view.name, **source_labels}
-        REFRESH_BYTES.labels(**lbl).inc(refresh_result.processed_bytes)
-        REFRESH_ROWS.labels(**lbl).inc(refresh_result.processed_rows)
-
+        REFRESH_DURATION.labels(view=view.name).observe(total_elapsed)
+        REFRESH_LAST_SUCCESS.labels(view=view.name).set(vs.last_refresh or time.time())
+        REFRESH_BYTES.labels(view=view.name).inc(total_bytes)
+        REFRESH_ROWS.labels(view=view.name).inc(total_rows)
         await maintain_view(s, view, cursor, target_table)
 
     except Exception as e:
@@ -629,166 +524,117 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="trino-mv-orchestrator", lifespan=lifespan)
 
 
-# ── API models ──
+# ── API models + form schema, all derived from ViewConfig ──
 
-class ViewCreate(BaseModel):
-    name: str
-    query: str
-    target_table: str | None = None
-    target_partitioning: str | None = None
-    refresh_interval_seconds: int = 60
-    full_refresh_chunk: str | None = None
-    optimize_interval_seconds: int = 0
-    optimize_file_size_threshold: str | None = None
-    expire_snapshots_interval_seconds: int = 0
-    expire_snapshots_retention: str = "7d"
-    remove_orphan_files_interval_seconds: int = 0
-    remove_orphan_files_retention: str = "7d"
+# Per-field presentation metadata: label + anything non-inferrable from the
+# dataclass annotation/default. Not in the map → derived defaults (label from
+# Title Case, required=False, type inferred from annotation).
+_GRAN_OPTIONS = [{"value": "", "label": "— none (single-shot) —"}] + [
+    {"value": g, "label": g} for g in ("hour", "day", "week", "month", "quarter", "year")
+]
+_FIELD_META: dict[str, dict] = {
+    "name": {"required": True, "placeholder": "ohlcv_1m", "disabled_on_edit": True},
+    "query": {"required": True, "type": "text", "rows": 10, "disabled_on_edit": True,
+              "placeholder": (
+                  "SELECT symbol,\n       date_trunc('minute', ts) AS minute,\n"
+                  "       min_by(price, ts) AS open,\n       max(price)        AS high,\n"
+                  "       min(price)        AS low,\n       max_by(price, ts) AS close\n"
+                  "FROM iceberg.market_data.trades\nGROUP BY symbol, date_trunc('minute', ts)"),
+              "help": ("exactly what you would write after CREATE MATERIALIZED VIEW … AS. "
+                       "source table, filter column, granularity and merge keys are "
+                       "derived automatically from the query.")},
+    "target_table": {"group": "target", "placeholder": "auto-generated"},
+    "target_partitioning": {"group": "target", "placeholder": "inherits from source"},
+    "refresh_interval_seconds": {"min": 1, "suffix": "seconds", "label": "Refresh Interval"},
+    "full_refresh_chunk": {"type": "select", "group": "target", "options": _GRAN_OPTIONS,
+                           "label": "Full Refresh Chunk Size",
+                           "help": ("If set, the first-run backfill is split into chunks of this size "
+                                    "and each chunk is committed independently. Must be coarser-or-equal "
+                                    "to the view's own date_trunc granularity.")},
+    "optimize_interval_seconds": {"min": 0, "suffix": "seconds", "group": "maintenance",
+                                  "label": "Optimize Every",
+                                  "help": "0 disables. Runs ALTER TABLE ... EXECUTE optimize."},
+    "optimize_file_size_threshold": {"group": "maintenance",
+                                     "label": "Optimize File Size Threshold",
+                                     "placeholder": "e.g. 128MB (default: Trino's 100MB)"},
+    "expire_snapshots_interval_seconds": {"min": 0, "suffix": "seconds", "group": "maintenance",
+                                          "label": "Expire Snapshots Every",
+                                          "help": "0 disables. Runs ALTER TABLE ... EXECUTE expire_snapshots."},
+    "expire_snapshots_retention": {"group": "maintenance", "label": "Expire Snapshots Retention",
+                                   "help": "Trino duration (e.g. '7d'). Must be ≥ catalog's min-retention."},
+    "remove_orphan_files_interval_seconds": {"min": 0, "suffix": "seconds", "group": "maintenance",
+                                             "label": "Remove Orphan Files Every",
+                                             "help": "0 disables. Runs ALTER TABLE ... EXECUTE remove_orphan_files."},
+    "remove_orphan_files_retention": {"group": "maintenance", "label": "Remove Orphan Files Retention",
+                                      "help": "Trino duration (e.g. '7d'). Must be ≥ catalog's min-retention."},
+}
 
-    @field_validator("name")
-    @classmethod
-    def validate_name(cls, v: str) -> str:
-        validate_identifier(v, "name")
-        return v
+# Resolve string annotations to real types (PEP 563 / `from __future__ import annotations`).
+_VIEW_TYPES: dict[str, type] = typing.get_type_hints(ViewConfig)
 
-    @field_validator("target_table")
-    @classmethod
-    def validate_target_table(cls, v: str | None) -> str | None:
-        if v is not None:
-            validate_qualified_name(v, "target_table")
-        return v
+
+def _build_form_schema() -> list[dict]:
+    schema = []
+    for f in dataclasses.fields(ViewConfig):
+        meta = _FIELD_META.get(f.name, {})
+        entry = {
+            "name": f.name,
+            "label": meta.get("label", f.name.replace("_", " ").title()),
+            "type": meta.get("type", "number" if _VIEW_TYPES[f.name] is int else "string"),
+            "required": meta.get("required", False),
+        }
+        if f.default is not dataclasses.MISSING:
+            entry["default"] = f.default
+        for k in ("placeholder", "help", "group", "options", "rows", "min", "suffix", "disabled_on_edit"):
+            if k in meta:
+                entry[k] = meta[k]
+        schema.append(entry)
+    return schema
+
+
+VIEW_FORM_SCHEMA: list[dict] = _build_form_schema()
+
+
+def _build_view_create_model() -> type[BaseModel]:
+    """Pydantic ViewCreate model auto-derived from ViewConfig fields."""
+    fields_spec: dict[str, tuple] = {}
+    for f in dataclasses.fields(ViewConfig):
+        default = ... if f.default is dataclasses.MISSING else f.default
+        fields_spec[f.name] = (_VIEW_TYPES[f.name], default)
+    validators = {
+        "_v_name": field_validator("name")(classmethod(lambda cls, v: (validate_identifier(v, "name"), v)[1])),
+        "_v_target_table": field_validator("target_table")(classmethod(
+            lambda cls, v: (validate_qualified_name(v, "target_table"), v)[1] if v else v)),
+    }
+    return create_model("ViewCreate", __validators__=validators, **fields_spec)
+
+
+ViewCreate = _build_view_create_model()
 
 
 class ViewResponse(BaseModel):
     """View as returned by the API.
 
-    ``source_table``, ``filter_column``, and ``merge_keys`` are *derived* from
-    the query AST — they appear in the response so the UI can render a source →
-    target card, but they are not accepted on ``POST``.
+    ``source_table``, ``filter_column``, ``merge_keys`` are derived from the
+    query AST and added for the UI's benefit; they are not accepted on POST.
     """
-    name: str
-    query: str
+    model_config = {"extra": "allow"}
     source_table: str
     filter_column: str
     merge_keys: tuple[str, ...]
-    target_table: str | None = None
-    target_partitioning: str | None = None
-    refresh_interval_seconds: int = 60
-    full_refresh_chunk: str | None = None
-    optimize_interval_seconds: int = 0
-    optimize_file_size_threshold: str | None = None
-    expire_snapshots_interval_seconds: int = 0
-    expire_snapshots_retention: str = "7d"
-    remove_orphan_files_interval_seconds: int = 0
-    remove_orphan_files_retention: str = "7d"
     status: dict | None = None
 
 
 def _view_to_response(v: ViewConfig, vs: ViewStatus | None) -> ViewResponse:
     parsed = parse_view_query(v.query)
+    data = {f.name: getattr(v, f.name) for f in dataclasses.fields(ViewConfig)}
     return ViewResponse(
-        name=v.name, query=v.query,
         source_table=parsed.source_table,
         filter_column=parsed.filter_column,
         merge_keys=parsed.merge_keys,
-        target_table=v.target_table, target_partitioning=v.target_partitioning,
-        refresh_interval_seconds=v.refresh_interval_seconds,
-        full_refresh_chunk=v.full_refresh_chunk,
-        optimize_interval_seconds=v.optimize_interval_seconds,
-        optimize_file_size_threshold=v.optimize_file_size_threshold,
-        expire_snapshots_interval_seconds=v.expire_snapshots_interval_seconds,
-        expire_snapshots_retention=v.expire_snapshots_retention,
-        remove_orphan_files_interval_seconds=v.remove_orphan_files_interval_seconds,
-        remove_orphan_files_retention=v.remove_orphan_files_retention,
         status=dataclasses.asdict(vs) if vs else None,
+        **data,
     )
-
-
-# ── Form schema (drives the UI dynamically) ──
-
-VIEW_FORM_SCHEMA: list[dict] = [
-    {"name": "name", "label": "Name", "type": "string", "required": True,
-     "placeholder": "ohlcv_1m", "disabled_on_edit": True},
-    {"name": "query", "label": "Query", "type": "text", "required": True,
-     "placeholder": (
-         "SELECT symbol,\n"
-         "       date_trunc('minute', ts) AS minute,\n"
-         "       min_by(price, ts) AS open,\n"
-         "       max(price)        AS high,\n"
-         "       min(price)        AS low,\n"
-         "       max_by(price, ts) AS close\n"
-         "FROM iceberg.market_data.trades\n"
-         "GROUP BY symbol, date_trunc('minute', ts)"
-     ),
-     "help": (
-         "exactly what you would write after CREATE MATERIALIZED VIEW … AS. "
-         "source table, filter column, granularity and merge keys are "
-         "derived automatically from the query."
-     ),
-     "rows": 10, "disabled_on_edit": True},
-    {"name": "target_table", "label": "Target Table", "type": "string", "required": False,
-     "placeholder": "auto-generated", "group": "target"},
-    {"name": "target_partitioning", "label": "Partitioning", "type": "string", "required": False,
-     "placeholder": "inherits from source", "group": "target"},
-    {"name": "refresh_interval_seconds", "label": "Refresh Interval", "type": "number",
-     "required": False, "default": 60, "min": 1, "suffix": "seconds"},
-    {"name": "full_refresh_chunk", "label": "Full Refresh Chunk Size", "type": "select",
-     "required": False, "group": "target",
-     "options": [
-         {"value": "", "label": "— none (single-shot) —"},
-         {"value": "hour", "label": "hour"},
-         {"value": "day", "label": "day"},
-         {"value": "week", "label": "week"},
-         {"value": "month", "label": "month"},
-         {"value": "quarter", "label": "quarter"},
-         {"value": "year", "label": "year"},
-     ],
-     "help": (
-         "If set, the first-run backfill is split into chunks of this size "
-         "and each chunk is committed independently. Leave empty for a "
-         "single-shot refresh. Must be coarser-or-equal to the view's own "
-         "date_trunc granularity."
-     )},
-
-    # ── Iceberg table maintenance. 0 disables each op; runs right after a
-    #    successful refresh on the same Trino session so no commit conflict.
-    {"name": "optimize_interval_seconds", "label": "Optimize Every",
-     "type": "number", "required": False, "default": 0, "min": 0,
-     "suffix": "seconds", "group": "maintenance",
-     "help": (
-         "0 disables. Runs ALTER TABLE ... EXECUTE optimize to compact "
-         "small files (useful for MVs that do many MERGE writes)."
-     )},
-    {"name": "optimize_file_size_threshold", "label": "Optimize File Size Threshold",
-     "type": "string", "required": False, "group": "maintenance",
-     "placeholder": "e.g. 128MB (default: Trino's 100MB)"},
-    {"name": "expire_snapshots_interval_seconds", "label": "Expire Snapshots Every",
-     "type": "number", "required": False, "default": 0, "min": 0,
-     "suffix": "seconds", "group": "maintenance",
-     "help": (
-         "0 disables. Runs ALTER TABLE ... EXECUTE expire_snapshots to "
-         "drop old snapshots and their data files."
-     )},
-    {"name": "expire_snapshots_retention", "label": "Expire Snapshots Retention",
-     "type": "string", "required": False, "default": "7d", "group": "maintenance",
-     "help": (
-         "Trino duration (e.g. '7d', '24h'). Must be ≥ the catalog's "
-         "iceberg.expire-snapshots.min-retention (default 7d)."
-     )},
-    {"name": "remove_orphan_files_interval_seconds", "label": "Remove Orphan Files Every",
-     "type": "number", "required": False, "default": 0, "min": 0,
-     "suffix": "seconds", "group": "maintenance",
-     "help": (
-         "0 disables. Runs ALTER TABLE ... EXECUTE remove_orphan_files "
-         "to delete files not referenced by metadata."
-     )},
-    {"name": "remove_orphan_files_retention", "label": "Remove Orphan Files Retention",
-     "type": "string", "required": False, "default": "7d", "group": "maintenance",
-     "help": (
-         "Trino duration (e.g. '7d'). Must be ≥ the catalog's "
-         "iceberg.remove-orphan-files.min-retention."
-     )},
-]
 
 
 # ── Endpoints ──
