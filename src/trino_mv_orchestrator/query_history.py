@@ -35,17 +35,68 @@ CREATE TABLE IF NOT EXISTS query_history (
 CREATE INDEX IF NOT EXISTS idx_query_history_view_started
     ON query_history (view, started_at DESC);
 
--- Persists the last wall-clock time each maintenance op ran, per view.
--- Separate from query_history because that table is a 50-row ring buffer
--- per view — at a 60s refresh cadence maintenance rows would be evicted
--- in under an hour and we'd re-run every op on restart.
+-- Persists the last wall-clock time each maintenance op ran, per view, plus
+-- summary counters and last-error so the UI / scheduler can recover their
+-- pre-restart state. Separate from query_history because that table is a
+-- 50-row ring buffer per view — at a 60s refresh cadence maintenance rows
+-- would be evicted in under an hour and we'd re-run every op on restart.
 CREATE TABLE IF NOT EXISTS maintenance_state (
-    view      TEXT NOT NULL,
-    op        TEXT NOT NULL,
-    last_run  REAL NOT NULL,
+    view           TEXT    NOT NULL,
+    op             TEXT    NOT NULL,
+    last_run       REAL    NOT NULL,
+    last_duration  REAL,
+    last_error     TEXT,
+    total_runs     INTEGER NOT NULL DEFAULT 0,
+    total_errors   INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (view, op)
 );
+
+-- Per-view ViewStatus snapshot. Persisted on every mutation in the refresh
+-- path so the UI shows the last-known state immediately after a restart
+-- (otherwise total_refreshes / chunks_done / last_refresh all reset to
+-- their initial values until the first post-restart tick — see issue #40).
+-- ``recent_queries`` and ``maintenance`` live in their own tables and are
+-- intentionally NOT mirrored here.
+CREATE TABLE IF NOT EXISTS view_status (
+    view              TEXT    PRIMARY KEY,
+    last_refresh      REAL,
+    last_duration     REAL,
+    last_action       TEXT    NOT NULL DEFAULT 'pending',
+    last_range        TEXT,
+    last_error        TEXT,
+    total_refreshes   INTEGER NOT NULL DEFAULT 0,
+    total_errors      INTEGER NOT NULL DEFAULT 0,
+    chunks_done       INTEGER NOT NULL DEFAULT 0,
+    chunks_total      INTEGER
+);
 """
+
+
+# Columns stored in ``view_status`` excluding the PK. Used by upsert to build
+# the SET clause and by get_view_status to project rows back into a dict.
+_VIEW_STATUS_COLS: tuple[str, ...] = (
+    "last_refresh",
+    "last_duration",
+    "last_action",
+    "last_range",
+    "last_error",
+    "total_refreshes",
+    "total_errors",
+    "chunks_done",
+    "chunks_total",
+)
+
+
+# Columns stored in ``maintenance_state`` excluding (view, op). ``last_run``
+# is required (NOT NULL) — reuse it both for the upsert SET clause and the
+# read-side projection.
+_MAINTENANCE_COLS: tuple[str, ...] = (
+    "last_run",
+    "last_duration",
+    "last_error",
+    "total_runs",
+    "total_errors",
+)
 
 
 class QueryHistory:
@@ -64,8 +115,34 @@ class QueryHistory:
     async def open(self) -> None:
         self._db = await aiosqlite.connect(self.db_path)
         await self._db.executescript(_SCHEMA)
+        await self._migrate()
         await self._db.commit()
         log.info("query history opened at %s (limit=%d per view)", self.db_path, self.limit)
+
+    async def _migrate(self) -> None:
+        """Bring an existing v1 DB up to the current schema in-place.
+
+        v1 only had ``maintenance_state(view, op, last_run)`` — pre-#40 deployments
+        running this build will hit a SQLite file with the missing columns.
+        ``ALTER TABLE ADD COLUMN`` is idempotent only if we first check existence
+        via ``PRAGMA table_info``; running the same ALTER twice errors.
+        """
+        async with self._db.execute("PRAGMA table_info(maintenance_state)") as cur:
+            existing = {row[1] for row in await cur.fetchall()}
+        # Columns added since v1. Order matches the CREATE TABLE above so a
+        # post-migration ``PRAGMA table_info`` matches a fresh-DB ordering.
+        additions = [
+            ("last_duration",  "REAL"),
+            ("last_error",     "TEXT"),
+            ("total_runs",     "INTEGER NOT NULL DEFAULT 0"),
+            ("total_errors",   "INTEGER NOT NULL DEFAULT 0"),
+        ]
+        for name, decl in additions:
+            if name not in existing:
+                await self._db.execute(
+                    f"ALTER TABLE maintenance_state ADD COLUMN {name} {decl}"
+                )
+                log.info("migrated maintenance_state: added column %s", name)
 
     async def close(self) -> None:
         if self._db is not None:
@@ -125,22 +202,84 @@ class QueryHistory:
     async def delete_view(self, view: str) -> None:
         await self._db.execute("DELETE FROM query_history WHERE view = ?", (view,))
         await self._db.execute("DELETE FROM maintenance_state WHERE view = ?", (view,))
+        await self._db.execute("DELETE FROM view_status WHERE view = ?", (view,))
         await self._db.commit()
 
-    async def record_maintenance(self, view: str, op: str, last_run: float) -> None:
-        """Upsert the last-run timestamp for ``(view, op)``."""
+    # ── view_status ───────────────────────────────────────────────────
+
+    async def upsert_view_status(self, view: str, fields: dict) -> None:
+        """Upsert the persisted ViewStatus row for ``view``.
+
+        ``fields`` mirrors the ``ViewStatus`` dataclass fields 1:1 (see
+        ``_VIEW_STATUS_COLS``). Unknown keys are ignored so callers can pass
+        a full ``dataclasses.asdict(vs)`` without filtering ``recent_queries``
+        / ``maintenance`` themselves.
+        """
+        cols = [c for c in _VIEW_STATUS_COLS if c in fields]
+        values = [fields[c] for c in cols]
+        col_list = ", ".join(["view", *cols])
+        placeholders = ", ".join(["?"] * (len(cols) + 1))
+        update_clause = ", ".join(f"{c} = excluded.{c}" for c in cols)
         await self._db.execute(
-            "INSERT INTO maintenance_state (view, op, last_run) VALUES (?, ?, ?) "
-            "ON CONFLICT(view, op) DO UPDATE SET last_run = excluded.last_run",
-            (view, op, last_run),
+            f"INSERT INTO view_status ({col_list}) VALUES ({placeholders}) "
+            f"ON CONFLICT(view) DO UPDATE SET {update_clause}",
+            (view, *values),
         )
         await self._db.commit()
 
-    async def all_maintenance(self, view: str) -> dict[str, float]:
-        """Return ``{op: last_run}`` for every op recorded against ``view``."""
+    async def get_view_status(self, view: str) -> dict | None:
+        """Return the persisted ViewStatus fields for ``view`` or ``None``."""
+        col_list = ", ".join(_VIEW_STATUS_COLS)
         async with self._db.execute(
-            "SELECT op, last_run FROM maintenance_state WHERE view = ?",
+            f"SELECT {col_list} FROM view_status WHERE view = ?",
+            (view,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return dict(zip(_VIEW_STATUS_COLS, row))
+
+    # ── maintenance_state ─────────────────────────────────────────────
+
+    async def upsert_maintenance(self, view: str, op: str, fields: dict) -> None:
+        """Upsert the per-op maintenance row for ``(view, op)``.
+
+        ``fields`` mirrors ``MaintenanceOpStatus``. ``last_run`` is required
+        (NOT NULL); other columns default to NULL / 0 if omitted.
+        """
+        if "last_run" not in fields or fields["last_run"] is None:
+            raise ValueError("upsert_maintenance requires a non-null last_run")
+        cols = [c for c in _MAINTENANCE_COLS if c in fields]
+        values = [fields[c] for c in cols]
+        col_list = ", ".join(["view", "op", *cols])
+        placeholders = ", ".join(["?"] * (len(cols) + 2))
+        update_clause = ", ".join(f"{c} = excluded.{c}" for c in cols)
+        await self._db.execute(
+            f"INSERT INTO maintenance_state ({col_list}) VALUES ({placeholders}) "
+            f"ON CONFLICT(view, op) DO UPDATE SET {update_clause}",
+            (view, op, *values),
+        )
+        await self._db.commit()
+
+    async def record_maintenance(self, view: str, op: str, last_run: float) -> None:
+        """Compatibility shim around :meth:`upsert_maintenance`.
+
+        Predates #40; some tests still call it with just ``last_run``. New
+        code should call ``upsert_maintenance`` with the full field dict.
+        """
+        await self.upsert_maintenance(view, op, {"last_run": last_run})
+
+    async def all_maintenance(self, view: str) -> dict[str, dict]:
+        """Return ``{op: {col: value, ...}}`` for every op recorded against ``view``.
+
+        Shape changed in #40: previously this returned ``dict[str, float]``
+        (just ``op → last_run``). Callers that only need ``last_run`` should
+        read ``[op]["last_run"]`` from the new dict.
+        """
+        col_list = ", ".join(_MAINTENANCE_COLS)
+        async with self._db.execute(
+            f"SELECT op, {col_list} FROM maintenance_state WHERE view = ?",
             (view,),
         ) as cur:
             rows = await cur.fetchall()
-        return {r[0]: r[1] for r in rows}
+        return {r[0]: dict(zip(_MAINTENANCE_COLS, r[1:])) for r in rows}
