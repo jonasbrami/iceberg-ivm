@@ -6,7 +6,6 @@ from trino_mv_orchestrator.detector import (
     MissingFilterColumnError,
     RefreshAction,
     UnexpectedOperationError,
-    _parse_ts,
     detect_changes,
     expand_to_bucket_bounds,
     get_current_snapshot,
@@ -366,38 +365,6 @@ class TestExpandToBucketBoundsInversesDateTrunc:
         assert start == _py_date_trunc(granularity, min_ts), (
             f"start {start} is not tight — should be {_py_date_trunc(granularity, min_ts)}"
         )
-
-
-# ── _parse_ts ──
-
-class TestParseTs:
-    def test_iso_with_tz(self):
-        dt = _parse_ts("2026-04-08T10:30:45.123456+00:00")
-        assert dt.year == 2026 and dt.month == 4 and dt.day == 8
-
-    def test_iso_no_tz(self):
-        dt = _parse_ts("2026-04-08T10:30:45.123456")
-        assert dt.hour == 10 and dt.minute == 30
-
-    def test_raises_on_unparseable(self):
-        """Unrecognized formats must raise, not fall back to date-only.
-
-        The old date-only fallback could silently shift a snapped range
-        by up to 24 hours (floor to midnight UTC), corrupting incremental
-        recomputation ranges.
-        """
-        with pytest.raises(ValueError, match="unparseable"):
-            _parse_ts("not-a-timestamp")
-
-    def test_truncates_sub_microsecond_precision(self):
-        """9-digit fractional seconds are truncated to 6 (microseconds).
-
-        expand_to_bucket_bounds floors to minute or coarser, so dropping the last
-        three digits cannot shift the bucket a row belongs to —
-        truncation is correctness-safe.
-        """
-        dt = _parse_ts("2026-04-08T10:30:45.123456789+00:00")
-        assert dt == datetime(2026, 4, 8, 10, 30, 45, 123456, tzinfo=timezone.utc)
 
 
 # ── get_current_snapshot ──

@@ -140,32 +140,32 @@ def _single_statement(sql: str) -> Statement:
 
 
 def _reject_unsupported_shapes(stmt: Statement) -> None:
-    """Reject queries whose shape the parser is not built to handle."""
+    """Reject queries whose shape the parser can't handle."""
     if "{range_filter}" in str(stmt):
         raise ValueError(
-            "query contains the legacy {range_filter} placeholder; "
-            "remove it — the orchestrator now injects the time-range WHERE "
-            "predicate automatically"
+            "query contains the legacy {range_filter} placeholder; remove it — "
+            "the orchestrator injects the time-range WHERE automatically"
         )
-
-    top_keywords = [
-        tok.normalized.upper()
-        for tok in stmt.tokens
-        if tok.ttype in (Keyword, DML, CTE)
-    ]
-
-    if "WITH" in top_keywords:
-        raise ValueError("CTEs (WITH clauses) are not supported")
-    if "UNION" in top_keywords or "INTERSECT" in top_keywords or "EXCEPT" in top_keywords:
-        raise ValueError("set operations (UNION/INTERSECT/EXCEPT) are not supported")
-    if any("JOIN" in k for k in top_keywords):
-        raise ValueError("joins are not supported; query must reference a single source table")
-    if top_keywords.count("SELECT") > 1:
-        raise ValueError("subqueries are not supported")
-    if "GROUP BY" not in top_keywords:
-        raise ValueError(
-            "query must have a GROUP BY clause; merge keys are derived from it"
-        )
+    select_count = 0
+    saw_group_by = False
+    for tok in stmt.tokens:
+        if tok.ttype not in (Keyword, DML, CTE):
+            continue
+        kw = tok.normalized.upper()
+        if kw == "WITH":
+            raise ValueError("CTEs (WITH clauses) are not supported")
+        if kw in ("UNION", "INTERSECT", "EXCEPT"):
+            raise ValueError("set operations (UNION/INTERSECT/EXCEPT) are not supported")
+        if "JOIN" in kw:
+            raise ValueError("joins are not supported; query must reference a single source table")
+        if kw == "SELECT":
+            select_count += 1
+            if select_count > 1:
+                raise ValueError("subqueries are not supported")
+        elif kw == "GROUP BY":
+            saw_group_by = True
+    if not saw_group_by:
+        raise ValueError("query must have a GROUP BY clause; merge keys are derived from it")
 
 
 def _extract_source_table(stmt: Statement) -> str:
@@ -314,9 +314,8 @@ def _projection_list(stmt: Statement) -> list:
 def _projection_alias(item) -> str:
     """Return the column name this projection item becomes in the output.
 
-    A bare column (Identifier with no alias) → its name.
-    An aliased expression (Identifier with AS) → the alias.
-    A bare Function with no alias → raises (operator must add an alias).
+    Bare column → its name. Aliased expression → the alias. Computed
+    expression without alias → raises.
     """
     if isinstance(item, Identifier):
         alias = item.get_alias()
@@ -324,20 +323,15 @@ def _projection_alias(item) -> str:
             return alias
         real = item.get_real_name()
         if real and not isinstance(item.token_first(skip_cm=True), Function):
-            # plain column reference — its own name is the output name
             return real
-        raise ValueError(
-            f"projection item {str(item)!r} has no alias; "
-            "add `AS <name>` so the target table has a stable column name"
-        )
-    if isinstance(item, Function):
-        raise ValueError(
-            f"projection item {str(item)!r} has no alias; "
-            "add `AS <name>` so the target table has a stable column name"
-        )
-    if item.ttype is Name:
+    elif item.ttype is Name:
         return str(item)
-    raise ValueError(f"cannot determine output name for projection item {str(item)!r}")
+    elif not isinstance(item, Function):
+        raise ValueError(f"cannot determine output name for projection item {str(item)!r}")
+    raise ValueError(
+        f"projection item {str(item)!r} has no alias; "
+        "add `AS <name>` so the target table has a stable column name"
+    )
 
 
 _AFTER_GROUP_BY = frozenset({"HAVING", "ORDER BY", "LIMIT", "OFFSET", "FETCH"})
@@ -405,10 +399,7 @@ def _extract_bucket_alias(
                 fn = first
         if fn is None or (fn.get_real_name() or "").lower() != "date_trunc":
             continue
-        try:
-            g, col = _read_date_trunc_args(fn)
-        except ValueError:
-            continue
+        g, col = _read_date_trunc_args(fn)
         if g == granularity and col == filter_column:
             return _projection_alias(item)
     return None
@@ -417,16 +408,10 @@ def _extract_bucket_alias(
 def _canonical(tok) -> str:
     """Normalize a projection / group-by item for equality comparison.
 
-    Strips whitespace and any trailing `AS alias` clause.
+    Strips whitespace and any trailing ``AS alias`` clause.
     """
     if isinstance(tok, Identifier):
-        # Drop the alias part: Identifier contains [Expr, (ws), 'AS', (ws), Alias]
-        first = None
-        for t in tok.tokens:
-            if t.ttype is Whitespace:
-                continue
-            first = t
-            break
+        first = tok.token_first(skip_cm=True)
         if first is not None:
             return str(first).strip().lower()
     return str(tok).strip().lower()

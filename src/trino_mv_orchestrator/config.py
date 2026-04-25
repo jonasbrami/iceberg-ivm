@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 import yaml
@@ -19,17 +19,14 @@ from trino_mv_orchestrator.query_parser import (
 log = logging.getLogger(__name__)
 
 # full_refresh_chunk must be coarser-or-equal to the view's own granularity
-# *and* cleanly contain its buckets. Weeks do not divide months, and months
-# do not divide weeks, so the relation is a partial order, not a total one.
+# and cleanly contain its buckets. Weeks don't divide months (and vice-versa),
+# so the relation is a partial order — hence the explicit override for "week".
+_GRAN_ORDER = ("minute", "hour", "day", "week", "month", "quarter", "year")
 _CHUNK_COMPATIBILITY: dict[str, frozenset[str]] = {
-    "minute":  frozenset({"minute", "hour", "day", "week", "month", "quarter", "year"}),
-    "hour":    frozenset({"hour", "day", "week", "month", "quarter", "year"}),
-    "day":     frozenset({"day", "week", "month", "quarter", "year"}),
-    "week":    frozenset({"week"}),
-    "month":   frozenset({"month", "quarter", "year"}),
-    "quarter": frozenset({"quarter", "year"}),
-    "year":    frozenset({"year"}),
+    g: frozenset(x for x in _GRAN_ORDER[i:] if x != "week" or g in ("minute", "hour", "day", "week"))
+    for i, g in enumerate(_GRAN_ORDER)
 }
+_CHUNK_COMPATIBILITY["week"] = frozenset({"week"})
 
 # Trino credentials are *only* read from these environment variables.
 # No defaults, no YAML overrides — keeping secrets out of the repo and
@@ -52,20 +49,8 @@ def validate_qualified_name(value: str, field_name: str) -> None:
         )
 
 
-# Iceberg maintenance operations we run via ``ALTER TABLE ... EXECUTE <op>``.
-# Order matters — ``server.maintain_view`` iterates this list so ops run in the
-# same order on every pass.
-MAINTENANCE_OPS: tuple[str, ...] = (
-    "optimize",
-    "expire_snapshots",
-    "remove_orphan_files",
-)
-
-# Trino duration grammar (``'7d'``, ``'30m'``, …) — used by Iceberg retention
-# params. Accepts s/m/h/d; weeks are ``Nd`` (Trino does not take 'w').
-_DURATION_RE = re.compile(r"^\d+[smhd]$")
-
-# Iceberg ``file_size_threshold`` must be a DataSize literal.
+_MAINTENANCE_OPS = ("optimize", "expire_snapshots", "remove_orphan_files")
+_DURATION_RE = re.compile(r"^\d+[smhd]$")     # Trino duration: s/m/h/d only
 _DATASIZE_RE = re.compile(r"^\d+(B|KB|MB|GB|TB)$")
 
 
@@ -73,7 +58,7 @@ _DATASIZE_RE = re.compile(r"^\d+(B|KB|MB|GB|TB)$")
 class ViewConfig:
     name: str
     query: str
-    target_table: str | None = None
+    target_table: str
     target_partitioning: str | None = None
     refresh_interval_seconds: int = 60
     # Granularity string ("day", "month", …) controlling the size of each
@@ -155,43 +140,30 @@ def validate_chunk_compatibility(chunk: str | None, query: str) -> None:
         )
 
 
-def validate_maintenance_config(raw: dict | ViewConfig) -> None:
-    """Validate maintenance intervals + param strings.
-
-    Accepts either a raw YAML/API dict or a constructed ``ViewConfig`` — same
-    field names in both, so attribute access via ``getattr`` covers it.
-    """
-    g = (raw.get if isinstance(raw, dict) else lambda k, d=None: getattr(raw, k, d))
-    for op in MAINTENANCE_OPS:
-        iv = g(f"{op}_interval_seconds", 0) or 0
+def validate_maintenance_config(raw: dict) -> None:
+    """Validate maintenance intervals + param strings on a view dict."""
+    for op in _MAINTENANCE_OPS:
+        iv = raw.get(f"{op}_interval_seconds", 0) or 0
         if iv < 0:
-            raise ValueError(
-                f"{op}_interval_seconds must be >= 0 (got {iv!r}); "
-                f"use 0 to disable the op"
-            )
-    for field_name in ("expire_snapshots_retention", "remove_orphan_files_retention"):
-        v = g(field_name, None)
+            raise ValueError(f"{op}_interval_seconds must be >= 0 (got {iv!r}); use 0 to disable")
+    for f in ("expire_snapshots_retention", "remove_orphan_files_retention"):
+        v = raw.get(f)
         if v and not _DURATION_RE.match(str(v)):
-            raise ValueError(
-                f"{field_name}: {v!r} is not a valid Trino duration; "
-                f"expected e.g. '7d', '24h', '60m', '30s'"
-            )
-    thr = g("optimize_file_size_threshold", None)
+            raise ValueError(f"{f}: {v!r} is not a valid Trino duration (e.g. '7d', '24h')")
+    thr = raw.get("optimize_file_size_threshold")
     if thr and not _DATASIZE_RE.match(str(thr)):
         raise ValueError(
-            f"optimize_file_size_threshold: {thr!r} is not a valid data size; "
-            f"expected e.g. '128MB', '1GB'"
+            f"optimize_file_size_threshold: {thr!r} is not a valid data size (e.g. '128MB')"
         )
 
 
 def _parse_view(raw: dict) -> ViewConfig:
-    missing = {"name", "query"} - raw.keys()
+    missing = {"name", "query", "target_table"} - raw.keys()
     if missing:
         raise ValueError(f"view missing required fields: {sorted(missing)}")
 
     validate_identifier(raw["name"], "name")
-    if raw.get("target_table"):
-        validate_qualified_name(raw["target_table"], "target_table")
+    validate_qualified_name(raw["target_table"], "target_table")
 
     # Full query validation — source_table, filter_column, granularity,
     # merge_keys are all derived here at load time.  Raises on any violation.
@@ -204,7 +176,7 @@ def _parse_view(raw: dict) -> ViewConfig:
     return ViewConfig(
         name=raw["name"],
         query=raw["query"],
-        target_table=raw.get("target_table"),
+        target_table=raw["target_table"],
         target_partitioning=raw.get("target_partitioning"),
         refresh_interval_seconds=raw.get("refresh_interval_seconds", 60),
         full_refresh_chunk=chunk,
@@ -292,37 +264,21 @@ def load_views(path: str | Path) -> list[ViewConfig]:
     return views
 
 
+_ALWAYS_EMIT = ("name", "query", "target_table", "refresh_interval_seconds")
+
+
 def save_views(views: list[ViewConfig], path: str | Path) -> None:
-    """Save views list to a YAML file."""
+    """Save views to YAML, omitting fields equal to their ViewConfig defaults."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    data: dict = {"views": []}
+    defaults = {f.name: f.default for f in fields(ViewConfig)}
+    out = []
     for v in views:
-        vd: dict = {
-            "name": v.name,
-            "query": v.query,
-            "refresh_interval_seconds": v.refresh_interval_seconds,
-        }
-        if v.target_table:
-            vd["target_table"] = v.target_table
-        if v.target_partitioning:
-            vd["target_partitioning"] = v.target_partitioning
-        if v.full_refresh_chunk:
-            vd["full_refresh_chunk"] = v.full_refresh_chunk
-        # Only emit maintenance fields that differ from the defaults, so the
-        # common "no maintenance configured" view stays a one-liner in YAML.
-        if v.optimize_interval_seconds:
-            vd["optimize_interval_seconds"] = v.optimize_interval_seconds
-        if v.optimize_file_size_threshold:
-            vd["optimize_file_size_threshold"] = v.optimize_file_size_threshold
-        if v.expire_snapshots_interval_seconds:
-            vd["expire_snapshots_interval_seconds"] = v.expire_snapshots_interval_seconds
-            if v.expire_snapshots_retention != "7d":
-                vd["expire_snapshots_retention"] = v.expire_snapshots_retention
-        if v.remove_orphan_files_interval_seconds:
-            vd["remove_orphan_files_interval_seconds"] = v.remove_orphan_files_interval_seconds
-            if v.remove_orphan_files_retention != "7d":
-                vd["remove_orphan_files_retention"] = v.remove_orphan_files_retention
-        data["views"].append(vd)
-    p.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
+        vd = {}
+        for f in fields(ViewConfig):
+            val = getattr(v, f.name)
+            if f.name in _ALWAYS_EMIT or (val and val != defaults[f.name]):
+                vd[f.name] = val
+        out.append(vd)
+    p.write_text(yaml.dump({"views": out}, default_flow_style=False, sort_keys=False))
     log.info("saved %d view(s) to %s", len(views), p)

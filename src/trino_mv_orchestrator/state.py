@@ -20,9 +20,7 @@ async def read_last_snapshot(cursor, target_table: str) -> int | None:
         f"WHERE key = '{SNAPSHOT_KEY}'"
     )
     row = await cursor.fetchone()
-    snapshot_id = int(row[0]) if row else None
-    log.debug("read last_snapshot=%s from %s", snapshot_id, target_table)
-    return snapshot_id
+    return int(row[0]) if row else None
 
 
 async def write_last_snapshot(cursor, target_table: str, snapshot_id: int) -> None:

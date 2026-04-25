@@ -11,7 +11,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
-from typing import Iterator
+from typing import Callable, Iterator
 
 log = logging.getLogger(__name__)
 
@@ -23,54 +23,15 @@ class RefreshAction(Enum):
 
 
 class ExpiredSnapshotError(Exception):
-    """Raised when last_source_snapshot is no longer present in $snapshots.
-
-    Iceberg snapshot expiration removed it. This orchestrator assumes the
-    last processed snapshot is always retained; if it isn't, we fail loudly
-    rather than silently skip ahead.
-    """
-    def __init__(self, source_table: str, snapshot_id: int):
-        super().__init__(
-            f"{source_table}: last_source_snapshot={snapshot_id} is not in "
-            f"$snapshots (expired?). Cannot compute the set of new snapshots."
-        )
-        self.source_table = source_table
-        self.snapshot_id = snapshot_id
+    """last_source_snapshot no longer present in $snapshots (Iceberg expired it)."""
 
 
 class MissingFilterColumnError(Exception):
-    """Raised when $all_entries has rows but none expose filter_column.
-
-    The file-level min/max bounds are needed to compute the incremental
-    range; if they're absent, we can't safely MERGE. Usually indicates a
-    typo in the view's `filter_column`, or a schema drift where the
-    column was added after some files were written.
-    """
-    def __init__(self, source_table: str, filter_column: str):
-        super().__init__(
-            f"{source_table}: filter_column {filter_column!r} not found in "
-            f"any file's readable_metrics. Check the view config."
-        )
-        self.source_table = source_table
-        self.filter_column = filter_column
+    """$all_entries has rows but none expose filter_column — config error."""
 
 
 class UnexpectedOperationError(Exception):
-    """Raised when a source snapshot uses an operation we don't allow.
-
-    The orchestrator assumes source tables are append-only. The only
-    legitimate Iceberg snapshot operations are ``append`` (new data) and
-    ``replace`` (compaction — files rewritten, no data change). Anything
-    else (``overwrite``, ``delete``, or a future unknown name) violates
-    the assumption and must fail loudly.
-    """
-    def __init__(self, source_table: str, operations: list[str]):
-        super().__init__(
-            f"{source_table}: unexpected snapshot operations {operations} "
-            f"— source table must be append-only (compaction allowed)."
-        )
-        self.source_table = source_table
-        self.operations = operations
+    """Source snapshot used a non-append/replace operation — append-only assumption violated."""
 
 
 @dataclass
@@ -102,46 +63,31 @@ async def get_current_snapshot(cursor, source_table: str) -> int | None:
 
 
 async def get_snapshots_since(cursor, source_table: str, last_snap: int) -> list[dict]:
-    """Get snapshot_id and operation for all snapshots strictly after last_snap.
+    """Return snapshots strictly after last_snap, ordered by (committed_at, snapshot_id).
 
-    Snapshot IDs are random longs in Iceberg — not sequential. We:
-
-    1. Look up the committed_at of last_snap. If it's missing, Iceberg has
-       expired it and we raise ExpiredSnapshotError rather than silently
-       returning an empty list (the old behavior caused permanent view
-       staleness).
-    2. Return everything with a strictly greater (committed_at, snapshot_id)
-       ordering. The snapshot_id tiebreak matters because committed_at is
-       millisecond-precision and sibling snapshots can share a timestamp —
-       a plain `committed_at > X` would drop them.
+    The snapshot_id tiebreak matters: committed_at is millisecond-precision, so
+    sibling snapshots can share a timestamp. Raises ExpiredSnapshotError if
+    last_snap itself has been expired from $snapshots.
     """
-    snaps_table = system_table(source_table, "snapshots")
-
-    await cursor.execute(
-        f"SELECT committed_at FROM {snaps_table} WHERE snapshot_id = {last_snap}"
-    )
+    snaps = system_table(source_table, "snapshots")
+    await cursor.execute(f"SELECT committed_at FROM {snaps} WHERE snapshot_id = {last_snap}")
     row = await cursor.fetchone()
     if row is None:
-        raise ExpiredSnapshotError(source_table, last_snap)
-
+        raise ExpiredSnapshotError(
+            f"{source_table}: last_source_snapshot={last_snap} is not in $snapshots "
+            f"(expired?). Cannot compute the set of new snapshots."
+        )
+    committed_at = row[0]
     await cursor.execute(
-        f"SELECT snapshot_id, operation FROM {snaps_table} "
-        f"WHERE committed_at > ("
-        f"    SELECT committed_at FROM {snaps_table} WHERE snapshot_id = {last_snap}"
-        f"  ) "
-        f"   OR ("
-        f"    committed_at = ("
-        f"      SELECT committed_at FROM {snaps_table} WHERE snapshot_id = {last_snap}"
-        f"    ) AND snapshot_id > {last_snap}"
-        f"  ) "
+        f"SELECT snapshot_id, operation FROM {snaps} "
+        f"WHERE committed_at > TIMESTAMP '{committed_at}' "
+        f"   OR (committed_at = TIMESTAMP '{committed_at}' AND snapshot_id > {last_snap}) "
         f"ORDER BY committed_at, snapshot_id"
     )
     return [{"snapshot_id": r[0], "operation": r[1]} for r in await cursor.fetchall()]
 
 
-APPEND_OP = "append"
-COMPACTION_OP = "replace"
-ALLOWED_OPS = frozenset({APPEND_OP, COMPACTION_OP})
+ALLOWED_OPS = frozenset({"append", "replace"})
 
 
 async def get_new_files_column_range(
@@ -150,48 +96,23 @@ async def get_new_files_column_range(
     """Read min/max of filter_column across files added in given snapshots.
 
     Uses $all_entries.readable_metrics — metadata-only, no data scan.
-    Bounds are parsed through _parse_ts and compared as datetimes, so
-    chronological order is correct regardless of the lexicographic form
-    of the bound strings. Returns (min_dt, max_dt) or None if no data
-    files were found at all.
+    Returns (min_dt, max_dt) or None if no data files were found.
     """
     snap_list = ", ".join(str(s) for s in snapshot_ids)
     await cursor.execute(
         f"SELECT readable_metrics "
         f"FROM {system_table(source_table, 'all_entries')} "
-        f"WHERE snapshot_id IN ({snap_list}) "
-        f"AND status = 1"  # ADDED data files
+        f"WHERE snapshot_id IN ({snap_list}) AND status = 1"  # ADDED data files
     )
-
-    lows: list[datetime] = []
-    highs: list[datetime] = []
-
     rows = await cursor.fetchall()
     if not rows:
-        # No added data files at all — legitimate empty-append case.
         return None
-
-    saw_filter_column = False
-    for (metrics_raw,) in rows:
-        if metrics_raw is None:
-            continue
-        metrics = metrics_raw if isinstance(metrics_raw, dict) else json.loads(metrics_raw)
-        col_metrics = metrics.get(filter_column)
-        if col_metrics is None:
-            continue
-        saw_filter_column = True
-        lb = col_metrics.get("lower_bound")
-        ub = col_metrics.get("upper_bound")
-        if lb is not None:
-            lows.append(_parse_ts(str(lb)))
-        if ub is not None:
-            highs.append(_parse_ts(str(ub)))
-
-    if not saw_filter_column:
-        # Rows exist but filter_column is absent from every file's
-        # metrics — configuration error, fail loudly rather than freeze.
-        raise MissingFilterColumnError(source_table, filter_column)
-
+    lows, highs, saw = _iter_column_bounds(rows, filter_column)
+    if not saw:
+        raise MissingFilterColumnError(
+            f"{source_table}: filter_column {filter_column!r} not found in any "
+            f"file's readable_metrics. Check the view config."
+        )
     if not lows or not highs:
         return None
     return (min(lows), max(highs))
@@ -219,9 +140,9 @@ def _iter_column_bounds(
         lb = col.get("lower_bound")
         ub = col.get("upper_bound")
         if lb is not None:
-            lows.append(_parse_ts(str(lb)))
+            lows.append(datetime.fromisoformat(str(lb)))
         if ub is not None:
-            highs.append(_parse_ts(str(ub)))
+            highs.append(datetime.fromisoformat(str(ub)))
     return lows, highs, saw
 
 
@@ -244,7 +165,10 @@ async def get_source_column_range(
         return None
     lows, highs, saw = _iter_column_bounds(rows, filter_column)
     if not saw:
-        raise MissingFilterColumnError(source_table, filter_column)
+        raise MissingFilterColumnError(
+            f"{source_table}: filter_column {filter_column!r} not found in any "
+            f"file's readable_metrics. Check the view config."
+        )
     if not lows or not highs:
         return None
     return (min(lows), max(highs))
@@ -271,19 +195,6 @@ async def get_target_bucket_max(
     return max(highs) if highs else None
 
 
-def _parse_ts(value: str) -> datetime:
-    """Parse an Iceberg readable_metrics timestamp to a datetime.
-
-    Sub-microsecond precision is silently truncated to microseconds —
-    ``expand_to_bucket_bounds`` floors to minute or coarser, so it
-    cannot affect which bucket a row belongs to.
-    """
-    try:
-        return datetime.fromisoformat(value)
-    except ValueError as e:
-        raise ValueError(f"unparseable timestamp: {value!r}") from e
-
-
 def midnight(dt: datetime) -> datetime:
     return dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -294,43 +205,45 @@ def _add_months(dt: datetime, n: int) -> datetime:
     return dt.replace(year=idx // 12, month=(idx % 12) + 1)
 
 
-_FIXED_STEP = {
-    "minute": timedelta(minutes=1),
-    "hour": timedelta(hours=1),
-    "day": timedelta(days=1),
-    "week": timedelta(weeks=1),
+def _q_start(dt: datetime) -> datetime:
+    return midnight(dt).replace(month=((dt.month - 1) // 3) * 3 + 1, day=1)
+
+
+# Per-granularity bucket math: (floor_to_bucket_start, next_bucket_after).
+# ``expand_to_bucket_bounds`` applies ``floor`` to min_ts and ``next_bucket`` to max_ts.
+# ``walk_buckets`` iterates by repeatedly applying ``next_bucket``.
+_BUCKETS: dict[str, tuple[Callable[[datetime], datetime], Callable[[datetime], datetime]]] = {
+    "minute":  (lambda d: d.replace(second=0, microsecond=0),
+                lambda d: d.replace(second=0, microsecond=0) + timedelta(minutes=1)),
+    "hour":    (lambda d: d.replace(minute=0, second=0, microsecond=0),
+                lambda d: d.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)),
+    "day":     (midnight, lambda d: midnight(d) + timedelta(days=1)),
+    "week":    (lambda d: midnight(d - timedelta(days=d.weekday())),
+                lambda d: midnight(d - timedelta(days=d.weekday())) + timedelta(weeks=1)),
+    "month":   (lambda d: midnight(d).replace(day=1),
+                lambda d: _add_months(midnight(d).replace(day=1), 1)),
+    "quarter": (_q_start, lambda d: _add_months(_q_start(d), 3)),
+    "year":    (lambda d: midnight(d).replace(month=1, day=1),
+                lambda d: midnight(d).replace(year=d.year + 1, month=1, day=1)),
 }
 
 
 def walk_buckets(
     start: datetime, end: datetime, granularity: str,
 ) -> Iterator[tuple[datetime, datetime]]:
-    """Yield half-open ``[chunk_start, chunk_end)`` intervals stepping one
-    ``granularity`` bucket at a time from ``start`` (inclusive) to ``end``
-    (exclusive).
+    """Yield half-open ``[chunk_start, chunk_end)`` intervals, one bucket at a time.
 
-    ``start`` and ``end`` are expected to already be aligned to
-    ``granularity`` boundaries (the caller snaps them via
-    ``expand_to_bucket_bounds``). If ``start >= end``, yields nothing.
+    ``start``/``end`` must already be bucket-aligned (caller snaps them via
+    ``expand_to_bucket_bounds``). Yields nothing if ``start >= end``.
     """
-    if start >= end:
-        return
-    if granularity in _FIXED_STEP:
-        step = _FIXED_STEP[granularity]
-        cur = start
-        while cur < end:
-            nxt = cur + step
-            yield (cur, min(nxt, end))
-            cur = nxt
-        return
-    months = {"month": 1, "quarter": 3, "year": 12}.get(granularity)
-    if months is None:
+    if granularity not in _BUCKETS:
         raise ValueError(f"unsupported granularity: {granularity}")
+    _, nxt = _BUCKETS[granularity]
     cur = start
     while cur < end:
-        nxt = _add_months(cur, months)
-        yield (cur, min(nxt, end))
-        cur = nxt
+        step_end = nxt(cur)
+        yield (cur, min(step_end, end))
+        cur = step_end
 
 
 def expand_to_bucket_bounds(
@@ -338,49 +251,27 @@ def expand_to_bucket_bounds(
 ) -> tuple[datetime, datetime]:
     """Expand a timestamp range outward to full GROUP BY bucket boundaries.
 
-    This is the **inverse** of Trino's ``date_trunc(granularity, ts)`` over a
-    range.  Where ``date_trunc`` maps many timestamps to a single bucket
-    start (forward, many-to-one), this function maps a ``(min_ts, max_ts)``
-    range to the smallest bucket-aligned interval that contains every
-    source row belonging to any touched bucket.
+    This is the **load-bearing correctness invariant** of the orchestrator:
+    ``expand_to_bucket_bounds`` is the Python inverse of Trino's
+    ``date_trunc(granularity, col)``. The detector reads per-file min/max
+    timestamps from ``$all_entries.readable_metrics`` and snaps that raw
+    range outward so the resulting ``[start, end)`` filter covers *every*
+    GROUP BY bucket that any newly-added row could fall into. Without the
+    snap, a late row arriving in the middle of a bucket would cause that
+    bucket's aggregate to be recomputed from a partial input — silent data
+    corruption.
+
+    We do this in Python rather than letting Trino do it because the
+    snapped range is then injected as a literal ``WHERE col >= TIMESTAMP
+    '...' AND col < TIMESTAMP '...'`` predicate. Iceberg partition pruning
+    requires literal bounds; a ``date_trunc`` expression on the right-hand
+    side would defeat pruning and force a full source scan.
 
     Returns ``(start, end)`` with ``start`` on a bucket boundary ≤ ``min_ts``
-    and ``end`` on the next bucket boundary > ``max_ts`` (half-open interval,
-    so the emitted WHERE predicate is ``col >= start AND col < end``).
-
-    Trino has no built-in inverse of ``date_trunc``; we do it in Python
-    once when the detector reads file stats, then emit concrete TIMESTAMP
-    literals into the MERGE so Trino's planner can partition-prune
-    without needing to constant-fold a ``date_trunc`` expression.
+    and ``end`` on the next bucket boundary > ``max_ts``.
     """
-    if granularity == "minute":
-        start = min_ts.replace(second=0, microsecond=0)
-        end = max_ts.replace(second=0, microsecond=0) + timedelta(minutes=1)
-    elif granularity == "hour":
-        start = min_ts.replace(minute=0, second=0, microsecond=0)
-        end = max_ts.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    elif granularity == "day":
-        start = midnight(min_ts)
-        end = midnight(max_ts) + timedelta(days=1)
-    elif granularity == "week":
-        # ISO week: Monday = 0
-        start = midnight(min_ts - timedelta(days=min_ts.weekday()))
-        end = midnight(max_ts - timedelta(days=max_ts.weekday())) + timedelta(weeks=1)
-    elif granularity == "month":
-        start = midnight(min_ts).replace(day=1)
-        end = _add_months(midnight(max_ts).replace(day=1), 1)
-    elif granularity == "quarter":
-        q_start = ((min_ts.month - 1) // 3) * 3 + 1
-        start = midnight(min_ts).replace(month=q_start, day=1)
-        q_start_max = ((max_ts.month - 1) // 3) * 3 + 1
-        end = _add_months(midnight(max_ts).replace(month=q_start_max, day=1), 3)
-    elif granularity == "year":
-        start = midnight(min_ts).replace(month=1, day=1)
-        end = midnight(max_ts).replace(year=max_ts.year + 1, month=1, day=1)
-    else:
-        raise ValueError(f"unsupported granularity: {granularity}")
-
-    return start, end
+    floor, nxt = _BUCKETS[granularity]
+    return floor(min_ts), nxt(max_ts)
 
 
 async def detect_changes(
@@ -426,9 +317,12 @@ async def detect_changes(
     #   anything else → fail loudly, assumption violated
     unknown = [op for op in ops if op not in ALLOWED_OPS]
     if unknown:
-        raise UnexpectedOperationError(source_table, unknown)
+        raise UnexpectedOperationError(
+            f"{source_table}: unexpected snapshot operations {unknown} — "
+            f"source table must be append-only (compaction allowed)."
+        )
 
-    append_snaps = [s for s in snapshots if s["operation"] == APPEND_OP]
+    append_snaps = [s for s in snapshots if s["operation"] == "append"]
     if not append_snaps:
         # Only compactions since last_snap; advance state, don't refresh.
         log.info(

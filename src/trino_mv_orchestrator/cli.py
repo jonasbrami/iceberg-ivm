@@ -44,11 +44,8 @@ def main() -> None:
     set_config_path(config_path)
     set_views_path(Path(args.views))
 
-    # Pre-load config to get the port, then let lifespan do the real init
+    # Pre-load config to get the port; lifespan does the real init.
     cfg = load_config(config_path)
-    log = logging.getLogger(__name__)
-    log.info("starting trino-mv-orchestrator on port %d", cfg.server.port)
-
     uvicorn.run(app, host="0.0.0.0", port=cfg.server.port, log_level="info")
 
 

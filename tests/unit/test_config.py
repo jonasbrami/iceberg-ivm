@@ -53,6 +53,7 @@ views:
              sum(qty) AS volume
       FROM iceberg.market_data.trades
       GROUP BY 1, 2
+    target_table: iceberg.analytics.ohlcv_1m
     refresh_interval_seconds: 30
 """
 
@@ -144,6 +145,7 @@ def test_view_defaults(tmp_path):
         "views:\n"
         "  - name: v\n"
         "    query: \"SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1\"\n"
+        "    target_table: iceberg.analytics.v\n"
     )
     views = load_views(write_views(tmp_path, minimal))
     assert views[0].refresh_interval_seconds == 60
@@ -181,6 +183,7 @@ def test_legacy_range_filter_placeholder_rejected(tmp_path):
     legacy = (
         "views:\n  - name: v\n"
         "    query: \"SELECT date_trunc('day', ts) AS d FROM t WHERE {range_filter} GROUP BY 1\"\n"
+        "    target_table: iceberg.analytics.v\n"
     )
     with pytest.raises(ValueError, match="range_filter"):
         load_views(write_views(tmp_path, legacy))
@@ -191,8 +194,10 @@ def test_duplicate_view_names_rejected(tmp_path):
         "views:\n"
         "  - name: v\n"
         "    query: \"SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1\"\n"
+        "    target_table: iceberg.analytics.v\n"
         "  - name: v\n"
         "    query: \"SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1\"\n"
+        "    target_table: iceberg.analytics.v2\n"
     )
     with pytest.raises(ValueError, match="duplicate"):
         load_views(write_views(tmp_path, views_yaml))
@@ -204,6 +209,7 @@ def test_save_views_and_reload(tmp_path):
     views = [ViewConfig(
         name="ohlcv_1m",
         query="SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1",
+        target_table="iceberg.analytics.ohlcv_1m",
         refresh_interval_seconds=30,
     )]
     views_path = tmp_path / "views.yaml"
@@ -230,6 +236,7 @@ def _views_yaml_with_chunk(view_granularity: str, chunk: str | None) -> str:
         "views:",
         "  - name: v",
         f"    query: \"SELECT date_trunc('{view_granularity}', ts) AS d FROM t GROUP BY 1\"",
+        "    target_table: iceberg.analytics.v",
     ]
     if chunk is not None:
         lines.append(f"    full_refresh_chunk: {chunk}")
@@ -291,6 +298,7 @@ def test_full_refresh_chunk_round_trip(tmp_path):
     views = [ViewConfig(
         name="v",
         query="SELECT date_trunc('minute', ts) AS d FROM t GROUP BY 1",
+        target_table="iceberg.analytics.v",
         full_refresh_chunk="day",
     )]
     views_path = tmp_path / "views.yaml"
@@ -305,6 +313,7 @@ def test_save_views_omits_full_refresh_chunk_when_none(tmp_path):
     views = [ViewConfig(
         name="v",
         query="SELECT date_trunc('minute', ts) AS d FROM t GROUP BY 1",
+        target_table="iceberg.analytics.v",
     )]
     views_path = tmp_path / "views.yaml"
     save_views(views, views_path)
@@ -320,6 +329,7 @@ def test_full_refresh_chunk_rejects_view_without_direct_bucket_projection(tmp_pa
     wrapped = (
         "views:\n  - name: v\n"
         "    query: \"SELECT from_iso8601_date(CAST(date_trunc('day', ts) AS varchar)) AS d FROM t GROUP BY 1\"\n"
+        "    target_table: iceberg.analytics.v\n"
         "    full_refresh_chunk: day\n"
     )
     with pytest.raises(ValueError, match="direct projection"):
@@ -332,6 +342,7 @@ def test_wrapped_date_trunc_accepted_without_chunk(tmp_path):
     wrapped = (
         "views:\n  - name: v\n"
         "    query: \"SELECT from_iso8601_date(CAST(date_trunc('day', ts) AS varchar)) AS d FROM t GROUP BY 1\"\n"
+        "    target_table: iceberg.analytics.v\n"
     )
     views = load_views(write_views(tmp_path, wrapped))
     assert views[0].full_refresh_chunk is None
@@ -344,6 +355,7 @@ _MAINTENANCE_YAML = """\
 views:
   - name: v
     query: "SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1"
+    target_table: iceberg.analytics.v
     optimize_interval_seconds: 3600
     optimize_file_size_threshold: 128MB
     expire_snapshots_interval_seconds: 86400
@@ -359,6 +371,7 @@ def test_maintenance_defaults_to_disabled(tmp_path):
         "views:\n"
         "  - name: v\n"
         "    query: \"SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1\"\n"
+        "    target_table: iceberg.analytics.v\n"
     )
     v = load_views(write_views(tmp_path, minimal))[0]
     assert v.optimize_interval_seconds == 0
@@ -383,6 +396,7 @@ def test_maintenance_round_trip(tmp_path):
     views = [ViewConfig(
         name="v",
         query="SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1",
+        target_table="iceberg.analytics.v",
         optimize_interval_seconds=3600,
         optimize_file_size_threshold="128MB",
         expire_snapshots_interval_seconds=86400,
@@ -403,6 +417,7 @@ def test_save_views_omits_maintenance_defaults(tmp_path):
     views = [ViewConfig(
         name="v",
         query="SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1",
+        target_table="iceberg.analytics.v",
     )]
     p = tmp_path / "views.yaml"
     save_views(views, p)

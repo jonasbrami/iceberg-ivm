@@ -8,6 +8,8 @@ import time
 import aiotrino
 import pytest_asyncio
 
+from ._driver import make_app_state
+
 
 TRINO_HOST = os.environ.get("TRINO_HOST", "localhost")
 TRINO_PORT = int(os.environ.get("TRINO_PORT", "18080"))
@@ -68,6 +70,14 @@ async def trino_conn():
         await conn.close()
 
 
+@pytest_asyncio.fixture
+async def app_state():
+    """Minimal AppState wired to the docker-compose Trino, for tests
+    that drive the daemon's top-level ``refresh_view`` loop."""
+    await wait_for_trino(TRINO_HOST, TRINO_PORT)
+    yield make_app_state(TRINO_HOST, TRINO_PORT)
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def clean_tables(trino_conn):
     """Drop test tables before and after each test."""
@@ -77,6 +87,7 @@ async def clean_tables(trino_conn):
         "iceberg.test_schema.ohlcv_1m",
         "iceberg.test_schema.ohlcv_weekly",
         "iceberg.test_schema.ohlcv_monthly",
+        "iceberg.test_schema.streaming_ohlcv",
     ]
     for t in tables:
         try:
