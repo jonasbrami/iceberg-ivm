@@ -33,6 +33,7 @@ VIEWS_YAML = textwrap.dedent("""\
           SELECT date_trunc('day', ts) AS d, a
           FROM iceberg.db.trades
           GROUP BY 1, 2
+        target_table: iceberg.analytics.test_view
 """)
 
 
@@ -152,6 +153,7 @@ def test_list_views(client):
 def test_create_view(client, setup_state):
     r = client.post("/api/views", json={
         "name": "new_view",
+        "target_table": "iceberg.analytics.new_view",
         "query": (
             "SELECT date_trunc('day', ts) AS d FROM iceberg.db.t GROUP BY 1"
         ),
@@ -168,6 +170,7 @@ def test_create_view_invalid_name(client):
     """SQL injection via view name should be rejected."""
     r = client.post("/api/views", json={
         "name": "bad-name",
+        "target_table": "iceberg.analytics.bad-name",
         "query": "SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1",
     })
     assert r.status_code == 422
@@ -176,6 +179,7 @@ def test_create_view_invalid_name(client):
 def test_create_duplicate(client):
     r = client.post("/api/views", json={
         "name": "test_view",
+        "target_table": "iceberg.analytics.test_view",
         "query": "SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1",
     })
     assert r.status_code == 409
@@ -203,6 +207,7 @@ def test_update_view_accepts_mutable_field_change(client, setup_state):
     """refresh_interval_seconds is mutable — PUT with the same query must succeed."""
     r = client.put("/api/views/test_view", json={
         "name": "test_view",
+        "target_table": "iceberg.analytics.test_view",
         "query": _EXISTING_QUERY,
         "refresh_interval_seconds": 300,
     })
@@ -216,6 +221,7 @@ def test_update_view_rejects_query_change(client, setup_state):
     """Changing the query would silently orphan materialized rows — must 422."""
     r = client.put("/api/views/test_view", json={
         "name": "test_view",
+        "target_table": "iceberg.analytics.test_view",
         "query": "SELECT date_trunc('hour', ts) AS d FROM iceberg.db.trades GROUP BY 1",
     })
     assert r.status_code == 422
@@ -228,6 +234,7 @@ def test_update_view_rejects_query_change(client, setup_state):
 def test_update_view_rejects_name_change(client):
     r = client.put("/api/views/test_view", json={
         "name": "renamed",
+        "target_table": "iceberg.analytics.renamed",
         "query": _EXISTING_QUERY,
     })
     assert r.status_code == 422
@@ -237,6 +244,7 @@ def test_update_view_rejects_name_change(client):
 def test_update_view_not_found(client):
     r = client.put("/api/views/nope", json={
         "name": "nope",
+        "target_table": "iceberg.analytics.nope",
         "query": _EXISTING_QUERY,
     })
     assert r.status_code == 404
@@ -246,6 +254,7 @@ def test_update_view_whitespace_only_query_diff_is_accepted(client):
     """A trailing-newline difference is not a semantic query change."""
     r = client.put("/api/views/test_view", json={
         "name": "test_view",
+        "target_table": "iceberg.analytics.test_view",
         "query": _EXISTING_QUERY.strip(),
         "refresh_interval_seconds": 90,
     })
@@ -272,6 +281,7 @@ def test_create_view_accepts_full_refresh_chunk(client, setup_state):
     """POST must accept full_refresh_chunk, persist it, and echo it back."""
     r = client.post("/api/views", json={
         "name": "chunked_view",
+        "target_table": "iceberg.analytics.chunked_view",
         "query": _FULL_REFRESH_QUERY,
         "full_refresh_chunk": "day",
     })
@@ -290,6 +300,7 @@ def test_create_view_accepts_week_chunk_on_week_view(client, setup_state):
     compatibility matrix: week divides nothing but itself)."""
     r = client.post("/api/views", json={
         "name": "weekly",
+        "target_table": "iceberg.analytics.weekly",
         "query": (
             "SELECT date_trunc('week', ts) AS w, a "
             "FROM iceberg.db.t GROUP BY 1, 2"
@@ -304,6 +315,7 @@ def test_create_view_rejects_incompatible_chunk(client):
     cleanly contain months). The API must reject with 422, not silently accept."""
     r = client.post("/api/views", json={
         "name": "bad_chunk",
+        "target_table": "iceberg.analytics.bad_chunk",
         "query": (
             "SELECT date_trunc('month', ts) AS m, a "
             "FROM iceberg.db.t GROUP BY 1, 2"
@@ -319,6 +331,7 @@ def test_create_view_rejects_unknown_granularity(client):
     downstream where walk_buckets assumes a valid granularity."""
     r = client.post("/api/views", json={
         "name": "bad_granularity",
+        "target_table": "iceberg.analytics.bad_granularity",
         "query": _FULL_REFRESH_QUERY,
         "full_refresh_chunk": "fortnight",
     })
@@ -332,6 +345,7 @@ def test_create_view_empty_string_chunk_treated_as_none(client, setup_state):
     ``if view.full_refresh_chunk:`` check would disagree)."""
     r = client.post("/api/views", json={
         "name": "single_shot",
+        "target_table": "iceberg.analytics.single_shot",
         "query": _FULL_REFRESH_QUERY,
         "full_refresh_chunk": "",
     })
@@ -345,6 +359,7 @@ def test_create_view_omits_chunk_defaults_to_none(client, setup_state):
     accepted and behaves like a single-shot refresh."""
     r = client.post("/api/views", json={
         "name": "no_chunk",
+        "target_table": "iceberg.analytics.no_chunk",
         "query": _FULL_REFRESH_QUERY,
     })
     assert r.status_code == 201
@@ -358,6 +373,7 @@ def test_create_view_omits_chunk_defaults_to_none(client, setup_state):
 def test_create_view_accepts_maintenance_fields(client, setup_state):
     r = client.post("/api/views", json={
         "name": "maintained",
+        "target_table": "iceberg.analytics.maintained",
         "query": _FULL_REFRESH_QUERY,
         "optimize_interval_seconds": 3600,
         "optimize_file_size_threshold": "128MB",
@@ -379,6 +395,7 @@ def test_create_view_accepts_maintenance_fields(client, setup_state):
 def test_create_view_rejects_bad_retention(client):
     r = client.post("/api/views", json={
         "name": "bad_ret",
+        "target_table": "iceberg.analytics.bad_ret",
         "query": _FULL_REFRESH_QUERY,
         "expire_snapshots_interval_seconds": 3600,
         "expire_snapshots_retention": "forever",
@@ -390,6 +407,7 @@ def test_create_view_rejects_bad_retention(client):
 def test_create_view_rejects_negative_interval(client):
     r = client.post("/api/views", json={
         "name": "bad_iv",
+        "target_table": "iceberg.analytics.bad_iv",
         "query": _FULL_REFRESH_QUERY,
         "optimize_interval_seconds": -10,
     })
@@ -400,6 +418,7 @@ def test_update_view_applies_maintenance_change(client, setup_state):
     """Maintenance fields are mutable via PUT."""
     r = client.put("/api/views/test_view", json={
         "name": "test_view",
+        "target_table": "iceberg.analytics.test_view",
         "query": _EXISTING_QUERY,
         "optimize_interval_seconds": 7200,
     })
@@ -412,6 +431,7 @@ def test_create_view_empty_file_size_threshold_treated_as_none(client, setup_sta
     """Empty string from the UI input must round-trip as None in ViewConfig."""
     r = client.post("/api/views", json={
         "name": "no_thr",
+        "target_table": "iceberg.analytics.no_thr",
         "query": _FULL_REFRESH_QUERY,
         "optimize_file_size_threshold": "",
     })
@@ -432,6 +452,7 @@ async def test_refresh_view_runs_maintenance(setup_state):
     v = ViewConfig(
         name="test_view",
         query=_EXISTING_QUERY,
+        target_table="iceberg.analytics.test_view",
         optimize_interval_seconds=1,
         expire_snapshots_interval_seconds=1,
         expire_snapshots_retention="7d",
@@ -503,6 +524,7 @@ async def test_maintain_view_respects_interval(setup_state):
     v = ViewConfig(
         name="test_view",
         query=_EXISTING_QUERY,
+        target_table="iceberg.analytics.test_view",
         optimize_interval_seconds=3600,  # 1h
     )
     vs = ViewStatus(name="test_view")
@@ -532,6 +554,7 @@ async def test_maintain_view_persists_last_run_to_history(setup_state, tmp_path)
     v = ViewConfig(
         name="test_view",
         query=_EXISTING_QUERY,
+        target_table="iceberg.analytics.test_view",
         optimize_interval_seconds=60,
     )
     setup_state.view_statuses["test_view"] = ViewStatus(name="test_view")
@@ -760,6 +783,7 @@ def test_reload_config_on_mtime_change(setup_state, tmp_path):
         "  - name: second_view\n"
         "    query: |\n"
         "      SELECT date_trunc('hour', ts) AS h FROM iceberg.db.other GROUP BY 1\n"
+        "    target_table: iceberg.analytics.second_view\n"
     )
     setup_state.views_path.write_text(new_views_yaml)
 
@@ -1073,6 +1097,7 @@ def test_new_metrics_defined():
 def test_create_view_fails_when_no_date_trunc(client, setup_state):
     r = client.post("/api/views", json={
         "name": "fail_view",
+        "target_table": "iceberg.analytics.fail_view",
         "query": "SELECT ts FROM t GROUP BY 1",
     })
     assert r.status_code == 422
@@ -1082,6 +1107,7 @@ def test_create_view_fails_when_no_date_trunc(client, setup_state):
 def test_create_view_fails_on_arithmetic(client, setup_state):
     r = client.post("/api/views", json={
         "name": "arith_view",
+        "target_table": "iceberg.analytics.arith_view",
         "query": (
             "SELECT date_trunc('minute', ts) - INTERVAL '5' MINUTE AS x "
             "FROM t GROUP BY 1"
@@ -1132,6 +1158,7 @@ def test_create_view_rejects_legacy_range_filter(client, setup_state):
         "query": (
             "SELECT date_trunc('day', ts) AS d FROM t WHERE {range_filter} GROUP BY 1"
         ),
+        "target_table": "iceberg.analytics.legacy_view",
     })
     assert r.status_code == 422
     assert "range_filter" in r.json()["detail"]

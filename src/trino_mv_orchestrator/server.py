@@ -187,10 +187,6 @@ def get_trino_connection(s: AppState) -> aiotrino.dbapi.Connection:
     return aiotrino.dbapi.connect(**kwargs)
 
 
-def resolve_target_table(view: ViewConfig, cfg: Config) -> str:
-    return view.target_table or f"{cfg.trino.catalog}.{cfg.trino.schema}.{view.name}"
-
-
 def reload_config(s: AppState) -> None:
     try:
         config_mtime = s.config_path.stat().st_mtime
@@ -297,7 +293,7 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
 
     try:
         parsed = parse_view_query(view.query)
-        target_table = resolve_target_table(view, s.config)
+        target_table = view.target_table
 
         # Create target on first run (unpartitioned by default; see #22).
         columns = await discover_columns(cursor, view.query)
@@ -543,7 +539,8 @@ _FIELD_META: dict[str, dict] = {
               "help": ("exactly what you would write after CREATE MATERIALIZED VIEW … AS. "
                        "source table, filter column, granularity and merge keys are "
                        "derived automatically from the query.")},
-    "target_table": {"group": "target", "placeholder": "auto-generated"},
+    "target_table": {"required": True, "group": "target",
+                     "placeholder": "iceberg.analytics.my_view"},
     "target_partitioning": {"group": "target", "placeholder": "inherits from source"},
     "refresh_interval_seconds": {"min": 1, "suffix": "seconds", "label": "Refresh Interval"},
     "full_refresh_chunk": {"type": "select", "group": "target", "options": _GRAN_OPTIONS,
@@ -582,10 +579,14 @@ def _build_form_schema() -> list[dict]:
             "label": meta.get("label", f.name.replace("_", " ").title()),
             "type": meta.get("type", "number" if _VIEW_TYPES[f.name] is int else "string"),
             "required": meta.get("required", False),
+            # Always emit a boolean so the UI's `:disabled` binding never
+            # receives `undefined` — Alpine renders an `undefined` value as
+            # a present `disabled` attribute, which silently locks the field.
+            "disabled_on_edit": meta.get("disabled_on_edit", False),
         }
         if f.default is not dataclasses.MISSING:
             entry["default"] = f.default
-        for k in ("placeholder", "help", "group", "options", "rows", "min", "suffix", "disabled_on_edit"):
+        for k in ("placeholder", "help", "group", "options", "rows", "min", "suffix"):
             if k in meta:
                 entry[k] = meta[k]
         schema.append(entry)
@@ -604,7 +605,7 @@ def _build_view_create_model() -> type[BaseModel]:
     validators = {
         "_v_name": field_validator("name")(classmethod(lambda cls, v: (validate_identifier(v, "name"), v)[1])),
         "_v_target_table": field_validator("target_table")(classmethod(
-            lambda cls, v: (validate_qualified_name(v, "target_table"), v)[1] if v else v)),
+            lambda cls, v: (validate_qualified_name(v, "target_table"), v)[1])),
     }
     return create_model("ViewCreate", __validators__=validators, **fields_spec)
 

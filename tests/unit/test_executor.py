@@ -18,6 +18,7 @@ def make_view(**overrides) -> ViewConfig:
             "FROM iceberg.market_data.trades "
             "GROUP BY 1, 2"
         ),
+        target_table="iceberg.analytics.ohlcv_1m",
     )
     defaults.update(overrides)
     return ViewConfig(**defaults)

@@ -58,7 +58,7 @@ _DATASIZE_RE = re.compile(r"^\d+(B|KB|MB|GB|TB)$")
 class ViewConfig:
     name: str
     query: str
-    target_table: str | None = None
+    target_table: str
     target_partitioning: str | None = None
     refresh_interval_seconds: int = 60
     # Granularity string ("day", "month", …) controlling the size of each
@@ -158,13 +158,12 @@ def validate_maintenance_config(raw: dict) -> None:
 
 
 def _parse_view(raw: dict) -> ViewConfig:
-    missing = {"name", "query"} - raw.keys()
+    missing = {"name", "query", "target_table"} - raw.keys()
     if missing:
         raise ValueError(f"view missing required fields: {sorted(missing)}")
 
     validate_identifier(raw["name"], "name")
-    if raw.get("target_table"):
-        validate_qualified_name(raw["target_table"], "target_table")
+    validate_qualified_name(raw["target_table"], "target_table")
 
     # Full query validation — source_table, filter_column, granularity,
     # merge_keys are all derived here at load time.  Raises on any violation.
@@ -177,7 +176,7 @@ def _parse_view(raw: dict) -> ViewConfig:
     return ViewConfig(
         name=raw["name"],
         query=raw["query"],
-        target_table=raw.get("target_table"),
+        target_table=raw["target_table"],
         target_partitioning=raw.get("target_partitioning"),
         refresh_interval_seconds=raw.get("refresh_interval_seconds", 60),
         full_refresh_chunk=chunk,
@@ -265,7 +264,7 @@ def load_views(path: str | Path) -> list[ViewConfig]:
     return views
 
 
-_ALWAYS_EMIT = ("name", "query", "refresh_interval_seconds")
+_ALWAYS_EMIT = ("name", "query", "target_table", "refresh_interval_seconds")
 
 
 def save_views(views: list[ViewConfig], path: str | Path) -> None:
