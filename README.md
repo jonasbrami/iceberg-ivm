@@ -24,6 +24,55 @@ time range.
 > human prompter and Claude Code. See [DESIGN.md](DESIGN.md) for the full
 > design rationale and conversation context.
 
+## Run it (TL;DR)
+
+Pre-requisite: an existing Trino cluster reachable from the container, with
+[`iceberg.allowed-extra-properties=mv.last_source_snapshot`](#1-trino-prerequisite)
+set on the catalog the orchestrator writes to.
+
+Put `config.yaml` and `views.yaml` in a directory you'll mount into the
+container (state survives across image bumps because both files — and the
+orchestrator's `state.db` — live there):
+
+```yaml
+# ./data/config.yaml
+server:
+  port: 8000
+trino:
+  catalog: iceberg
+  schema: analytics
+```
+
+```yaml
+# ./data/views.yaml
+views: []     # add views here, or manage them via the web UI
+```
+
+```yaml
+# docker-compose.yml
+services:
+  orchestrator:
+    image: jonasbrami/trino-mv-orchestrator:0.2.1
+    environment:
+      TRINO_URL: http://trino:8080
+      TRINO_USER: orchestrator
+      # TRINO_PASSWORD: …            # only if your Trino requires it
+    volumes:
+      - ./data:/data
+    command: ["-c", "/data/config.yaml", "--views", "/data/views.yaml"]
+    ports:
+      - "8000:8000"
+```
+
+```bash
+docker compose up -d
+open http://localhost:8000          # web UI
+curl localhost:8000/health          # → {"status":"ok","views":0}
+```
+
+For a full local stack with a sandbox Trino + MinIO + Postgres, see
+[Quick start](#quick-start) below.
+
 ## How it works
 
 ```mermaid
