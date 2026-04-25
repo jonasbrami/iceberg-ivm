@@ -479,7 +479,22 @@
     <div class="px-6 py-5 space-y-[18px]">
 
       <template x-for="(row, idx) in schemaRows" :key="idx">
-        <div :class="row.length > 1 ? 'grid grid-cols-2 gap-3' : ''">
+        <div>
+
+          <!-- Section divider before the maintenance group, so refresh
+               config and Iceberg housekeeping read as separate concerns. -->
+          <template x-if="row[0]?.group === 'maintenance'">
+            <div class="flex items-center gap-3 pt-3 pb-1">
+              <div class="h-px flex-1 bg-[rgba(15,15,30,0.10)]"></div>
+              <span class="text-[10px] font-mono font-medium text-[#888ca0]
+                           uppercase tracking-[0.08em] shrink-0">
+                Iceberg Maintenance
+              </span>
+              <div class="h-px flex-1 bg-[rgba(15,15,30,0.10)]"></div>
+            </div>
+          </template>
+
+          <div :class="row.length > 1 ? 'grid grid-cols-2 gap-3' : ''">
 
           <template x-for="field in row" :key="field.name">
             <div>
@@ -611,6 +626,7 @@
             </div>
           </template>
 
+          </div>
         </div>
       </template>
 
