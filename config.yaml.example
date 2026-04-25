@@ -1,6 +1,12 @@
 server:
   port: 8000
   config_reload_interval_seconds: 30
+  # SQLite file holding the per-view recent_queries ring buffer and
+  # maintenance scheduling state. Defaults to "state.db" resolved relative
+  # to the views file's directory (which is a host bind-mount in Docker
+  # deployments). For Docker, point this at a persistent volume so history
+  # survives image upgrades — e.g. "/data/state.db".
+  # state_db_path: /data/state.db
 
 # Trino connection URL, user, and password are read from environment
 # variables — *never* from this file. No defaults; the orchestrator

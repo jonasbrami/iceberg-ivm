@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 import typing
 from contextlib import asynccontextmanager
@@ -475,6 +476,29 @@ async def supervisor(s: AppState) -> None:
 
 # ── FastAPI lifespan ──
 
+def resolve_state_db_path(
+    views_path: Path, config_path: Path, configured: str,
+) -> Path:
+    """Resolve ``state_db_path`` from config to a concrete filesystem path.
+
+    Absolute values are used as-is. For relative values, prefer the
+    ``views.yaml`` directory as the anchor — in the Dockerfile that file
+    is bind-mounted from the host, so it's persistent by construction
+    (whereas ``config.yaml`` is often mounted file-only into ``/app``,
+    which lives in the container's writable layer and gets wiped on
+    image bumps — see issue #39). Falls back to the config file's
+    directory when the views directory doesn't exist or isn't writable
+    (e.g. test fixtures pointing at a not-yet-created path).
+    """
+    db_path = Path(configured)
+    if db_path.is_absolute():
+        return db_path
+    views_dir = views_path.parent
+    if views_dir.exists() and os.access(views_dir, os.W_OK):
+        return views_dir / db_path
+    return config_path.parent / db_path
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Allow tests to pre-seed state (with _stop=True to skip loop)
@@ -487,12 +511,18 @@ async def lifespan(app: FastAPI):
         app.state.s = s
 
     if s.history is None and s.config is not None:
-        # Resolve relative state_db_path against the config file's directory
-        # so a docker-mounted /app/config.yaml puts state.db next to it
-        # without extra flags.
-        db_path = Path(s.config.server.state_db_path)
-        if not db_path.is_absolute():
-            db_path = s.config_path.parent / db_path
+        db_path = resolve_state_db_path(
+            s.views_path, s.config_path, s.config.server.state_db_path,
+        )
+        if str(db_path).startswith("/app/"):
+            log.warning(
+                "state_db_path resolved under /app/ (%s) — in Docker this is "
+                "the container's writable layer and will be wiped on image "
+                "bumps. Mount a host directory for views.yaml or set an "
+                "absolute server.state_db_path on a persistent volume "
+                "(see issue #39).",
+                db_path,
+            )
         db_path.parent.mkdir(parents=True, exist_ok=True)
         s.history = QueryHistory(db_path, RECENT_QUERY_LIMIT)
         await s.history.open()
