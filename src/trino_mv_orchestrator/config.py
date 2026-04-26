@@ -67,15 +67,19 @@ class ViewConfig:
     # at load time.
     full_refresh_chunk: str | None = None
 
-    # Iceberg maintenance. Each ``_interval_seconds`` is the minimum gap
-    # between runs (0 = disabled). Retention/threshold values are strings
-    # passed straight through to Trino's named-arg syntax; format-validated
-    # at load time so bad values never reach the executor.
-    optimize_interval_seconds: int = 0
+    # Iceberg maintenance. ``maintenance_interval_seconds`` is the shared
+    # minimum gap between runs for *every* op (0 = disable maintenance
+    # entirely). Each per-op boolean toggles that op individually; defaults
+    # are True so opting in to maintenance (interval > 0) automatically
+    # runs all three ops. Retention / threshold values are passed straight
+    # through to Trino's named-arg syntax; format-validated at load time so
+    # bad values never reach the executor.
+    maintenance_interval_seconds: int = 0
+    optimize: bool = True
     optimize_file_size_threshold: str | None = None     # None → Trino default (100MB)
-    expire_snapshots_interval_seconds: int = 0
+    expire_snapshots: bool = True
     expire_snapshots_retention: str = "7d"
-    remove_orphan_files_interval_seconds: int = 0
+    remove_orphan_files: bool = True
     remove_orphan_files_retention: str = "7d"
 
 
@@ -144,11 +148,12 @@ def validate_chunk_compatibility(chunk: str | None, query: str) -> None:
 
 
 def validate_maintenance_config(raw: dict) -> None:
-    """Validate maintenance intervals + param strings on a view dict."""
-    for op in _MAINTENANCE_OPS:
-        iv = raw.get(f"{op}_interval_seconds", 0) or 0
-        if iv < 0:
-            raise ValueError(f"{op}_interval_seconds must be >= 0 (got {iv!r}); use 0 to disable")
+    """Validate the shared maintenance interval + per-op param strings."""
+    iv = raw.get("maintenance_interval_seconds", 0) or 0
+    if iv < 0:
+        raise ValueError(
+            f"maintenance_interval_seconds must be >= 0 (got {iv!r}); use 0 to disable"
+        )
     for f in ("expire_snapshots_retention", "remove_orphan_files_retention"):
         v = raw.get(f)
         if v and not _DURATION_RE.match(str(v)):
@@ -183,11 +188,12 @@ def _parse_view(raw: dict) -> ViewConfig:
         target_partitioning=raw.get("target_partitioning"),
         refresh_interval_seconds=raw.get("refresh_interval_seconds", 60),
         full_refresh_chunk=chunk,
-        optimize_interval_seconds=raw.get("optimize_interval_seconds", 0),
+        maintenance_interval_seconds=raw.get("maintenance_interval_seconds", 0),
+        optimize=raw.get("optimize", True),
         optimize_file_size_threshold=raw.get("optimize_file_size_threshold"),
-        expire_snapshots_interval_seconds=raw.get("expire_snapshots_interval_seconds", 0),
+        expire_snapshots=raw.get("expire_snapshots", True),
         expire_snapshots_retention=raw.get("expire_snapshots_retention", "7d"),
-        remove_orphan_files_interval_seconds=raw.get("remove_orphan_files_interval_seconds", 0),
+        remove_orphan_files=raw.get("remove_orphan_files", True),
         remove_orphan_files_retention=raw.get("remove_orphan_files_retention", "7d"),
     )
 
@@ -280,7 +286,7 @@ def save_views(views: list[ViewConfig], path: str | Path) -> None:
         vd = {}
         for f in fields(ViewConfig):
             val = getattr(v, f.name)
-            if f.name in _ALWAYS_EMIT or (val and val != defaults[f.name]):
+            if f.name in _ALWAYS_EMIT or val != defaults[f.name]:
                 vd[f.name] = val
         out.append(vd)
     p.write_text(yaml.dump({"views": out}, default_flow_style=False, sort_keys=False))
