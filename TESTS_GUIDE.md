@@ -15,7 +15,7 @@ tests/
 │   ├── test_executor.py
 │   ├── test_introspect.py
 │   ├── test_server.py
-│   └── test_state.py
+│   └── test_query_history.py
 └── integration/    ~10 tests, real Trino + Iceberg + MinIO via docker compose
     ├── test_refresh.py
     └── test_cross_partition_groupby.py
@@ -237,19 +237,20 @@ Covers `server.py`.
 - `test_get_trino_connection_pins_timezone_to_utc` — **the session-tz bug**. Asserts that every `aiotrino.dbapi.connect(...)` call passes `timezone="UTC"`. Without this, `date_trunc` on `TIMESTAMP WITH TIME ZONE` columns uses the session's tz, while the Python `expand_to_bucket_bounds` math runs in UTC — they disagree and partial buckets get recomputed with wrong aggregates.
 
 **State advance on NO_CHANGE**
-- `test_refresh_view_advances_state_on_empty_append_no_change` — when `detect_changes` returns `NO_CHANGE` but `current_snapshot` has moved (compaction or empty-append), `write_last_snapshot` is still called. Otherwise the view re-detects the same snapshots forever.
+- `test_refresh_view_advances_state_on_empty_append_no_change` — when `detect_changes` returns `NO_CHANGE` but `current_snapshot` has moved (compaction or empty-append), `set_last_source_snapshot` is still called on the SQLite `view_status` row. Otherwise the view re-detects the same snapshots forever.
 
 **Metrics presence**
 - `test_new_metrics_defined` — guards against accidentally removing `REFRESH_BYTES`, `REFRESH_ROWS`, `DETECTION_DURATION`, `SOURCE_SNAPSHOT`.
 
-### `test_state.py` — snapshot persistence
+### `test_query_history.py` — SQLite `state.db`
 
-Covers `state.py`.
+Covers `query_history.py` — the per-view ring buffer of recent queries, the `view_status` row mirror, the maintenance-op schedule, and the `last_source_snapshot` bookmark.
 
-- `test_state_uses_detector_system_table` / `test_unqualified_table` — both modules share one `system_table()` helper (no duplication of the `"name$properties"` quoting rule)
-- `TestReadLastSnapshot.test_returns_id` — reads from `target."$properties"`, parses int
-- `TestReadLastSnapshot.test_returns_none` — empty result → `None`
-- `TestWriteLastSnapshot.test_writes_alter` — emits `ALTER TABLE … SET PROPERTIES` containing the snapshot key and value
+- **Recent-query buffer** — `test_append_and_recent_round_trip`, `test_recent_ordered_newest_first`, `test_limit_trims_oldest`, `test_views_are_isolated`, `test_history_survives_reopen`
+- **View status mirror** — `test_upsert_and_get_view_status_round_trip`, `test_upsert_view_status_overwrites_prior`, `test_upsert_view_status_ignores_unknown_keys` (so callers can pass `dataclasses.asdict(vs)` directly), `test_view_status_survives_reopen`
+- **Maintenance schedule** — `test_record_and_read_maintenance`, `test_upsert_maintenance_round_trip_all_fields`, `test_upsert_maintenance_requires_last_run`, `test_maintenance_state_survives_reopen`
+- **Snapshot bookmark** — `test_get_last_source_snapshot_unknown_view`, `test_set_then_get_last_source_snapshot`, `test_set_last_source_snapshot_does_not_clobber_other_columns` (the bookmark column is intentionally outside `_VIEW_STATUS_COLS` so `upsert_view_status` and `set_last_source_snapshot` are orthogonal), `test_last_source_snapshot_survives_reopen`
+- **Cleanup** — `test_delete_view_drops_only_that_view`, `test_delete_view_purges_view_status`, `test_delete_view_purges_maintenance_state`
 
 ---
 
@@ -275,9 +276,6 @@ Source is `iceberg.test_schema.trades` partitioned by `day(ts)`. Target is a 1-m
 #### `TestIncrementalRefresh`
 - `test_new_day` — Full refresh, persist snapshot. Insert a trade on a new day. Detector returns `INCREMENTAL` with a `filter_range`. After execute, target has 2 bars total. Verifies that data from the previous day isn't lost.
 - `test_same_day_update` — Full refresh on minute X. Insert a second trade in **the same minute**. Detector returns `INCREMENTAL`. After execute, the existing row is `MERGE`d (not duplicated) and `high`/`volume`/`trade_count` reflect both trades.
-
-#### `TestState`
-- `test_roundtrip` — `write_last_snapshot(99999)` followed by `read_last_snapshot()` returns `99999` (asserts that Iceberg `extra_properties` actually persists across statements)
 
 #### `TestNoChangeSkip`
 - `test_skip` — Two `detect_changes` calls in a row with the same `last_snapshot` — the second returns `NO_CHANGE`

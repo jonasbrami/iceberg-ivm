@@ -71,11 +71,20 @@ async def trino_conn():
 
 
 @pytest_asyncio.fixture
-async def app_state():
+async def app_state(tmp_path):
     """Minimal AppState wired to the docker-compose Trino, for tests
-    that drive the daemon's top-level ``refresh_view`` loop."""
+    that drive the daemon's top-level ``refresh_view`` loop. A real
+    SQLite history is attached so the source-snapshot bookmark
+    round-trips through ``view_status.last_source_snapshot``."""
     await wait_for_trino(TRINO_HOST, TRINO_PORT)
-    yield make_app_state(TRINO_HOST, TRINO_PORT)
+    s = await make_app_state(
+        TRINO_HOST, TRINO_PORT, state_db_path=tmp_path / "state.db",
+    )
+    try:
+        yield s
+    finally:
+        if s.history is not None:
+            await s.history.close()
 
 
 @pytest_asyncio.fixture(autouse=True)

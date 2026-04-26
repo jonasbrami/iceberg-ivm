@@ -1,11 +1,14 @@
 # trino-mv-orchestrator
 
-Metadata-driven incremental materialized view orchestrator for Trino/Iceberg.
+A simple **Iceberg IVM (incremental view maintenance) controller** that delegates
+all computation to Trino.
 
-Maintains materialized views backed by Iceberg tables, refreshed incrementally
-using only Iceberg file-level metadata for change detection. When source data
-changes, only the affected time range is recomputed from complete source data,
-guaranteeing correct aggregations. Refreshes are atomic via `MERGE INTO`.
+The orchestrator owns the control plane — view definitions, change detection,
+refresh scheduling, watermarks — while Trino executes the actual SQL against
+Iceberg tables. Change detection runs on Iceberg file-level metadata only;
+when source data changes, only the affected time range is recomputed from
+complete source data, guaranteeing correct aggregations. Refreshes are atomic
+via `MERGE INTO`.
 
 **Lightweight by design.** The orchestrator itself moves no data and holds no
 table contents — it only reads Iceberg metadata (`$snapshots`, `$all_entries`)
@@ -24,11 +27,28 @@ time range.
 > human prompter and Claude Code. See [DESIGN.md](DESIGN.md) for the full
 > design rationale and conversation context.
 
+## Why this project exists
+
+There's a specific, unfilled niche in the Iceberg + Trino ecosystem: **metadata-driven, bucket-aware incremental refresh of aggregating materialized views**. Each existing option falls short in a different way:
+
+| Option | Gap |
+|---|---|
+| **Trino native Iceberg MVs** ([REFRESH MATERIALIZED VIEW](https://trino.io/docs/current/sql/refresh-materialized-view.html)) | Incremental path is append-style — the planner falls back to full refresh when the query aggregates. The open issue [trinodb/trino#18673](https://github.com/trinodb/trino/issues/18673) tracks exactly this gap. |
+| **Hive Iceberg MVs** ([Cloudera blog](https://www.cloudera.com/blog/technical/accelerating-queries-on-iceberg-tables-with-materialized-views.html)) | Incremental rebuild of aggregations exists, but only for **decomposable aggregates** (SUM/MIN/MAX/COUNT/AVG) via additive delta merge — and it **fails on compaction** because it can't tell the new snapshot's intent. |
+| **SQLMesh `INCREMENTAL_BY_TIME_RANGE`** | Bucket-aware by design, but the change signal is a **cron interval**, not Iceberg metadata. Late data needs a manually widened `lookback`. Doesn't read `$snapshots` or file-level statistics. |
+| **dbt-trino incremental models** | The `is_incremental()` predicate is whatever SQL the user writes. No Iceberg snapshot or file-stats integration; no bucket-snapping; no concept of "compaction is a no-op". |
+
+This project combines three things no other option does together:
+
+1. **Read Iceberg file-level min/max stats** (`$all_entries.readable_metrics`) to find the exact time range of new data — never scans the data itself for change detection.
+2. **Snap that range outward to complete GROUP BY bucket boundaries** so re-aggregation produces correct results, regardless of how the source is partitioned.
+3. **Recompute the affected buckets from full source data via `MERGE`** — works for any aggregate (including non-decomposable ones like `min_by`, `max_by`, percentiles), and tolerates compaction by treating `replace` snapshots as no-ops.
+
+The result is a small, sharply-scoped service: append-only Iceberg sources, `date_trunc`-bucketed aggregations, Trino as the executor. No DAG, no second CLI, no fork of the engine.
+
 ## Run it (TL;DR)
 
-Pre-requisite: an existing Trino cluster reachable from the container, with
-[`iceberg.allowed-extra-properties=mv.last_source_snapshot`](#1-trino-prerequisite)
-set on the catalog the orchestrator writes to.
+Pre-requisite: an existing Trino cluster reachable from the container.
 
 Put `config.yaml` and `views.yaml` in a directory you'll mount into the
 container (state survives across image bumps because both files — and the
@@ -117,7 +137,6 @@ detection — just the metadata describing what data exists.
 |---|---|---|
 | `source.$snapshots` | `(snapshot_id, operation, committed_at)` | Did the source change since our last refresh? And was the change a legitimate `append`, a `replace` (compaction — no new data), or something else (`overwrite` / `delete`, which we reject)? |
 | `source.$all_entries` | `readable_metrics` JSON on files added in new snapshots (filtered by `snapshot_id IN (new)` and `status = 1`) | Per-file column-level min/max bounds. Gives us the tightest `[min_ts, max_ts]` bracket over the new data without reading a single data file. |
-| `target.$properties` | `mv.last_source_snapshot` | The last source snapshot we already processed — our "bookmark". |
 
 **Why `$all_entries` and not `$partitions`?** An earlier prototype diffed
 `$partitions` between snapshots — but when the GROUP BY granularity is
@@ -236,48 +255,18 @@ corrupts aggregates.
 
 ## Requirements
 
-- **Trino ≥ 465** — `extra_properties` table-property support was added in 465 (see the prerequisite below).
+- **Trino** with the Iceberg connector enabled — recent versions are recommended for `$all_entries` / `readable_metrics`.
 - **Iceberg catalog supporting writes from Trino** — Hive Metastore, REST, Nessie, Polaris, Snowflake Open Catalog, or JDBC.
 - **Trino user** with the following privileges:
-  - `SELECT` on every source table (plus its `$snapshots`, `$all_entries`, `$properties` metadata tables — these inherit from the base-table grant in Trino's Iceberg connector).
+  - `SELECT` on every source table (plus its `$snapshots`, `$all_entries` metadata tables — these inherit from the base-table grant in Trino's Iceberg connector).
   - `CREATE TABLE` on the target schema — the orchestrator creates the target on first refresh.
   - `SELECT`, `INSERT`, `DELETE`, `UPDATE` on every target table — needed for `MERGE` (incremental) and `DELETE + INSERT` (full refresh).
-  - `ALTER TABLE` on every target table — state persistence via `SET PROPERTIES extra_properties = …`.
 - **Iceberg column statistics** on the source `filter_column` — the detector reads `readable_metrics` from `$all_entries`. Statistics are on by default for Trino and Spark ≥ 3.5 writers.
 - **Python ≥ 3.12** — only when running from source (the Docker image does not require this on the host).
 
 ## Quick start
 
-### 1. Trino prerequisite
-
-Refresh state (the last source snapshot processed) is persisted **inside the
-target table** as an Iceberg custom property — so dropping the view cleans its
-state up automatically, no sidecar DB needed. Trino's Iceberg connector ships
-this as an opt-in feature: by default no custom property keys can be written
-through `extra_properties`, so you need to allow `mv.last_source_snapshot` on
-every catalog the orchestrator writes to:
-
-```properties
-# etc/catalog/iceberg.properties
-iceberg.allowed-extra-properties=mv.last_source_snapshot
-```
-
-Without this, the state-writing `ALTER TABLE … SET PROPERTIES extra_properties
-= …` fails, and the orchestrator will redo a full refresh on every cycle
-because it can't remember where it left off.
-
-**References** (Trino docs):
-
-- [`iceberg.allowed-extra-properties`](https://trino.io/docs/current/connector/iceberg.html#general-configuration) —
-  *"List of extra properties that are allowed to be set on Iceberg tables. Use
-  `*` to allow all properties."*  Default: `[]`.
-- [`extra_properties` table property](https://trino.io/docs/current/connector/iceberg.html#table-properties) —
-  the per-table map we write the snapshot ID into.
-- Introduced in [Trino 465](https://trino.io/docs/current/release/release-465.html)
-  (2024-12-11): *"Add support for reading and writing arbitrary table properties
-  with the `extra_properties` table property."*  Trino ≥ 465 is required.
-
-### 2. Set Trino credentials (environment variables)
+### 1. Set Trino credentials (environment variables)
 
 Trino URL, user, and password are read **only** from the environment. They
 never appear in `config.yaml`, so secrets stay out of the repo and
@@ -291,7 +280,7 @@ per-environment deployments only need to set a few env vars.
 
 The orchestrator refuses to start if `TRINO_URL` or `TRINO_USER` is missing.
 
-### 3. Create two YAML files
+### 2. Create two YAML files
 
 **`config.yaml`** — server settings + per-deployment Trino *catalog* and
 *schema* (not secrets; see [`config.yaml.example`](config.yaml.example)):
@@ -331,7 +320,7 @@ target table is created on first run.
 
 Views can also be managed interactively from the web UI.
 
-### 4. Run it
+### 3. Run it
 
 Install dependencies, export the credential env vars, and start the service:
 
@@ -417,11 +406,11 @@ On the first refresh of a brand-new view you'll see:
 
 1. `discover_columns` (a `PREPARE` + `DESCRIBE OUTPUT`, no data scan) resolves the target column types.
 2. `CREATE TABLE IF NOT EXISTS target (…)` creates the Iceberg table. The target is **unpartitioned by default**; set `target_partitioning` on the view to partition it (e.g. `"ARRAY['day(minute)']"`).
-3. The detector sees no `mv.last_source_snapshot` in the target's `$properties` and returns `FULL_REFRESH`.
+3. The detector sees no `last_source_snapshot` recorded in the orchestrator's `state.db` and returns `FULL_REFRESH`.
 4. `execute_full_refresh` runs `DELETE FROM target WHERE true` then `INSERT INTO target SELECT …` (your original query, verbatim — no WHERE injected).
-5. The source snapshot ID is stored in `target.extra_properties.mv.last_source_snapshot`.
+5. The source snapshot ID is written to `state.db` (`view_status.last_source_snapshot`).
 
-Every subsequent cycle is incremental unless you drop the target table.
+Every subsequent cycle is incremental unless you delete the bookmark.
 
 ### Day-2 operations
 
@@ -429,8 +418,8 @@ Every subsequent cycle is incremental unless you drop the target table.
 |---|---|
 | Add / edit a view | Edit `views.yaml` (or use UI / API). Takes effect at next config reload. |
 | Delete a view | UI → Delete, or `DELETE /api/views/{name}`. Removes it from the schedule **only** — the target Iceberg table is untouched. Drop it separately if you want the data gone. |
-| Force a full refresh | `DROP TABLE <target>` in Trino. State lives inside the target, so dropping it resets the bookmark; the next tick creates the table and full-refreshes. |
-| Restart the orchestrator | Safe. Resident state is per-view status counters only; the snapshot bookmark lives in Iceberg. Restart picks up where it left off. |
+| Force a full refresh | Delete the view via the UI / `DELETE /api/views/{name}` and recreate it (this clears the SQLite bookmark), then `DROP TABLE <target>` if you also want the data gone. Just dropping the target by itself will not full-refresh — the next tick will incremental-refresh against an empty table. |
+| Restart the orchestrator | Safe. The bookmark lives in `state.db` (mounted alongside `views.yaml`); restart picks up where it left off. |
 | Manual refresh | UI → Refresh, or `POST /api/views/{name}/refresh`. Runs one cycle synchronously and returns the action taken. |
 | Health check | `curl http://localhost:8000/health` → `{"status":"ok","views":N}` |
 
@@ -734,7 +723,7 @@ src/trino_mv_orchestrator/
     detector.py      -- $snapshots + $all_entries file stats + expand_to_bucket_bounds()
     executor.py      -- MERGE SQL generation + execution
     introspect.py    -- DESCRIBE OUTPUT, EXPLAIN IO, SHOW CREATE TABLE
-    state.py         -- Read/write last_source_snapshot via extra_properties
+    query_history.py -- SQLite-backed view_status / query history / source-snapshot bookmark
     server.py        -- FastAPI: web UI, REST API, Prometheus, refresh loop
     cli.py           -- Entry point, starts uvicorn
     static/

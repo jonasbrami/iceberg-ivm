@@ -105,23 +105,6 @@ time range of new data without scanning data files.
 }
 ```
 
-### `$properties`
-
-```sql
-SELECT value FROM target."$properties" WHERE key = 'mv.last_source_snapshot'
-```
-
-Used to read/write orchestrator state. Writes via:
-```sql
-ALTER TABLE target SET PROPERTIES
-  extra_properties = MAP(ARRAY['mv.last_source_snapshot'], ARRAY['12345'])
-```
-
-Requires `iceberg.allowed-extra-properties` to be configured in the catalog.
-`ALTER TABLE SET PROPERTIES extra_properties` **merges** keys (does not
-clobber existing properties) -- confirmed via `IcebergMetadata.java:2660`:
-`extraProperties.forEach(updateProperties::set)`.
-
 ## Key design decisions
 
 ### Timezone assumption
@@ -217,16 +200,23 @@ shows the predicate becomes a post-scan filter, causing a full table scan.
 A plain column range (`ts >= A AND ts < B`) IS pushed down. So we compute
 bucket boundaries in Python and produce a plain range filter.
 
-### Why `extra_properties` for state, not a separate table?
+### Why SQLite for state, not the target table's `extra_properties`?
 
-State lives with the target table. Drop the table = state gone = full
-backfill on recreate. No external coordination. The `extra_properties`
-mechanism merges keys (confirmed in source code), so the orchestrator's
-property doesn't clobber other properties.
+The per-view source-snapshot bookmark lives in `state.db` (`view_status.last_source_snapshot`)
+alongside query history, maintenance scheduling, and restart-survival
+counters. Same per-view PK, same read-once-write-once-per-tick access
+pattern, same persistence story — and no Iceberg-catalog allowlist
+required.
 
-The MERGE and state write are two separate Iceberg commits (Trino has no
-multi-statement transactions). Crash between them = redundant refresh on
-next cycle. No data loss or corruption.
+Trade-off: dropping the target table does not auto-clear the bookmark, so
+the next tick would attempt an incremental refresh against an empty
+table. To force a full refresh, delete the view (`DELETE
+/api/views/{name}`) — which clears the SQLite row — and recreate it.
+
+The MERGE and bookmark write are two separate operations (Trino has no
+multi-statement transactions, and SQLite isn't in the same commit
+either). Crash between them ⇒ redundant refresh on next cycle. No data
+loss or corruption: `MERGE` is idempotent on the merge keys.
 
 ### Auto-discovery via DESCRIBE OUTPUT
 
@@ -356,4 +346,4 @@ to avoid table conflicts.
   bar includes all 3 trades
 - **New data in different week**: verify previous week's bars untouched
 - **No-op skip**: no new snapshots = no queries beyond `$snapshots`
-- **State roundtrip**: write/read `last_source_snapshot` via `$properties`
+- **State roundtrip**: set/get `last_source_snapshot` on `view_status` via `QueryHistory`

@@ -13,7 +13,6 @@ from trino_mv_orchestrator.detector import RefreshAction, detect_changes
 from trino_mv_orchestrator.executor import execute_refresh
 from trino_mv_orchestrator.introspect import discover_columns, build_create_table_sql
 from trino_mv_orchestrator.query_parser import parse_view_query
-from trino_mv_orchestrator.state import write_last_snapshot
 
 pytestmark = [pytest.mark.integration, pytest.mark.xdist_group("integration")]
 
@@ -75,7 +74,6 @@ async def setup_and_full_refresh(cursor, view, parsed, target):
     await cursor.execute(build_create_table_sql(target, cols, view.target_partitioning))
     await _drain(execute_refresh(cursor, view, target, parsed, value_cols))
     result = await detect_changes(cursor, SOURCE_TABLE, "ts", parsed.granularity, last_snapshot=None)
-    await write_last_snapshot(cursor, target, result.current_snapshot)
     return result, value_cols
 
 
@@ -192,7 +190,6 @@ class TestLateArrivingData:
             cursor, WEEKLY_VIEW, WEEKLY_TARGET, WEEKLY_PARSED, value_cols,
             incremental_range=result.filter_range,
         ))
-        await write_last_snapshot(cursor, WEEKLY_TARGET, result.current_snapshot)
         last_snap = result.current_snapshot
 
         # Sanity: target now has both weekly bars

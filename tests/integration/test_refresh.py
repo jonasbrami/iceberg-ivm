@@ -9,9 +9,8 @@ import pytest
 from trino_mv_orchestrator.config import ViewConfig
 from trino_mv_orchestrator.detector import RefreshAction, detect_changes
 from trino_mv_orchestrator.executor import execute_refresh
-from trino_mv_orchestrator.introspect import ColumnInfo, build_create_table_sql, discover_columns
+from trino_mv_orchestrator.introspect import build_create_table_sql, discover_columns
 from trino_mv_orchestrator.query_parser import parse_view_query
-from trino_mv_orchestrator.state import read_last_snapshot, write_last_snapshot
 
 pytestmark = [pytest.mark.integration, pytest.mark.xdist_group("integration")]
 
@@ -115,7 +114,6 @@ class TestIncrementalRefresh:
         await _drain(execute_refresh(cursor, VIEW, TARGET_TABLE, PARSED, value_cols))
 
         result = await detect_changes(cursor, SOURCE_TABLE, "ts", "minute", last_snapshot=None)
-        await write_last_snapshot(cursor, TARGET_TABLE, result.current_snapshot)
 
         await insert_trades(cursor, "2026-04-09", [("AAPL", "10:00:00", 155.0, 200)])
 
@@ -140,7 +138,6 @@ class TestIncrementalRefresh:
         await _drain(execute_refresh(cursor, VIEW, TARGET_TABLE, PARSED, value_cols))
 
         result = await detect_changes(cursor, SOURCE_TABLE, "ts", "minute", last_snapshot=None)
-        await write_last_snapshot(cursor, TARGET_TABLE, result.current_snapshot)
 
         await insert_trades(cursor, "2026-04-08", [("AAPL", "09:30:30", 160.0, 200)])
 
@@ -156,15 +153,6 @@ class TestIncrementalRefresh:
         assert bars[0]["high"] == 160.0
         assert bars[0]["volume"] == 300.0
         assert bars[0]["trade_count"] == 2
-
-
-class TestState:
-    async def test_roundtrip(self, trino_conn):
-        cursor = await trino_conn.cursor()
-        await cursor.execute(build_create_table_sql(TARGET_TABLE, [ColumnInfo("x", "INTEGER")]))
-        assert await read_last_snapshot(cursor, TARGET_TABLE) is None
-        await write_last_snapshot(cursor, TARGET_TABLE, 12345)
-        assert await read_last_snapshot(cursor, TARGET_TABLE) == 12345
 
 
 class TestNoChangeSkip:

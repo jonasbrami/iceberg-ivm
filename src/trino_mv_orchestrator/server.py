@@ -43,7 +43,6 @@ from trino_mv_orchestrator.introspect import (
 )
 from trino_mv_orchestrator.query_history import QueryHistory
 from trino_mv_orchestrator.query_parser import parse_view_query
-from trino_mv_orchestrator.state import read_last_snapshot, write_last_snapshot
 
 log = logging.getLogger(__name__)
 
@@ -372,7 +371,10 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
         ))
         value_columns = [c.name for c in columns if c.name not in parsed.merge_keys]
 
-        last_snap = await read_last_snapshot(cursor, target_table)
+        last_snap = (
+            await s.history.get_last_source_snapshot(view.name)
+            if s.history is not None else None
+        )
 
         t0 = time.monotonic()
         result = await detect_changes(
@@ -397,7 +399,8 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
             # Advance state past empty-append / compaction-only snapshots so
             # we don't re-detect them every cycle.
             if result.current_snapshot is not None and result.current_snapshot != last_snap:
-                await write_last_snapshot(cursor, target_table, result.current_snapshot)
+                if s.history is not None:
+                    await s.history.set_last_source_snapshot(view.name, result.current_snapshot)
             await _persist_view_status(s, view.name, vs)
             await maintain_view(s, view, cursor, target_table)
             return
@@ -450,7 +453,8 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
         # or fully caught up) also advance state — total_queries == 0 is fine.
         REFRESH_TOTAL.labels(view=view.name,
                              type="incremental" if incremental_range else "full").inc()
-        await write_last_snapshot(cursor, target_table, result.current_snapshot)
+        if s.history is not None:
+            await s.history.set_last_source_snapshot(view.name, result.current_snapshot)
         vs.total_refreshes += 1
         vs.chunks_total = None
         REFRESH_DURATION.labels(view=view.name).observe(total_elapsed)
