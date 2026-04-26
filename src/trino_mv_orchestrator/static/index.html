@@ -308,25 +308,24 @@
             <span x-text="view.status?.last_error"></span>
           </div>
 
-          <!-- Maintenance chips: one per op configured with an interval.
-               Shown only when an op has actually run once (last_run != null),
-               so disabled ops don't clutter the card. Red-tint on error. -->
-          <div x-show="view.status?.maintenance && Object.keys(view.status.maintenance).length > 0"
-               class="flex flex-wrap gap-x-[18px] gap-y-[6px] mt-3 pt-[12px]
-                      border-t border-[rgba(15,15,30,0.06)]">
-            <span class="text-[9.5px] font-mono text-[#9090a8] uppercase tracking-[0.08em]">Maintenance</span>
-            <template x-for="[op, s] in Object.entries(view.status?.maintenance ?? {})" :key="op">
-              <div x-show="s?.last_run" class="flex items-baseline gap-[6px]"
-                   :class="s?.last_error ? 'text-red-700' : 'text-[#3a3a52]'"
-                   :title="s?.last_error || ''">
-                <span class="text-[9.5px] font-mono uppercase tracking-[0.08em]"
-                      :class="s?.last_error ? 'text-red-700/85' : 'text-purple-700/85'"
-                      x-text="op.replace(/_/g, ' ')"></span>
-                <span class="text-[12px] font-mono tabular-nums"
-                      x-text="s?.last_run ? timeAgo(s.last_run) : '—'"></span>
-              </div>
-            </template>
-          </div>
+          <!-- Maintenance: collapsed to the most-recent run across all ops.
+               Per-op breakdowns live in the recent-queries list below
+               (each maintenance query is tagged with its op stage).
+               Title attribute exposes the per-op timestamps on hover.
+               Red-tint when the most-recent run errored. -->
+          <template x-if="lastMaintenance(view)">
+            <div class="flex items-baseline gap-[6px] mt-3 pt-[12px]
+                        border-t border-[rgba(15,15,30,0.06)]"
+                 :class="lastMaintenance(view)?.last_error ? 'text-red-700' : 'text-[#3a3a52]'"
+                 :title="maintenanceTitle(view)">
+              <span class="text-[9.5px] font-mono uppercase tracking-[0.08em]"
+                    :class="lastMaintenance(view)?.last_error ? 'text-red-700/85' : 'text-purple-700/85'">
+                Last Maintenance
+              </span>
+              <span class="text-[12px] font-mono tabular-nums"
+                    x-text="timeAgo(lastMaintenance(view).last_run)"></span>
+            </div>
+          </template>
 
           <!-- Query (collapsible) -->
           <details class="group mt-3">
@@ -606,6 +605,18 @@
                          transition-[border-color,box-shadow] duration-150">
               </template>
 
+              <!-- boolean (checkbox) -->
+              <template x-if="field.type === 'boolean'">
+                <label class="inline-flex items-center gap-2 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    x-model="form[field.name]"
+                    class="w-4 h-4 accent-indigo-600 cursor-pointer">
+                  <span class="text-[12px] font-mono text-[#1a1a28]"
+                        x-text="form[field.name] ? 'enabled' : 'disabled'"></span>
+                </label>
+              </template>
+
               <!-- select (dropdown) -->
               <template x-if="field.type === 'select'">
                 <select
@@ -814,6 +825,8 @@ function app() {
         const raw = this.form[f.name];
         if (f.type === 'array') {
           body[f.name] = String(raw || '').split(',').map(s => s.trim()).filter(Boolean);
+        } else if (f.type === 'boolean') {
+          body[f.name] = !!raw;
         } else if (f.type === 'number') {
           body[f.name] = raw;
         } else if (f.required) {
@@ -903,6 +916,24 @@ function app() {
       if (diff < 60)   return diff + 's ago';
       if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
       return Math.floor(diff / 3600) + 'h ago';
+    },
+
+    lastMaintenance(view) {
+      const ms = view.status?.maintenance;
+      if (!ms) return null;
+      let best = null;
+      for (const s of Object.values(ms)) {
+        if (s?.last_run && (!best || s.last_run > best.last_run)) best = s;
+      }
+      return best;
+    },
+
+    maintenanceTitle(view) {
+      const ms = view.status?.maintenance ?? {};
+      return Object.entries(ms)
+        .filter(([, s]) => s?.last_run)
+        .map(([op, s]) => `${op.replace(/_/g, ' ')}: ${this.timeAgo(s.last_run)}${s.last_error ? ' — ' + s.last_error : ''}`)
+        .join('\n');
     },
 
     formatRows(n) {

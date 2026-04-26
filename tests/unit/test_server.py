@@ -96,9 +96,10 @@ def test_view_schema(client):
         "name", "query",
         "target_table", "target_partitioning", "refresh_interval_seconds",
         "full_refresh_chunk",
-        "optimize_interval_seconds", "optimize_file_size_threshold",
-        "expire_snapshots_interval_seconds", "expire_snapshots_retention",
-        "remove_orphan_files_interval_seconds", "remove_orphan_files_retention",
+        "maintenance_interval_seconds",
+        "optimize", "optimize_file_size_threshold",
+        "expire_snapshots", "expire_snapshots_retention",
+        "remove_orphan_files", "remove_orphan_files_retention",
     }
     for f in schema:
         assert "label" in f and "type" in f and "required" in f
@@ -109,15 +110,22 @@ def test_view_schema(client):
 
 
 def test_view_schema_maintenance_fields_grouped(client):
-    """All six maintenance fields share the 'maintenance' group so the UI
-    can render them as a dedicated section."""
+    """All maintenance fields (shared interval, per-op booleans, retention/threshold)
+    share the 'maintenance' group so the UI can render them as one section."""
     schema = client.get("/api/views/schema").json()
     maint = [f for f in schema if f.get("group") == "maintenance"]
     assert {f["name"] for f in maint} == {
-        "optimize_interval_seconds", "optimize_file_size_threshold",
-        "expire_snapshots_interval_seconds", "expire_snapshots_retention",
-        "remove_orphan_files_interval_seconds", "remove_orphan_files_retention",
+        "maintenance_interval_seconds",
+        "optimize", "optimize_file_size_threshold",
+        "expire_snapshots", "expire_snapshots_retention",
+        "remove_orphan_files", "remove_orphan_files_retention",
     }
+    # Per-op toggles must surface as booleans so the UI renders checkboxes,
+    # not text inputs.
+    by_name = {f["name"]: f for f in maint}
+    for op in ("optimize", "expire_snapshots", "remove_orphan_files"):
+        assert by_name[op]["type"] == "boolean", f"{op} should be a boolean field"
+        assert by_name[op]["default"] is True, f"{op} should default to enabled"
 
 
 def test_view_schema_full_refresh_chunk_is_select_with_granularity_options(client):
@@ -375,20 +383,24 @@ def test_create_view_accepts_maintenance_fields(client, setup_state):
         "name": "maintained",
         "target_table": "iceberg.analytics.maintained",
         "query": _FULL_REFRESH_QUERY,
-        "optimize_interval_seconds": 3600,
+        "maintenance_interval_seconds": 3600,
+        "optimize": True,
         "optimize_file_size_threshold": "128MB",
-        "expire_snapshots_interval_seconds": 86400,
+        "expire_snapshots": False,
         "expire_snapshots_retention": "14d",
-        "remove_orphan_files_interval_seconds": 604800,
+        "remove_orphan_files": True,
         "remove_orphan_files_retention": "30d",
     })
     assert r.status_code == 201, r.text
     body = r.json()
-    assert body["optimize_interval_seconds"] == 3600
+    assert body["maintenance_interval_seconds"] == 3600
+    assert body["optimize"] is True
+    assert body["expire_snapshots"] is False
     assert body["optimize_file_size_threshold"] == "128MB"
     assert body["expire_snapshots_retention"] == "14d"
     new = next(v for v in setup_state.config.views if v.name == "maintained")
-    assert new.optimize_interval_seconds == 3600
+    assert new.maintenance_interval_seconds == 3600
+    assert new.expire_snapshots is False
     assert new.optimize_file_size_threshold == "128MB"
 
 
@@ -397,7 +409,7 @@ def test_create_view_rejects_bad_retention(client):
         "name": "bad_ret",
         "target_table": "iceberg.analytics.bad_ret",
         "query": _FULL_REFRESH_QUERY,
-        "expire_snapshots_interval_seconds": 3600,
+        "maintenance_interval_seconds": 3600,
         "expire_snapshots_retention": "forever",
     })
     assert r.status_code == 422
@@ -409,7 +421,7 @@ def test_create_view_rejects_negative_interval(client):
         "name": "bad_iv",
         "target_table": "iceberg.analytics.bad_iv",
         "query": _FULL_REFRESH_QUERY,
-        "optimize_interval_seconds": -10,
+        "maintenance_interval_seconds": -10,
     })
     assert r.status_code == 422
 
@@ -420,11 +432,13 @@ def test_update_view_applies_maintenance_change(client, setup_state):
         "name": "test_view",
         "target_table": "iceberg.analytics.test_view",
         "query": _EXISTING_QUERY,
-        "optimize_interval_seconds": 7200,
+        "maintenance_interval_seconds": 7200,
+        "optimize": False,
     })
     assert r.status_code == 200, r.text
     updated = next(v for v in setup_state.config.views if v.name == "test_view")
-    assert updated.optimize_interval_seconds == 7200
+    assert updated.maintenance_interval_seconds == 7200
+    assert updated.optimize is False
 
 
 def test_create_view_empty_file_size_threshold_treated_as_none(client, setup_state):
@@ -453,8 +467,10 @@ async def test_refresh_view_runs_maintenance(setup_state):
         name="test_view",
         query=_EXISTING_QUERY,
         target_table="iceberg.analytics.test_view",
-        optimize_interval_seconds=1,
-        expire_snapshots_interval_seconds=1,
+        maintenance_interval_seconds=1,
+        # remove_orphan_files toggled off — only optimize + expire_snapshots
+        # should run to prove per-op booleans gate execution independently.
+        remove_orphan_files=False,
         expire_snapshots_retention="7d",
     )
     setup_state.config = Config(
@@ -525,7 +541,10 @@ async def test_maintain_view_respects_interval(setup_state):
         name="test_view",
         query=_EXISTING_QUERY,
         target_table="iceberg.analytics.test_view",
-        optimize_interval_seconds=3600,  # 1h
+        maintenance_interval_seconds=3600,  # 1h shared interval
+        # only optimize enabled — keeps the test focused on the interval gate
+        expire_snapshots=False,
+        remove_orphan_files=False,
     )
     vs = ViewStatus(name="test_view")
     # Just ran 10s ago — 1h interval should gate it off.
@@ -544,6 +563,57 @@ async def test_maintain_view_respects_interval(setup_state):
     assert calls == []
 
 
+async def test_maintain_view_skips_everything_when_interval_zero(setup_state):
+    """maintenance_interval_seconds=0 is the global kill switch: even with
+    every per-op boolean still True (the defaults), no SQL must run."""
+    from trino_mv_orchestrator import server as server_mod
+    from trino_mv_orchestrator.config import ViewConfig
+
+    v = ViewConfig(
+        name="test_view",
+        query=_EXISTING_QUERY,
+        target_table="iceberg.analytics.test_view",
+        maintenance_interval_seconds=0,  # disabled — booleans must not matter
+    )
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view")
+
+    async def fake_maintenance(cursor, target, op, params):
+        raise AssertionError(f"{op} should not have run when interval is 0")
+
+    with patch.object(server_mod, "execute_maintenance", fake_maintenance):
+        await server_mod.maintain_view(setup_state, v, cursor=None, target_table="t")
+
+
+async def test_maintain_view_respects_per_op_toggle(setup_state):
+    """With one op disabled, the other two still run on the shared interval."""
+    from trino_mv_orchestrator import server as server_mod
+    from trino_mv_orchestrator.config import ViewConfig
+    from trino_mv_orchestrator.executor import QueryInfo
+
+    v = ViewConfig(
+        name="test_view",
+        query=_EXISTING_QUERY,
+        target_table="iceberg.analytics.test_view",
+        maintenance_interval_seconds=1,
+        optimize=False,  # only this one off
+    )
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view")
+
+    calls: list[str] = []
+
+    async def fake_maintenance(cursor, target, op, params):
+        calls.append(op)
+        return QueryInfo(
+            query_id=f"q_{op}", info_uri=f"http://trino/q_{op}",
+            stage=f"maintenance_{op}", started_at=1.0, elapsed_ms=5.0,
+        )
+
+    with patch.object(server_mod, "execute_maintenance", fake_maintenance):
+        await server_mod.maintain_view(setup_state, v, cursor=None, target_table="t")
+
+    assert calls == ["expire_snapshots", "remove_orphan_files"]
+
+
 async def test_maintain_view_persists_last_run_to_history(setup_state, tmp_path):
     """Scheduling must survive restart — last_run is written to maintenance_state."""
     from trino_mv_orchestrator import server as server_mod
@@ -555,7 +625,9 @@ async def test_maintain_view_persists_last_run_to_history(setup_state, tmp_path)
         name="test_view",
         query=_EXISTING_QUERY,
         target_table="iceberg.analytics.test_view",
-        optimize_interval_seconds=60,
+        maintenance_interval_seconds=60,
+        expire_snapshots=False,
+        remove_orphan_files=False,
     )
     setup_state.view_statuses["test_view"] = ViewStatus(name="test_view")
     h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
@@ -1352,7 +1424,9 @@ async def test_maintenance_persists_full_field_dict(setup_state, tmp_path):
         name="test_view",
         query=_EXISTING_QUERY,
         target_table="iceberg.analytics.test_view",
-        optimize_interval_seconds=60,
+        maintenance_interval_seconds=60,
+        expire_snapshots=False,
+        remove_orphan_files=False,
     )
     setup_state.view_statuses["test_view"] = ViewStatus(name="test_view")
     h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)

@@ -293,22 +293,27 @@ async def maintain_view(
 ) -> None:
     """Run any due Iceberg maintenance ops after a refresh, on the same cursor.
 
-    Serialising with refresh avoids Iceberg commit conflicts. ``0`` interval =
-    disabled. Last-run times are persisted so restarts resume the schedule.
+    Serialising with refresh avoids Iceberg commit conflicts.
+    ``maintenance_interval_seconds == 0`` disables maintenance entirely;
+    each per-op boolean toggles that op individually. Per-op last-run
+    times are persisted so restarts resume the schedule.
     """
+    interval = view.maintenance_interval_seconds
+    if interval <= 0:
+        return
     ops = [
-        ("optimize", view.optimize_interval_seconds,
+        ("optimize", view.optimize,
             {"file_size_threshold": view.optimize_file_size_threshold}
             if view.optimize_file_size_threshold else {}),
-        ("expire_snapshots", view.expire_snapshots_interval_seconds,
+        ("expire_snapshots", view.expire_snapshots,
             {"retention_threshold": view.expire_snapshots_retention}),
-        ("remove_orphan_files", view.remove_orphan_files_interval_seconds,
+        ("remove_orphan_files", view.remove_orphan_files,
             {"retention_threshold": view.remove_orphan_files_retention}),
     ]
     vs = s.view_statuses.setdefault(view.name, ViewStatus(name=view.name))
     now = time.time()
-    for op, interval, params in ops:
-        if interval <= 0:
+    for op, enabled, params in ops:
+        if not enabled:
             continue
         ms = vs.maintenance.setdefault(op, MaintenanceOpStatus())
         if ms.last_run is not None and now - ms.last_run < interval:
@@ -653,20 +658,20 @@ _FIELD_META: dict[str, dict] = {
                            "help": ("If set, the first-run backfill is split into chunks of this size "
                                     "and each chunk is committed independently. Must be coarser-or-equal "
                                     "to the view's own date_trunc granularity.")},
-    "optimize_interval_seconds": {"min": 0, "suffix": "seconds", "group": "maintenance",
-                                  "label": "Optimize Every",
-                                  "help": "0 disables. Runs ALTER TABLE ... EXECUTE optimize."},
+    "maintenance_interval_seconds": {"min": 0, "suffix": "seconds", "group": "maintenance",
+                                     "label": "Maintenance Interval",
+                                     "help": "Shared interval for every enabled op. 0 disables maintenance entirely."},
+    "optimize": {"group": "maintenance", "label": "Optimize",
+                 "help": "Run ALTER TABLE ... EXECUTE optimize on each tick."},
     "optimize_file_size_threshold": {"group": "maintenance",
                                      "label": "Optimize File Size Threshold",
                                      "placeholder": "e.g. 128MB (default: Trino's 100MB)"},
-    "expire_snapshots_interval_seconds": {"min": 0, "suffix": "seconds", "group": "maintenance",
-                                          "label": "Expire Snapshots Every",
-                                          "help": "0 disables. Runs ALTER TABLE ... EXECUTE expire_snapshots."},
+    "expire_snapshots": {"group": "maintenance", "label": "Expire Snapshots",
+                         "help": "Run ALTER TABLE ... EXECUTE expire_snapshots on each tick."},
     "expire_snapshots_retention": {"group": "maintenance", "label": "Expire Snapshots Retention",
                                    "help": "Trino duration (e.g. '7d'). Must be ≥ catalog's min-retention."},
-    "remove_orphan_files_interval_seconds": {"min": 0, "suffix": "seconds", "group": "maintenance",
-                                             "label": "Remove Orphan Files Every",
-                                             "help": "0 disables. Runs ALTER TABLE ... EXECUTE remove_orphan_files."},
+    "remove_orphan_files": {"group": "maintenance", "label": "Remove Orphan Files",
+                            "help": "Run ALTER TABLE ... EXECUTE remove_orphan_files on each tick."},
     "remove_orphan_files_retention": {"group": "maintenance", "label": "Remove Orphan Files Retention",
                                       "help": "Trino duration (e.g. '7d'). Must be ≥ catalog's min-retention."},
 }
@@ -679,10 +684,12 @@ def _build_form_schema() -> list[dict]:
     schema = []
     for f in dataclasses.fields(ViewConfig):
         meta = _FIELD_META.get(f.name, {})
+        t = _VIEW_TYPES[f.name]
+        default_type = "boolean" if t is bool else "number" if t is int else "string"
         entry = {
             "name": f.name,
             "label": meta.get("label", f.name.replace("_", " ").title()),
-            "type": meta.get("type", "number" if _VIEW_TYPES[f.name] is int else "string"),
+            "type": meta.get("type", default_type),
             "required": meta.get("required", False),
             # Always emit a boolean so the UI's `:disabled` binding never
             # receives `undefined` — Alpine renders an `undefined` value as

@@ -356,17 +356,20 @@ views:
   - name: v
     query: "SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1"
     target_table: iceberg.analytics.v
-    optimize_interval_seconds: 3600
+    maintenance_interval_seconds: 3600
+    optimize: true
     optimize_file_size_threshold: 128MB
-    expire_snapshots_interval_seconds: 86400
+    expire_snapshots: false
     expire_snapshots_retention: 14d
-    remove_orphan_files_interval_seconds: 604800
+    remove_orphan_files: true
     remove_orphan_files_retention: 30d
 """
 
 
-def test_maintenance_defaults_to_disabled(tmp_path):
-    """Views without maintenance fields load with all intervals at 0."""
+def test_maintenance_defaults_to_disabled_with_ops_enabled(tmp_path):
+    """Views without maintenance fields load with the shared interval at 0
+    (kill switch off) but every per-op toggle defaulted to True — so opting
+    in only requires setting maintenance_interval_seconds > 0."""
     minimal = (
         "views:\n"
         "  - name: v\n"
@@ -374,21 +377,23 @@ def test_maintenance_defaults_to_disabled(tmp_path):
         "    target_table: iceberg.analytics.v\n"
     )
     v = load_views(write_views(tmp_path, minimal))[0]
-    assert v.optimize_interval_seconds == 0
+    assert v.maintenance_interval_seconds == 0
+    assert v.optimize is True
     assert v.optimize_file_size_threshold is None
-    assert v.expire_snapshots_interval_seconds == 0
+    assert v.expire_snapshots is True
     assert v.expire_snapshots_retention == "7d"
-    assert v.remove_orphan_files_interval_seconds == 0
+    assert v.remove_orphan_files is True
     assert v.remove_orphan_files_retention == "7d"
 
 
 def test_maintenance_fields_loaded(tmp_path):
     v = load_views(write_views(tmp_path, _MAINTENANCE_YAML))[0]
-    assert v.optimize_interval_seconds == 3600
+    assert v.maintenance_interval_seconds == 3600
+    assert v.optimize is True
     assert v.optimize_file_size_threshold == "128MB"
-    assert v.expire_snapshots_interval_seconds == 86400
+    assert v.expire_snapshots is False
     assert v.expire_snapshots_retention == "14d"
-    assert v.remove_orphan_files_interval_seconds == 604800
+    assert v.remove_orphan_files is True
     assert v.remove_orphan_files_retention == "30d"
 
 
@@ -397,23 +402,23 @@ def test_maintenance_round_trip(tmp_path):
         name="v",
         query="SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1",
         target_table="iceberg.analytics.v",
-        optimize_interval_seconds=3600,
+        maintenance_interval_seconds=3600,
+        optimize=False,
         optimize_file_size_threshold="128MB",
-        expire_snapshots_interval_seconds=86400,
         expire_snapshots_retention="14d",
     )]
     p = tmp_path / "views.yaml"
     save_views(views, p)
     loaded = load_views(p)[0]
-    assert loaded.optimize_interval_seconds == 3600
+    assert loaded.maintenance_interval_seconds == 3600
+    assert loaded.optimize is False
     assert loaded.optimize_file_size_threshold == "128MB"
-    assert loaded.expire_snapshots_interval_seconds == 86400
     assert loaded.expire_snapshots_retention == "14d"
 
 
 def test_save_views_omits_maintenance_defaults(tmp_path):
-    """Disabled ops and default retention values don't appear in YAML — the
-    common empty-maintenance view stays a short diff."""
+    """Default values (interval=0, all booleans True, default retentions)
+    don't appear in YAML — the common empty-maintenance view stays a short diff."""
     views = [ViewConfig(
         name="v",
         query="SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1",
@@ -422,21 +427,34 @@ def test_save_views_omits_maintenance_defaults(tmp_path):
     p = tmp_path / "views.yaml"
     save_views(views, p)
     text = p.read_text()
-    assert "optimize_interval_seconds" not in text
+    assert "maintenance_interval_seconds" not in text
+    assert "optimize" not in text          # default True
+    assert "expire_snapshots" not in text  # default True
+    assert "remove_orphan_files" not in text
     assert "optimize_file_size_threshold" not in text
-    assert "expire_snapshots_interval_seconds" not in text
-    assert "expire_snapshots_retention" not in text
-    assert "remove_orphan_files_interval_seconds" not in text
 
 
-@pytest.mark.parametrize("field,value", [
-    ("optimize_interval_seconds", -1),
-    ("expire_snapshots_interval_seconds", -60),
-    ("remove_orphan_files_interval_seconds", -3600),
-])
-def test_maintenance_rejects_negative_interval(field, value):
+def test_save_views_emits_disabled_op_toggle(tmp_path):
+    """A False boolean must round-trip through YAML even though it's falsy —
+    bug-prone area since the old save filter dropped any falsy value."""
+    views = [ViewConfig(
+        name="v",
+        query="SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1",
+        target_table="iceberg.analytics.v",
+        maintenance_interval_seconds=3600,
+        optimize=False,
+    )]
+    p = tmp_path / "views.yaml"
+    save_views(views, p)
+    text = p.read_text()
+    assert "optimize: false" in text
+    loaded = load_views(p)[0]
+    assert loaded.optimize is False
+
+
+def test_maintenance_rejects_negative_interval():
     with pytest.raises(ValueError, match=">= 0"):
-        validate_maintenance_config({field: value})
+        validate_maintenance_config({"maintenance_interval_seconds": -1})
 
 
 @pytest.mark.parametrize("field,value", [
@@ -456,15 +474,14 @@ def test_maintenance_rejects_bad_file_size_threshold(value):
         validate_maintenance_config({"optimize_file_size_threshold": value})
 
 
-def test_maintenance_accepts_valid(tmp_path):
-    """Sanity: a fully-loaded maintenance YAML passes validation and parses."""
-    # Covered by test_maintenance_fields_loaded already, but an explicit
-    # smoke via validate_maintenance_config is cheap insurance.
+def test_maintenance_accepts_valid():
+    """Sanity: a fully-shaped maintenance dict passes validation."""
     validate_maintenance_config({
-        "optimize_interval_seconds": 3600,
+        "maintenance_interval_seconds": 3600,
+        "optimize": True,
         "optimize_file_size_threshold": "128MB",
-        "expire_snapshots_interval_seconds": 86400,
+        "expire_snapshots": True,
         "expire_snapshots_retention": "7d",
-        "remove_orphan_files_interval_seconds": 604800,
+        "remove_orphan_files": True,
         "remove_orphan_files_retention": "30d",
     })
