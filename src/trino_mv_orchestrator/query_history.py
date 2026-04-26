@@ -58,16 +58,17 @@ CREATE TABLE IF NOT EXISTS maintenance_state (
 -- ``recent_queries`` and ``maintenance`` live in their own tables and are
 -- intentionally NOT mirrored here.
 CREATE TABLE IF NOT EXISTS view_status (
-    view              TEXT    PRIMARY KEY,
-    last_refresh      REAL,
-    last_duration     REAL,
-    last_action       TEXT    NOT NULL DEFAULT 'pending',
-    last_range        TEXT,
-    last_error        TEXT,
-    total_refreshes   INTEGER NOT NULL DEFAULT 0,
-    total_errors      INTEGER NOT NULL DEFAULT 0,
-    chunks_done       INTEGER NOT NULL DEFAULT 0,
-    chunks_total      INTEGER
+    view                  TEXT    PRIMARY KEY,
+    last_refresh          REAL,
+    last_duration         REAL,
+    last_action           TEXT    NOT NULL DEFAULT 'pending',
+    last_range            TEXT,
+    last_error            TEXT,
+    total_refreshes       INTEGER NOT NULL DEFAULT 0,
+    total_errors          INTEGER NOT NULL DEFAULT 0,
+    chunks_done           INTEGER NOT NULL DEFAULT 0,
+    chunks_total          INTEGER,
+    last_source_snapshot  INTEGER
 );
 """
 
@@ -212,6 +213,29 @@ class QueryHistory:
         if row is None:
             return None
         return dict(zip(_VIEW_STATUS_COLS, row))
+
+    # ── last_source_snapshot ──────────────────────────────────────────
+    # Lives on the view_status row but kept out of _VIEW_STATUS_COLS so the
+    # ViewStatus dataclass mirror can't accidentally clobber a fresh bookmark
+    # via upsert_view_status. Read once at the top of refresh_view, written
+    # once when a refresh (or compaction-only advance) commits.
+
+    async def get_last_source_snapshot(self, view: str) -> int | None:
+        async with self._db.execute(
+            "SELECT last_source_snapshot FROM view_status WHERE view = ?",
+            (view,),
+        ) as cur:
+            row = await cur.fetchone()
+        return row[0] if row and row[0] is not None else None
+
+    async def set_last_source_snapshot(self, view: str, snapshot_id: int) -> None:
+        await self._db.execute(
+            "INSERT INTO view_status (view, last_source_snapshot) VALUES (?, ?) "
+            "ON CONFLICT(view) DO UPDATE SET "
+            "last_source_snapshot = excluded.last_source_snapshot",
+            (view, snapshot_id),
+        )
+        await self._db.commit()
 
     # ── maintenance_state ─────────────────────────────────────────────
 

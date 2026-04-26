@@ -20,7 +20,6 @@ import pytest
 
 from trino_mv_orchestrator.config import ViewConfig
 from trino_mv_orchestrator.server import refresh_view
-from trino_mv_orchestrator.state import read_last_snapshot
 
 from ._driver import Cycle, Trade, fetch_target_rows, insert_trades_batch
 from ._oracle import OhlcvOracle
@@ -112,8 +111,9 @@ class TestSustainedStream:
     match the oracle row-for-row, and ``vs.total_refreshes`` must equal
     the cycle index.
 
-    Validates that snapshot bookkeeping (``read_last_snapshot`` /
-    ``write_last_snapshot``) advances correctly across many ticks and
+    Validates that snapshot bookkeeping (the SQLite-backed
+    ``last_source_snapshot`` bookmark on ``view_status``) advances
+    correctly across many ticks and
     that no cycle drops or duplicates rows.
     """
 
@@ -260,8 +260,8 @@ class TestCompactionInterleaved:
     ``refresh_view`` must:
 
       * Set ``vs.last_action = "skip"``.
-      * Advance ``read_last_snapshot`` past the compaction snapshot
-        (server.py:326-327) so the next tick starts from there.
+      * Advance the persisted bookmark past the compaction snapshot
+        so the next tick starts from there.
       * Leave target rows byte-identical to before the optimize.
 
     Then a subsequent append must refresh incrementally and pick up
@@ -330,7 +330,7 @@ class TestCompactionInterleaved:
                     f"{label}: optimize altered the target; expected unchanged"
                 )
                 # …and must advance the persisted source snapshot past the optimize op.
-                cur_snap = await read_last_snapshot(cursor, TARGET_TABLE)
+                cur_snap = await app_state.history.get_last_source_snapshot(VIEW.name)
                 assert cur_snap is not None and (
                     prev_snapshot is None or cur_snap != prev_snapshot
                 ), (
@@ -345,6 +345,6 @@ class TestCompactionInterleaved:
                     f"  expected: {expected}\n"
                     f"  actual:   {actual}"
                 )
-                prev_snapshot = await read_last_snapshot(cursor, TARGET_TABLE)
+                prev_snapshot = await app_state.history.get_last_source_snapshot(VIEW.name)
 
             prev_target_rows = actual

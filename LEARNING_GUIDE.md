@@ -60,13 +60,12 @@ flowchart TB
     Loop --> Refresh["refresh_view()"]
 
     Refresh --> Introspect["introspect.py<br/>columns + partitioning"]
-    Refresh --> State["state.py<br/>read/write snapshot id"]
+    Refresh --> History["query_history.py<br/>SQLite state.db<br/>(snapshot bookmark, view_status, recent queries)"]
     Refresh --> Detector["detector.py<br/>change detection"]
     Refresh --> Executor["executor.py<br/>MERGE / DELETE+INSERT"]
 
     Detector -. "metadata only" .-> Trino[("Trino + Iceberg")]
     Executor -. "MERGE" .-> Trino
-    State -. "ALTER TABLE properties" .-> Trino
     Introspect -. "DESCRIBE / SHOW CREATE" .-> Trino
 ```
 
@@ -80,7 +79,7 @@ flowchart TB
 | `detector.py` | Read `$snapshots` / `$all_entries`, decide refresh action, snap range |
 | `executor.py` | Build & run `MERGE` / `DELETE+INSERT` SQL |
 | `introspect.py` | Auto-discover query columns and source partitioning |
-| `state.py` | Read/write `mv.last_source_snapshot` from target's Iceberg properties |
+| `query_history.py` | SQLite-backed `state.db`: snapshot bookmark, `view_status` mirror, recent-query ring buffer, maintenance schedule |
 
 ---
 
@@ -91,7 +90,7 @@ sequenceDiagram
     participant L as refresh_loop
     participant R as refresh_view
     participant I as introspect
-    participant ST as state
+    participant H as QueryHistory<br/>(state.db)
     participant D as detector
     participant E as executor
     participant T as Trino
@@ -102,9 +101,8 @@ sequenceDiagram
     T-->>I: column types
     R->>T: CREATE TABLE IF NOT EXISTS target (partitioning from view.target_partitioning, else unpartitioned)
 
-    R->>ST: read_last_snapshot(target)
-    ST->>T: SELECT FROM target."$properties"
-    T-->>ST: last_snap_id (or None)
+    R->>H: get_last_source_snapshot(view)
+    H-->>R: last_snap_id (or None)
 
     R->>D: detect_changes(view, last_snap)
     D->>T: SELECT current snapshot from source.$snapshots
@@ -128,8 +126,7 @@ sequenceDiagram
         E->>T: DELETE FROM target then INSERT INTO target SELECT (full)
     end
 
-    R->>ST: write_last_snapshot(current_snap_id)
-    ST->>T: ALTER TABLE target SET PROPERTIES extra_properties
+    R->>H: set_last_source_snapshot(view, current_snap_id)
     R->>L: update metrics, status
 ```
 
@@ -283,21 +280,24 @@ WHEN NOT MATCHED THEN INSERT (...) VALUES (...)
 
 ## 10. State Persistence
 
-State lives **in the target table itself**, in Iceberg's `extra_properties`.
+State lives in a **SQLite `state.db`** mounted next to `views.yaml`. The
+per-view source-snapshot bookmark is one column on the `view_status` table,
+managed by `query_history.py`.
 
 ```mermaid
 flowchart LR
-    R["read: SELECT value FROM target.$properties<br/>WHERE key='mv.last_source_snapshot'"]
-    W["write: ALTER TABLE target SET PROPERTIES<br/>extra_properties = MAP(['mv.last_source_snapshot'], ['12345'])"]
-    R -.-> Iceberg[("target Iceberg table")]
-    W -.-> Iceberg
+    R["read: get_last_source_snapshot(view)<br/>SELECT last_source_snapshot FROM view_status WHERE view = ?"]
+    W["write: set_last_source_snapshot(view, 12345)<br/>INSERT … ON CONFLICT(view) DO UPDATE"]
+    R -.-> SQLite[("state.db")]
+    W -.-> SQLite
 ```
 
 **Consequences of this design:**
 
-- `DROP TABLE target` → state gone → next run does a full backfill. No external coordinator to clean up.
-- Two separate commits per refresh (MERGE + ALTER). A crash in between means redundant work next cycle, not data loss.
-- Requires Trino catalog config: `iceberg.allowed-extra-properties=mv.last_source_snapshot`.
+- No Trino-side configuration required — the catalog does not need `iceberg.allowed-extra-properties` set.
+- `state.db` lives alongside `views.yaml` so it survives container/image upgrades.
+- Two separate commits per refresh (MERGE in Trino + bookmark write in SQLite). A crash in between means redundant work next cycle, not data loss — `MERGE` is idempotent on the merge keys.
+- `DROP TABLE target` does NOT auto-clear the bookmark; to force a full refresh, delete the view (`DELETE /api/views/{name}` clears the SQLite row) and recreate it.
 
 ---
 
@@ -409,7 +409,7 @@ flowchart TB
         TC["test_config.py"]
         TS["test_server.py"]
         TI["test_introspect.py"]
-        TST["test_state.py"]
+        TQH["test_query_history.py"]
     end
     subgraph Int["tests/integration/  (~10 tests, real Trino + Iceberg + MinIO)"]
         TR["test_refresh.py"]
@@ -449,7 +449,7 @@ flowchart TB
 | Config loading | `config.py:140-173` |
 | Granularity inference | `config.py:29-57` |
 | View validation | `config.py:106-137` |
-| State read/write | `state.py:16-37` |
+| Snapshot bookmark + view_status persistence | `query_history.py` (`get_/set_last_source_snapshot`, `upsert_view_status`) |
 | Column discovery | `introspect.py:31-39` |
 | Partitioning discovery | `introspect.py:42-51` |
 

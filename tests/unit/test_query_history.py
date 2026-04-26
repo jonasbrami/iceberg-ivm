@@ -275,3 +275,67 @@ async def test_delete_view_purges_view_status(history):
     assert (await history.get_view_status("b"))["total_refreshes"] == 2
 
 
+# ── last_source_snapshot ──
+
+async def test_get_last_source_snapshot_unknown_view(history):
+    """No row at all → None (treated as FULL_REFRESH by the caller)."""
+    assert await history.get_last_source_snapshot("never-seen") is None
+
+
+async def test_get_last_source_snapshot_row_without_bookmark(history):
+    """Row exists from upsert_view_status but the bookmark column is NULL."""
+    await history.upsert_view_status("v", {"total_refreshes": 3})
+    assert await history.get_last_source_snapshot("v") is None
+
+
+async def test_set_then_get_last_source_snapshot(history):
+    await history.set_last_source_snapshot("v", 12345)
+    assert await history.get_last_source_snapshot("v") == 12345
+
+
+async def test_set_last_source_snapshot_updates(history):
+    await history.set_last_source_snapshot("v", 1)
+    await history.set_last_source_snapshot("v", 2)
+    assert await history.get_last_source_snapshot("v") == 2
+
+
+async def test_set_last_source_snapshot_does_not_clobber_other_columns(history):
+    """Bookmark writes and ViewStatus mirror writes touch the same row but
+    must stay orthogonal — set_last_source_snapshot must not reset
+    total_refreshes / last_action / etc. to defaults, and upsert_view_status
+    must not wipe the bookmark."""
+    await history.upsert_view_status("v", {
+        "last_refresh": 100.0,
+        "last_action": "full",
+        "total_refreshes": 7,
+    })
+    await history.set_last_source_snapshot("v", 99)
+
+    persisted = await history.get_view_status("v")
+    assert persisted["total_refreshes"] == 7
+    assert persisted["last_action"] == "full"
+    assert persisted["last_refresh"] == 100.0
+    assert await history.get_last_source_snapshot("v") == 99
+
+    # Reverse: a later upsert_view_status must leave the bookmark alone.
+    await history.upsert_view_status("v", {"total_refreshes": 8})
+    assert await history.get_last_source_snapshot("v") == 99
+
+
+async def test_last_source_snapshot_survives_reopen(tmp_path):
+    path = tmp_path / "state.db"
+    h1 = QueryHistory(path, limit=5)
+    await h1.open()
+    await h1.set_last_source_snapshot("v", 42)
+    await h1.close()
+
+    h2 = QueryHistory(path, limit=5)
+    await h2.open()
+    try:
+        assert await h2.get_last_source_snapshot("v") == 42
+    finally:
+        await h2.close()
+
+
+
+

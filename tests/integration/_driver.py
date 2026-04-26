@@ -9,9 +9,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 
 from trino_mv_orchestrator.config import Config, TrinoConfig, ServerConfig
-from trino_mv_orchestrator.server import AppState
+from trino_mv_orchestrator.query_history import QueryHistory
+from trino_mv_orchestrator.server import AppState, RECENT_QUERY_LIMIT
 
 
 @dataclass
@@ -39,13 +41,18 @@ class Cycle:
     note: str = ""
 
 
-def make_app_state(host: str, port: int, *, schema: str = "test_schema") -> AppState:
+async def make_app_state(
+    host: str, port: int, *, schema: str = "test_schema",
+    state_db_path: Path | str | None = None,
+) -> AppState:
     """Build a minimal ``AppState`` wired to the docker-compose Trino.
 
-    No SQLite history (``history`` stays ``None``); ``_record_query``
-    falls back to the in-memory ring buffer (server.py:286-290). No
-    config files on disk — ``config_path`` / ``views_path`` are unused
-    once ``config`` is set, since refresh_view never reloads.
+    Opens a real ``QueryHistory`` so the SQLite-backed
+    ``last_source_snapshot`` bookmark works end-to-end. No config files
+    on disk — ``config_path`` / ``views_path`` are unused once
+    ``config`` is set, since refresh_view never reloads. Caller is
+    responsible for awaiting ``s.history.close()`` (see the
+    ``app_state`` fixture in ``conftest.py``).
     """
     s = AppState()
     s.config = Config(
@@ -59,6 +66,10 @@ def make_app_state(host: str, port: int, *, schema: str = "test_schema") -> AppS
         views=[],
         server=ServerConfig(),
     )
+    if state_db_path is not None:
+        h = QueryHistory(state_db_path, limit=RECENT_QUERY_LIMIT)
+        await h.open()
+        s.history = h
     return s
 
 

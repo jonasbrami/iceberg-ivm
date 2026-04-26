@@ -1,7 +1,7 @@
 """Tests for the FastAPI server endpoints."""
 import asyncio
 import textwrap
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -494,9 +494,6 @@ async def test_refresh_view_runs_maintenance(setup_state):
             chunks_done=1, chunks_total=1,
         )
 
-    async def fake_write(cursor, target, snap_id): pass
-    async def fake_read(cursor, target): return None
-
     maintenance_calls: list[tuple[str, dict]] = []
 
     async def fake_maintenance(cursor, target, op, params):
@@ -508,8 +505,6 @@ async def test_refresh_view_runs_maintenance(setup_state):
 
     with patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()), \
          patch.object(server_mod, "discover_columns", fake_discover), \
-         patch.object(server_mod, "read_last_snapshot", fake_read), \
-         patch.object(server_mod, "write_last_snapshot", fake_write), \
          patch.object(server_mod, "detect_changes", fake_detect), \
          patch.object(server_mod, "execute_refresh", fake_execute_refresh), \
          patch.object(server_mod, "execute_maintenance", fake_maintenance):
@@ -758,13 +753,8 @@ async def test_concurrent_triggers_coalesce_into_single_followup(setup_state):
     async def fake_discover_columns(c, q):
         return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
 
-    async def fake_read(c, t): return None
-    async def fake_write(c, t, snap): pass
-
     with patch.object(server_mod, "get_trino_connection", lambda s: FakeConn()), \
          patch.object(server_mod, "discover_columns", fake_discover_columns), \
-         patch.object(server_mod, "read_last_snapshot", fake_read), \
-         patch.object(server_mod, "write_last_snapshot", fake_write), \
          patch.object(server_mod, "detect_changes", fake_detect), \
          patch.object(server_mod, "execute_refresh", slow_refresh):
         worker = asyncio.create_task(server_mod.view_worker(setup_state, view.name))
@@ -974,7 +964,6 @@ async def test_refresh_view_advances_state_on_empty_append_no_change(setup_state
     from trino_mv_orchestrator.introspect import ColumnInfo
 
     view = setup_state.config.views[0]
-    write_calls: list[int] = []
 
     class FakeConn:
         async def cursor(self): return FakeCursor()
@@ -986,10 +975,9 @@ async def test_refresh_view_advances_state_on_empty_append_no_change(setup_state
         async def fetchone(self): return None
         async def fetchall(self): return []
 
-    async def fake_write(cursor, target, snap_id):
-        write_calls.append(snap_id)
-
-    async def fake_read(cursor, target): return 100
+    history = AsyncMock()
+    history.get_last_source_snapshot.return_value = 100
+    setup_state.history = history
 
     async def fake_detect(*args, **kwargs):
         return ChangeResult(action=RefreshAction.NO_CHANGE, current_snapshot=200)
@@ -999,13 +987,14 @@ async def test_refresh_view_advances_state_on_empty_append_no_change(setup_state
 
     with patch.object(server_mod, "get_trino_connection", lambda s: FakeConn()), \
          patch.object(server_mod, "discover_columns", fake_discover_columns), \
-         patch.object(server_mod, "read_last_snapshot", fake_read), \
-         patch.object(server_mod, "write_last_snapshot", fake_write), \
          patch.object(server_mod, "detect_changes", fake_detect):
         await server_mod.refresh_view(setup_state, view)
 
-    assert write_calls == [200], (
-        f"expected write_last_snapshot(200), got {write_calls}. "
+    snapshot_calls = [
+        c.args[1] for c in history.set_last_source_snapshot.await_args_list
+    ]
+    assert snapshot_calls == [200], (
+        f"expected set_last_source_snapshot(view, 200), got {snapshot_calls}. "
         f"view status: {setup_state.view_statuses[view.name]!r}"
     )
 
@@ -1031,9 +1020,6 @@ async def test_refresh_view_appends_recent_queries(setup_state, client):
         async def fetchone(self): return None
         async def fetchall(self): return []
 
-    async def fake_write(cursor, target, snap_id): pass
-    async def fake_read(cursor, target): return None
-
     async def fake_detect(*args, **kwargs):
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=1)
 
@@ -1051,8 +1037,6 @@ async def test_refresh_view_appends_recent_queries(setup_state, client):
 
     with patch.object(server_mod, "get_trino_connection", lambda s: FakeConn()), \
          patch.object(server_mod, "discover_columns", fake_discover_columns), \
-         patch.object(server_mod, "read_last_snapshot", fake_read), \
-         patch.object(server_mod, "write_last_snapshot", fake_write), \
          patch.object(server_mod, "detect_changes", fake_detect), \
          patch.object(server_mod, "execute_refresh", fake_execute_refresh):
         await server_mod.refresh_view(setup_state, view)
@@ -1094,8 +1078,6 @@ async def test_refresh_persists_queries_and_hydrates_on_restart(
         async def fetchone(self): return None
         async def fetchall(self): return []
 
-    async def fake_write(cursor, target, snap_id): pass
-    async def fake_read(cursor, target): return None
     async def fake_detect(*a, **kw):
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=1)
     async def fake_discover(cursor, query):
@@ -1110,8 +1092,6 @@ async def test_refresh_persists_queries_and_hydrates_on_restart(
     try:
         with patch.object(server_mod, "get_trino_connection", lambda s: FakeConn()), \
              patch.object(server_mod, "discover_columns", fake_discover), \
-             patch.object(server_mod, "read_last_snapshot", fake_read), \
-             patch.object(server_mod, "write_last_snapshot", fake_write), \
              patch.object(server_mod, "detect_changes", fake_detect), \
              patch.object(server_mod, "execute_refresh", fake_execute_refresh):
             await server_mod.refresh_view(setup_state, view)
@@ -1180,8 +1160,6 @@ async def test_refresh_persists_view_status_counters(setup_state, tmp_path):
         async def fetchone(self): return None
         async def fetchall(self): return []
 
-    async def fake_write(c, t, snap_id): pass
-    async def fake_read(c, t): return None
     async def fake_detect(*a, **kw):
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=1)
     async def fake_discover(c, q):
@@ -1196,8 +1174,6 @@ async def test_refresh_persists_view_status_counters(setup_state, tmp_path):
     try:
         with patch.object(server_mod, "get_trino_connection", lambda s: FakeConn()), \
              patch.object(server_mod, "discover_columns", fake_discover), \
-             patch.object(server_mod, "read_last_snapshot", fake_read), \
-             patch.object(server_mod, "write_last_snapshot", fake_write), \
              patch.object(server_mod, "detect_changes", fake_detect), \
              patch.object(server_mod, "execute_refresh", fake_execute_refresh):
             await server_mod.refresh_view(setup_state, view)
@@ -1276,8 +1252,6 @@ async def test_refresh_then_restart_round_trips_total_refreshes(setup_state, tmp
         async def fetchone(self): return None
         async def fetchall(self): return []
 
-    async def fake_write(c, t, snap_id): pass
-    async def fake_read(c, t): return None
     async def fake_detect(*a, **kw):
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=1)
     async def fake_discover(c, q):
@@ -1292,8 +1266,6 @@ async def test_refresh_then_restart_round_trips_total_refreshes(setup_state, tmp
     try:
         with patch.object(server_mod, "get_trino_connection", lambda s: FakeConn()), \
              patch.object(server_mod, "discover_columns", fake_discover), \
-             patch.object(server_mod, "read_last_snapshot", fake_read), \
-             patch.object(server_mod, "write_last_snapshot", fake_write), \
              patch.object(server_mod, "detect_changes", fake_detect), \
              patch.object(server_mod, "execute_refresh", fake_execute_refresh):
             await server_mod.refresh_view(setup_state, view)
@@ -1333,7 +1305,6 @@ async def test_refresh_failure_persists_last_error(setup_state, tmp_path):
         async def fetchone(self): return None
         async def fetchall(self): return []
 
-    async def fake_read(c, t): return None
     async def fake_detect(*a, **kw):
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=1)
     async def fake_discover(c, q):
@@ -1345,7 +1316,6 @@ async def test_refresh_failure_persists_last_error(setup_state, tmp_path):
     try:
         with patch.object(server_mod, "get_trino_connection", lambda s: FakeConn()), \
              patch.object(server_mod, "discover_columns", fake_discover), \
-             patch.object(server_mod, "read_last_snapshot", fake_read), \
              patch.object(server_mod, "detect_changes", fake_detect), \
              patch.object(server_mod, "execute_refresh", fake_execute_refresh):
             await server_mod.refresh_view(setup_state, view)
@@ -1371,13 +1341,16 @@ async def test_post_restart_no_change_clears_chunks_total(setup_state, tmp_path)
     await h.open()
     setup_state.history = h
     try:
-        # Pretend the previous process was killed mid-backfill.
+        # Pretend the previous process was killed mid-backfill. The current
+        # source snapshot already matches the bookmark — that's the NO_CHANGE
+        # path the test exercises.
         await h.upsert_view_status(view.name, {
             "last_action": "chunked_full",
             "chunks_done": 5,
             "chunks_total": 10,
             "total_refreshes": 0,
         })
+        await h.set_last_source_snapshot(view.name, 1)
         setup_state.view_statuses[view.name] = ViewStatus(name=view.name)
         await server_mod.hydrate_view_state(setup_state)
         assert setup_state.view_statuses[view.name].chunks_total == 10
@@ -1392,7 +1365,6 @@ async def test_post_restart_no_change_clears_chunks_total(setup_state, tmp_path)
             async def fetchone(self): return None
             async def fetchall(self): return []
 
-        async def fake_read(c, t): return 1
         async def fake_detect(*a, **kw):
             return ChangeResult(action=RefreshAction.NO_CHANGE, current_snapshot=1)
         async def fake_discover(c, q):
@@ -1400,7 +1372,6 @@ async def test_post_restart_no_change_clears_chunks_total(setup_state, tmp_path)
 
         with patch.object(server_mod, "get_trino_connection", lambda s: FakeConn()), \
              patch.object(server_mod, "discover_columns", fake_discover), \
-             patch.object(server_mod, "read_last_snapshot", fake_read), \
              patch.object(server_mod, "detect_changes", fake_detect):
             await server_mod.refresh_view(setup_state, view)
 
@@ -1605,7 +1576,7 @@ class _FakeCursor:
     async def fetchall(self): return []
 
 
-async def test_refresh_view_chunked_backfill_completes(setup_state):
+async def test_refresh_view_chunked_backfill_completes(setup_state, tmp_path):
     """When ``full_refresh_chunk`` is set and detection says FULL_REFRESH, the
     worker must surface ``last_action="chunked_full"``, iterate chunks from
     the executor, and write ``last_source_snapshot`` on clean completion."""
@@ -1619,7 +1590,10 @@ async def test_refresh_view_chunked_backfill_completes(setup_state):
     view = _install_chunked_view(setup_state)
     setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
     setup_state._stop = False
-    write_calls: list[int] = []
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
 
     async def fake_detect(*a, **kw):
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=42)
@@ -1638,33 +1612,29 @@ async def test_refresh_view_chunked_backfill_completes(setup_state):
                 chunks_done=i, chunks_total=3,
             )
 
-    async def fake_write(cursor, target, snap_id):
-        write_calls.append(snap_id)
+    try:
+        with patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()), \
+             patch.object(server_mod, "discover_columns", fake_discover), \
+             patch.object(server_mod, "detect_changes", fake_detect), \
+             patch.object(server_mod, "execute_refresh", fake_execute_refresh):
+            await server_mod.refresh_view(setup_state, view)
 
-    async def fake_read(cursor, target): return None
-
-    with patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()), \
-         patch.object(server_mod, "discover_columns", fake_discover), \
-         patch.object(server_mod, "read_last_snapshot", fake_read), \
-         patch.object(server_mod, "write_last_snapshot", fake_write), \
-         patch.object(server_mod, "detect_changes", fake_detect), \
-         patch.object(server_mod, "execute_refresh", fake_execute_refresh):
-        await server_mod.refresh_view(setup_state, view)
-
-    assert write_calls == [42]  # snapshot written on clean completion
-    vs = setup_state.view_statuses[view.name]
-    assert vs.last_action == "chunked_full"
-    assert vs.chunks_done == 3
-    assert vs.chunks_total is None  # cleared on clean completion
-    assert vs.total_refreshes == 1
-    # Three chunks appended newest-first via the history ring buffer.
-    assert [q.query_id for q in vs.recent_queries] == ["q3", "q2", "q1"]
+        assert await h.get_last_source_snapshot(view.name) == 42
+        vs = setup_state.view_statuses[view.name]
+        assert vs.last_action == "chunked_full"
+        assert vs.chunks_done == 3
+        assert vs.chunks_total is None  # cleared on clean completion
+        assert vs.total_refreshes == 1
+        # Three chunks appended newest-first via the history ring buffer.
+        assert [q.query_id for q in vs.recent_queries] == ["q3", "q2", "q1"]
+    finally:
+        await h.close()
 
 
-async def test_refresh_view_interrupt_skips_last_snapshot_write(setup_state):
+async def test_refresh_view_interrupt_skips_last_snapshot_write(setup_state, tmp_path):
     """When ``s._stop`` trips between chunks, ``refresh_view`` breaks out of
     the async-for without writing ``last_source_snapshot`` (next tick resumes
-    from target metadata) and without incrementing ``total_refreshes``.
+    from the persisted bookmark) and without incrementing ``total_refreshes``.
     Partial chunks already appended to recent_queries are preserved."""
     from datetime import datetime, timezone
 
@@ -1675,7 +1645,10 @@ async def test_refresh_view_interrupt_skips_last_snapshot_write(setup_state):
 
     view = _install_chunked_view(setup_state)
     setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
-    write_calls: list[int] = []
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
 
     async def fake_detect(*a, **kw):
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=99)
@@ -1699,28 +1672,25 @@ async def test_refresh_view_interrupt_skips_last_snapshot_write(setup_state):
             started_at=2.0, elapsed_ms=100.0, chunks_done=2, chunks_total=3,
         )
 
-    async def fake_write(cursor, target, snap_id):
-        write_calls.append(snap_id)
+    try:
+        with patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()), \
+             patch.object(server_mod, "discover_columns", fake_discover), \
+             patch.object(server_mod, "detect_changes", fake_detect), \
+             patch.object(server_mod, "execute_refresh", fake_execute_refresh):
+            await server_mod.refresh_view(setup_state, view)
 
-    async def fake_read(cursor, target): return None
-
-    with patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()), \
-         patch.object(server_mod, "discover_columns", fake_discover), \
-         patch.object(server_mod, "read_last_snapshot", fake_read), \
-         patch.object(server_mod, "write_last_snapshot", fake_write), \
-         patch.object(server_mod, "detect_changes", fake_detect), \
-         patch.object(server_mod, "execute_refresh", fake_execute_refresh):
-        await server_mod.refresh_view(setup_state, view)
-
-    assert write_calls == []   # interrupt: no snapshot bookmark write
-    vs = setup_state.view_statuses[view.name]
-    assert vs.last_action == "chunked_full"
-    assert vs.total_refreshes == 0
-    # First chunk made it into recent_queries before the stop flag tripped.
-    assert any(q.query_id == "q1" for q in vs.recent_queries)
-    assert vs.last_duration == pytest.approx(0.25)
-    assert vs.chunks_done == 1
-    assert vs.chunks_total == 3
+        # Interrupt: the bookmark must not have been written.
+        assert await h.get_last_source_snapshot(view.name) is None
+        vs = setup_state.view_statuses[view.name]
+        assert vs.last_action == "chunked_full"
+        assert vs.total_refreshes == 0
+        # First chunk made it into recent_queries before the stop flag tripped.
+        assert any(q.query_id == "q1" for q in vs.recent_queries)
+        assert vs.last_duration == pytest.approx(0.25)
+        assert vs.chunks_done == 1
+        assert vs.chunks_total == 3
+    finally:
+        await h.close()
 
 
 def test_chunk_metrics_defined():
