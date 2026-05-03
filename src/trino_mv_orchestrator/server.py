@@ -27,9 +27,9 @@ from trino_mv_orchestrator.config import (
     load_views,
     save_views,
     validate_chunk_compatibility,
-    validate_identifier,
     validate_maintenance_config,
     validate_qualified_name,
+    validate_view_name,
 )
 from trino_mv_orchestrator.detector import RefreshAction, detect_changes
 from trino_mv_orchestrator.executor import (
@@ -643,7 +643,10 @@ _GRAN_OPTIONS = [{"value": "", "label": "— none (single-shot) —"}] + [
     {"value": g, "label": g} for g in ("hour", "day", "week", "month", "quarter", "year")
 ]
 _FIELD_META: dict[str, dict] = {
-    "name": {"required": True, "placeholder": "ohlcv_1m", "disabled_on_edit": True},
+    "name": {"placeholder": "defaults to target table",
+             "disabled_on_edit": True,
+             "help": ("optional label used to identify this view in the API and UI. "
+                      "Leave blank to default to the target table FQDN.")},
     "query": {"required": True, "type": "text", "rows": 10, "disabled_on_edit": True,
               "placeholder": (
                   "SELECT symbol,\n       date_trunc('minute', ts) AS minute,\n"
@@ -655,7 +658,9 @@ _FIELD_META: dict[str, dict] = {
                        "derived automatically from the query.")},
     "target_table": {"required": True, "group": "target",
                      "placeholder": "iceberg.analytics.my_view"},
-    "target_partitioning": {"group": "target", "placeholder": "inherits from source"},
+    "target_partitioning": {"group": "target",
+                            "placeholder": "ARRAY['day(minute)']",
+                            "help": "unpartitioned if blank"},
     "refresh_interval_seconds": {"min": 1, "suffix": "seconds", "label": "Refresh Interval"},
     "full_refresh_chunk": {"type": "select", "group": "target", "options": _GRAN_OPTIONS,
                            "label": "Full Refresh Chunk Size",
@@ -713,13 +718,32 @@ VIEW_FORM_SCHEMA: list[dict] = _build_form_schema()
 
 
 def _build_view_create_model() -> type[BaseModel]:
-    """Pydantic ViewCreate model auto-derived from ViewConfig fields."""
+    """Pydantic ViewCreate model auto-derived from ViewConfig fields.
+
+    ``name`` is optional at the API boundary — both ``""`` and ``null``
+    round-trip and are substituted with ``target_table`` inside the create
+    handler. The ``str | None`` typing keeps any reasonable client (UI
+    JS that emits ``null`` for blank optional fields, curl, etc.) from
+    needing to know our defaulting rule.
+    """
     fields_spec: dict[str, tuple] = {}
     for f in dataclasses.fields(ViewConfig):
-        default = ... if f.default is dataclasses.MISSING else f.default
-        fields_spec[f.name] = (_VIEW_TYPES[f.name], default)
+        if f.name == "name":
+            field_type: object = typing.Optional[str]
+            default = None
+        else:
+            field_type = _VIEW_TYPES[f.name]
+            default = ... if f.default is dataclasses.MISSING else f.default
+        fields_spec[f.name] = (field_type, default)
+
+    def _check_name(cls, v):
+        if not v:
+            return v
+        validate_view_name(v, "name")
+        return v
+
     validators = {
-        "_v_name": field_validator("name")(classmethod(lambda cls, v: (validate_identifier(v, "name"), v)[1])),
+        "_v_name": field_validator("name")(classmethod(_check_name)),
         "_v_target_table": field_validator("target_table")(classmethod(
             lambda cls, v: (validate_qualified_name(v, "target_table"), v)[1])),
     }
@@ -817,8 +841,17 @@ def create_view(
 ) -> ViewResponse:
     if not s.config:
         raise HTTPException(500, "config not loaded")
-    if any(v.name == body.name for v in s.config.views):
-        raise HTTPException(409, f"view '{body.name}' already exists")
+
+    # Default name → target_table FQDN. Lets API/UI callers omit a redundant
+    # label when they're happy to identify the view by where it writes.
+    name = body.name or body.target_table
+    try:
+        validate_view_name(name, "name")
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+
+    if any(v.name == name for v in s.config.views):
+        raise HTTPException(409, f"view '{name}' already exists")
 
     # Validate the query — raises on any violation.  Rejected queries never
     # make it into saved state.
@@ -832,6 +865,7 @@ def create_view(
     # Normalize the UI's empty-string sentinel ("single-shot") to None so it
     # round-trips through YAML the same way YAML-loaded views do.
     payload = body.model_dump()
+    payload["name"] = name
     if not payload.get("full_refresh_chunk"):
         payload["full_refresh_chunk"] = None
     if not payload.get("optimize_file_size_threshold"):
@@ -842,11 +876,11 @@ def create_view(
     save_views(new_views, s.views_path)
     s.config = new_cfg
     s.views_mtime = s.views_path.stat().st_mtime
-    s.view_statuses[body.name] = ViewStatus(name=body.name)
+    s.view_statuses[name] = ViewStatus(name=name)
     VIEWS_CONFIGURED.set(len(new_views))
-    log.info("created view %r via API", body.name)
+    log.info("created view %r via API", name)
 
-    return _view_to_response(new_view, s.view_statuses[body.name])
+    return _view_to_response(new_view, s.view_statuses[name])
 
 
 @app.put("/api/views/{name}")
@@ -865,7 +899,7 @@ def update_view(
     existing = next((v for v in s.config.views if v.name == name), None)
     if not existing:
         raise HTTPException(404, f"view '{name}' not found")
-    if body.name != name:
+    if body.name and body.name != name:
         raise HTTPException(422, "name cannot be changed; delete and recreate the view instead")
     if body.query.strip() != existing.query.strip():
         raise HTTPException(422, "query cannot be changed; delete and recreate the view instead")
@@ -877,6 +911,7 @@ def update_view(
         raise HTTPException(422, str(exc))
 
     payload = body.model_dump()
+    payload["name"] = name
     if not payload.get("full_refresh_chunk"):
         payload["full_refresh_chunk"] = None
     if not payload.get("optimize_file_size_threshold"):

@@ -16,6 +16,10 @@ wheels/
 config.yaml
 views.yaml
 
+# Orchestrator state DB (created by running the service)
+*.db
+*.db-journal
+
 # Editor / local dev
 .vscode/
 local-run/

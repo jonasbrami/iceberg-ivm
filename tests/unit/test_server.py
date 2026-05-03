@@ -178,10 +178,74 @@ def test_create_view_invalid_name(client):
     """SQL injection via view name should be rejected."""
     r = client.post("/api/views", json={
         "name": "bad-name",
-        "target_table": "iceberg.analytics.bad-name",
+        "target_table": "iceberg.analytics.bad_name",
         "query": "SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1",
     })
     assert r.status_code == 422
+
+
+def test_create_view_omits_name_defaults_to_target_table(client, setup_state):
+    """Name is optional — when omitted (or empty) it defaults to the
+    target_table FQDN so callers don't have to invent a redundant label."""
+    r = client.post("/api/views", json={
+        "target_table": "iceberg.analytics.no_name_view",
+        "query": (
+            "SELECT date_trunc('day', ts) AS d FROM iceberg.db.t GROUP BY 1"
+        ),
+    })
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["name"] == "iceberg.analytics.no_name_view"
+    assert any(
+        v.name == "iceberg.analytics.no_name_view" for v in setup_state.config.views
+    )
+
+
+def test_create_view_blank_name_defaults_to_target_table(client):
+    """An explicit empty-string name is treated the same as omitting the field."""
+    r = client.post("/api/views", json={
+        "name": "",
+        "target_table": "iceberg.analytics.blank_name_view",
+        "query": (
+            "SELECT date_trunc('day', ts) AS d FROM iceberg.db.t GROUP BY 1"
+        ),
+    })
+    assert r.status_code == 201, r.text
+    assert r.json()["name"] == "iceberg.analytics.blank_name_view"
+
+
+def test_create_view_null_name_defaults_to_target_table(client):
+    """The web UI's buildBody emits null for blank non-required string fields.
+    The API must accept that shape — regression for an earlier version that
+    typed name as str (rejected null with a 422)."""
+    r = client.post("/api/views", json={
+        "name": None,
+        "target_table": "iceberg.analytics.null_name_view",
+        "query": (
+            "SELECT date_trunc('day', ts) AS d FROM iceberg.db.t GROUP BY 1"
+        ),
+    })
+    assert r.status_code == 201, r.text
+    assert r.json()["name"] == "iceberg.analytics.null_name_view"
+
+
+def test_create_view_with_dotted_fqdn_name(client):
+    """A dotted-FQDN name (the default behavior shape) round-trips through
+    POST and is accessible via subsequent /api/views/{name} routes."""
+    fqdn = "iceberg.analytics.dotted_view"
+    r = client.post("/api/views", json={
+        "target_table": fqdn,
+        "query": (
+            "SELECT date_trunc('day', ts) AS d FROM iceberg.db.t GROUP BY 1"
+        ),
+    })
+    assert r.status_code == 201
+    assert r.json()["name"] == fqdn
+    # GET-via-list returns it
+    listed = {v["name"] for v in client.get("/api/views").json()}
+    assert fqdn in listed
+    # DELETE by FQDN-name path-param works
+    assert client.delete(f"/api/views/{fqdn}").status_code == 204
 
 
 def test_create_duplicate(client):
@@ -275,6 +339,28 @@ def test_view_schema_query_field_is_disabled_on_edit(client):
     schema = client.get("/api/views/schema").json()
     query_field = next(f for f in schema if f["name"] == "query")
     assert query_field.get("disabled_on_edit") is True
+
+
+def test_view_schema_name_field_is_optional(client):
+    """The name field is optional in the form schema — UI shows '(optional)' /
+    placeholder hints that it defaults to the target table."""
+    schema = client.get("/api/views/schema").json()
+    name_field = next(f for f in schema if f["name"] == "name")
+    assert name_field["required"] is False
+    assert name_field.get("disabled_on_edit") is True
+
+
+def test_update_view_blank_name_is_accepted(client, setup_state):
+    """PUT with a blank name is treated as 'same as URL', not as a rename."""
+    r = client.put("/api/views/test_view", json={
+        "name": "",
+        "target_table": "iceberg.analytics.test_view",
+        "query": _EXISTING_QUERY,
+        "refresh_interval_seconds": 120,
+    })
+    assert r.status_code == 200, r.text
+    updated = next(v for v in setup_state.config.views if v.name == "test_view")
+    assert updated.refresh_interval_seconds == 120
 
 
 # ── full_refresh_chunk via the REST API (#32) ──
