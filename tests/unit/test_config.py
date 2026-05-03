@@ -165,8 +165,16 @@ def test_missing_name(tmp_path):
 
 def test_invalid_view_name(tmp_path):
     bad = VALID_VIEWS.replace("name: ohlcv_1m", "name: drop-table")
-    with pytest.raises(ValueError, match="valid SQL identifier"):
+    with pytest.raises(ValueError, match="valid view name"):
         load_views(write_views(tmp_path, bad))
+
+
+def test_view_name_can_be_qualified_fqdn(tmp_path):
+    """A name with dots (e.g. matching the target_table FQDN) is accepted —
+    enables the API/UI default of name = target_table."""
+    fqdn = VALID_VIEWS.replace("name: ohlcv_1m", "name: iceberg.analytics.ohlcv_1m")
+    views = load_views(write_views(tmp_path, fqdn))
+    assert views[0].name == "iceberg.analytics.ohlcv_1m"
 
 
 def test_invalid_target_table(tmp_path):

@@ -49,6 +49,21 @@ def validate_qualified_name(value: str, field_name: str) -> None:
         )
 
 
+def validate_view_name(value: str, field_name: str = "name") -> None:
+    """Accept a bare SQL identifier (`my_view`) or a dotted qualified name
+    (`iceberg.analytics.my_view`).
+
+    Looser than ``validate_identifier`` because a view's ``name`` defaults to
+    its ``target_table`` FQDN when the user doesn't supply one explicitly —
+    so the FQDN form must round-trip cleanly through validation.
+    """
+    if not QUALIFIED_NAME_RE.match(value):
+        raise ValueError(
+            f"{field_name}: {value!r} is not a valid view name "
+            "(must be a SQL identifier or a dotted qualified name)"
+        )
+
+
 _MAINTENANCE_OPS = ("optimize", "expire_snapshots", "remove_orphan_files")
 _DURATION_RE = re.compile(r"^\d+[smhd]$")     # Trino duration: s/m/h/d only
 _DATASIZE_RE = re.compile(r"^\d+(B|KB|MB|GB|TB)$")
@@ -170,7 +185,7 @@ def _parse_view(raw: dict) -> ViewConfig:
     if missing:
         raise ValueError(f"view missing required fields: {sorted(missing)}")
 
-    validate_identifier(raw["name"], "name")
+    validate_view_name(raw["name"], "name")
     validate_qualified_name(raw["target_table"], "target_table")
 
     # Full query validation — source_table, filter_column, granularity,
