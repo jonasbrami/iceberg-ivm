@@ -305,18 +305,19 @@ flowchart LR
 
 Two YAML files.
 
-### `config.yaml` — connection + server
+### `config.yaml` — server + per-deployment Trino catalog/schema
+
+URL, user, and password come from the environment (`TRINO_URL`,
+`TRINO_USER`, `TRINO_PASSWORD`) — never from this file. Only
+`catalog` and `schema` live in YAML:
 
 ```yaml
 server:
   port: 8000
   config_reload_interval_seconds: 30
 trino:
-  host: localhost
-  port: 8080
   catalog: iceberg
   schema: analytics
-  user: iceberg-ivm
 ```
 
 ### Views — defined inline or in a separate `views.yaml`

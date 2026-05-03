@@ -151,7 +151,7 @@ operates in UTC, aligning with `expand_to_bucket_bounds` by construction.
 
 ### Append-only source assumption
 
-iceberg-ivm assumes source tables are append-only. The only
+The service assumes source tables are append-only. The only
 legitimate Iceberg snapshot operations are:
 
 - `append` — real new data, drives incremental refresh.

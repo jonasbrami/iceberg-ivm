@@ -3,18 +3,18 @@
 A simple **Iceberg IVM (incremental view maintenance) controller** that delegates
 all computation to Trino.
 
-iceberg-ivm owns the control plane — view definitions, change detection,
+The service owns the control plane — view definitions, change detection,
 refresh scheduling, watermarks — while Trino executes the actual SQL against
 Iceberg tables. Change detection runs on Iceberg file-level metadata only;
 when source data changes, only the affected time range is recomputed from
 complete source data, guaranteeing correct aggregations. Refreshes are atomic
 via `MERGE INTO`.
 
-**Lightweight by design.** iceberg-ivm itself moves no data and holds no
+**Lightweight by design.** The service itself moves no data and holds no
 table contents — it only reads Iceberg metadata (`$snapshots`, `$all_entries`)
 and issues SQL to Trino. All data lives in Iceberg; all scans and writes
-happen inside Trino. iceberg-ivm's resident state is a handful of
-per-view status counters.
+happen inside Trino. Its resident state is a handful of per-view status
+counters.
 
 **Materialized views are Iceberg tables, which makes them chainable.** Because
 each target is a first-class Iceberg table, it can be the *source* of another
@@ -129,7 +129,7 @@ sequenceDiagram
 
 ### Iceberg metadata: what we read and why
 
-iceberg-ivm treats Iceberg's metadata tables as a small, structured
+The service treats Iceberg's metadata tables as a small, structured
 log it can poll cheaply. It never scans source *data* for change
 detection — just the metadata describing what data exists.
 
@@ -278,7 +278,7 @@ per-environment deployments only need to set a few env vars.
 | `TRINO_USER` | yes | Trino username. |
 | `TRINO_PASSWORD` | no | BasicAuth password. Omit (or leave empty) for anonymous access — e.g. the local dev compose stack. |
 
-iceberg-ivm refuses to start if `TRINO_URL` or `TRINO_USER` is missing.
+The service refuses to start if `TRINO_URL` or `TRINO_USER` is missing.
 
 ### 2. Create two YAML files
 
@@ -312,7 +312,7 @@ views:
     refresh_interval_seconds: 30
 ```
 
-iceberg-ivm parses each query and derives `source_table`, `filter_column`,
+The service parses each query and derives `source_table`, `filter_column`,
 `filter_granularity`, and `merge_keys` from it. At refresh time the time-range
 WHERE predicate is AST-injected automatically — there is no `{range_filter}`
 placeholder. Column types are auto-discovered via `DESCRIBE OUTPUT` and the
