@@ -1,7 +1,7 @@
 [project]
 name = "iceberg-ivm"
 dynamic = ["version"]
-description = "Metadata-driven incremental materialized view orchestrator for Trino/Iceberg"
+description = "Incremental view maintenance for Iceberg tables on Trino"
 readme = "README.md"
 authors = [
     { name = "Jonas Brami", email = "jonasbrami@gmail.com" }

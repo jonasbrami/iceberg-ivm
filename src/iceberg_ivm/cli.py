@@ -14,7 +14,7 @@ from iceberg_ivm.server import app, set_config_path, set_views_path
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="iceberg-ivm",
-        description="Metadata-driven incremental MV orchestrator for Trino/Iceberg",
+        description="Incremental view maintenance for Iceberg tables on Trino",
     )
     parser.add_argument(
         "-c", "--config",

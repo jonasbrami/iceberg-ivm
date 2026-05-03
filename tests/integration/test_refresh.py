@@ -1,4 +1,4 @@
-"""End-to-end integration tests for the MV orchestrator.
+"""End-to-end integration tests for iceberg-ivm.
 
 Requires: docker compose -f tests/docker-compose.yml up -d
 """

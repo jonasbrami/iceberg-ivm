@@ -390,7 +390,7 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
             vs.last_action = "skip"
             # Clear any lingering in-flight chunked-backfill progress that may
             # have been hydrated from view_status after a mid-backfill restart.
-            # If the source has caught up while the orchestrator was down, the
+            # If the source has caught up while iceberg-ivm was down, the
             # next tick is NO_CHANGE — but the persisted chunks_total would
             # still claim a backfill is in flight. The committed bookmark
             # (last_source_snapshot) is the source of truth here.

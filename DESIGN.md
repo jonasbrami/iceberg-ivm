@@ -109,7 +109,7 @@ time range of new data without scanning data files.
 
 ### Timezone assumption
 
-Every Trino session the orchestrator opens is pinned to `UTC` via the
+Every Trino session iceberg-ivm opens is pinned to `UTC` via the
 aiotrino `timezone` connection parameter. This is a hard requirement,
 not a convenience — without it the detector and the user's GROUP BY can
 disagree on bucket boundaries and silently corrupt incremental
@@ -151,7 +151,7 @@ operates in UTC, aligning with `expand_to_bucket_bounds` by construction.
 
 ### Append-only source assumption
 
-The orchestrator assumes source tables are append-only. The only
+iceberg-ivm assumes source tables are append-only. The only
 legitimate Iceberg snapshot operations are:
 
 - `append` — real new data, drives incremental refresh.
@@ -244,8 +244,8 @@ We analyzed what it would take to add this to Trino itself:
 - Iceberg `finishRefreshMaterializedView` does partition-scoped
   `deleteFromRowFilter` + append
 
-Estimated: 4-6 weeks for MVP + 1-2 months upstream review. The external
-orchestrator achieves the same result in ~500 lines of Python.
+Estimated: 4-6 weeks for MVP + 1-2 months upstream review. iceberg-ivm
+achieves the same result in ~500 lines of Python.
 
 ### Iceberg identifier-field-ids for merge_keys
 

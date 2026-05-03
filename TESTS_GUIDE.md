@@ -62,7 +62,7 @@ Covers `config.py`. Query-shape validation lives in `test_query_parser.py`; this
 
 ### `test_query_parser.py` — AST-based query parsing
 
-Covers `query_parser.py`. This is where the orchestrator now decides whether a view query is supported.
+Covers `query_parser.py`. This is where iceberg-ivm decides whether a view query is supported.
 
 **Happy path** — every shape the parser extracts correctly:
 - `test_full_shape` — end-to-end ParsedView from a typical SELECT
@@ -92,7 +92,7 @@ Covers `query_parser.py`. This is where the orchestrator now decides whether a v
 
 ### `test_detector.py` — change detection
 
-Covers `detector.py`. This is where the orchestrator's correctness is mostly proven.
+Covers `detector.py`. This is where iceberg-ivm's correctness is mostly proven.
 
 #### `TestExpandToBucketBounds` — handcrafted boundary cases
 
@@ -308,5 +308,5 @@ These tests are the **canonical proof** that `expand_to_bucket_bounds` works in 
 Three classes worth opening before changing anything:
 
 1. **`TestExpandToBucketBoundsInversesDateTrunc`** (`test_detector.py:218`) — the property tests that pin the math. If you touch `expand_to_bucket_bounds`, run these first.
-2. **`TestDetectChanges`** (`test_detector.py:412`) — the truth table for the orchestrator's decision function. Eight cases that together describe every legitimate state transition.
+2. **`TestDetectChanges`** (`test_detector.py:412`) — the truth table for iceberg-ivm's decision function. Eight cases that together describe every legitimate state transition.
 3. **`TestWeeklyBarsCrossPartition`** (`test_cross_partition_groupby.py:74`) — what correctness looks like end-to-end. If a refactor breaks this, you've broken the product.

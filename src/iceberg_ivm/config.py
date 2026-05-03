@@ -32,7 +32,7 @@ _CHUNK_COMPATIBILITY["week"] = frozenset({"week"})
 # No defaults, no YAML overrides — keeping secrets out of the repo and
 # making per-environment deployment a matter of setting env vars.
 #
-# TRINO_PASSWORD is optional: if unset, the orchestrator connects
+# TRINO_PASSWORD is optional: if unset, iceberg-ivm connects
 # without BasicAuth (for clusters that allow anonymous access — e.g.
 # the local dev compose stack).
 _TRINO_ENV_REQUIRED = ("TRINO_URL", "TRINO_USER")
@@ -239,7 +239,7 @@ def load_config(path: str | Path) -> Config:
     if missing_env:
         raise ValueError(
             f"trino credentials missing from environment: {missing_env}. "
-            f"Set {', '.join(_TRINO_ENV_REQUIRED)} before starting the orchestrator."
+            f"Set {', '.join(_TRINO_ENV_REQUIRED)} before starting iceberg-ivm."
         )
 
     trino = TrinoConfig(

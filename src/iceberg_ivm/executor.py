@@ -115,7 +115,7 @@ async def _backfill_ranges(
     """Return the ordered (start, end) ranges for a full refresh.
 
     One element = single-shot; N elements = chunked. Resume point comes from
-    target's ``$files`` — no orchestrator cursor state. Empty = empty source.
+    target's ``$files`` — no external cursor state. Empty = empty source.
     """
     source_range = await get_source_column_range(
         cursor, parsed.source_table, parsed.filter_column,

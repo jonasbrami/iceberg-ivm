@@ -50,7 +50,7 @@ services:
       retries: 30
       start_period: 30s
 
-  orchestrator:
+  iceberg-ivm:
     build:
       context: ..
       dockerfile: Dockerfile

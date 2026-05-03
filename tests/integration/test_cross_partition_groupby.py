@@ -158,7 +158,7 @@ class TestLateArrivingData:
     """Out-of-order ingestion: a row whose timestamp is *earlier* than
     data already processed in a previous refresh cycle.
 
-    This is the canonical streaming case the orchestrator exists for.
+    This is the canonical streaming case iceberg-ivm exists for.
     The detector reads the late row's min/max from $all_entries, snaps
     to the bucket containing the late timestamp, and the MERGE
     recomputes that historical bucket from complete source data.
