@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import pytest
 
-from trino_mv_orchestrator.config import ViewConfig
-from trino_mv_orchestrator.detector import RefreshAction, detect_changes
-from trino_mv_orchestrator.executor import execute_refresh
-from trino_mv_orchestrator.introspect import discover_columns, build_create_table_sql
-from trino_mv_orchestrator.query_parser import parse_view_query
+from iceberg_ivm.config import ViewConfig
+from iceberg_ivm.detector import RefreshAction, detect_changes
+from iceberg_ivm.executor import execute_refresh
+from iceberg_ivm.introspect import discover_columns, build_create_table_sql
+from iceberg_ivm.query_parser import parse_view_query
 
 pytestmark = [pytest.mark.integration, pytest.mark.xdist_group("integration")]
 
@@ -158,7 +158,7 @@ class TestLateArrivingData:
     """Out-of-order ingestion: a row whose timestamp is *earlier* than
     data already processed in a previous refresh cycle.
 
-    This is the canonical streaming case the orchestrator exists for.
+    This is the canonical streaming case iceberg-ivm exists for.
     The detector reads the late row's min/max from $all_entries, snaps
     to the bucket containing the late timestamp, and the MERGE
     recomputes that historical bucket from complete source data.

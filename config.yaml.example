@@ -9,11 +9,11 @@ server:
   # state_db_path: /data/state.db
 
 # Trino connection URL, user, and password are read from environment
-# variables — *never* from this file. No defaults; the orchestrator
+# variables — *never* from this file. No defaults; iceberg-ivm
 # refuses to start without them.
 #
 #   TRINO_URL       e.g. "http://trino:8080" (required)
-#   TRINO_USER      e.g. "orchestrator"       (required)
+#   TRINO_USER      e.g. "iceberg-ivm"       (required)
 #   TRINO_PASSWORD  BasicAuth password        (optional — omit for anonymous)
 #
 # Only `catalog` and `schema` (the per-deployment Trino catalog + target

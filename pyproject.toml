@@ -1,7 +1,7 @@
 [project]
-name = "trino-mv-orchestrator"
+name = "iceberg-ivm"
 dynamic = ["version"]
-description = "Metadata-driven incremental materialized view orchestrator for Trino/Iceberg"
+description = "Incremental view maintenance for Iceberg tables on Trino"
 readme = "README.md"
 authors = [
     { name = "Jonas Brami", email = "jonasbrami@gmail.com" }
@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.scripts]
-trino-mv-orchestrator = "trino_mv_orchestrator.cli:main"
+iceberg-ivm = "iceberg_ivm.cli:main"
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]
@@ -27,7 +27,7 @@ build-backend = "hatchling.build"
 # Version is derived from git tags: `v0.1.1` → `0.1.1`. Between tags,
 # installs produce a dev version (e.g. `0.1.2.dev3+g7817deb`). In Docker
 # builds (no `.git` in context) the publish workflow passes the tag via
-# SETUPTOOLS_SCM_PRETEND_VERSION_FOR_TRINO_MV_ORCHESTRATOR.
+# SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ICEBERG_IVM.
 [tool.hatch.version]
 source = "vcs"
 

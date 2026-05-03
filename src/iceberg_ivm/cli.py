@@ -1,4 +1,4 @@
-"""CLI entry point for trino-mv-orchestrator."""
+"""CLI entry point for iceberg-ivm."""
 from __future__ import annotations
 
 import argparse
@@ -7,14 +7,14 @@ from pathlib import Path
 
 import uvicorn
 
-from trino_mv_orchestrator.config import load_config
-from trino_mv_orchestrator.server import app, set_config_path, set_views_path
+from iceberg_ivm.config import load_config
+from iceberg_ivm.server import app, set_config_path, set_views_path
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        prog="trino-mv-orchestrator",
-        description="Metadata-driven incremental MV orchestrator for Trino/Iceberg",
+        prog="iceberg-ivm",
+        description="Incremental view maintenance for Iceberg tables on Trino",
     )
     parser.add_argument(
         "-c", "--config",

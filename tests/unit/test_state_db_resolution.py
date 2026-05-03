@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from trino_mv_orchestrator.server import resolve_state_db_path
+from iceberg_ivm.server import resolve_state_db_path
 
 
 def test_relative_anchors_on_views_dir(tmp_path: Path) -> None:

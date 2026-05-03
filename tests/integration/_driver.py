@@ -1,9 +1,9 @@
 """Helpers for streaming-refresh integration tests.
 
-These wrap the orchestrator's daemon driver (``server.refresh_view``)
+These wrap the iceberg-ivm daemon driver (``server.refresh_view``)
 behind a fixture-friendly API so tests can script a deterministic
 sequence of (insert batch → refresh → assert) cycles without touching
-the orchestrator's CLI or HTTP surface.
+the iceberg-ivm CLI or HTTP surface.
 """
 from __future__ import annotations
 
@@ -11,9 +11,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from trino_mv_orchestrator.config import Config, TrinoConfig, ServerConfig
-from trino_mv_orchestrator.query_history import QueryHistory
-from trino_mv_orchestrator.server import AppState, RECENT_QUERY_LIMIT
+from iceberg_ivm.config import Config, TrinoConfig, ServerConfig
+from iceberg_ivm.query_history import QueryHistory
+from iceberg_ivm.server import AppState, RECENT_QUERY_LIMIT
 
 
 @dataclass

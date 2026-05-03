@@ -10,5 +10,5 @@ COPY pyproject.toml README.md ./
 COPY src/ src/
 RUN uv pip install --system .
 
-ENTRYPOINT ["trino-mv-orchestrator"]
+ENTRYPOINT ["iceberg-ivm"]
 CMD ["-c", "/app/config.yaml"]

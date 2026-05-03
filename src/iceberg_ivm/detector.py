@@ -251,7 +251,7 @@ def expand_to_bucket_bounds(
 ) -> tuple[datetime, datetime]:
     """Expand a timestamp range outward to full GROUP BY bucket boundaries.
 
-    This is the **load-bearing correctness invariant** of the orchestrator:
+    This is the **load-bearing correctness invariant** of iceberg-ivm:
     ``expand_to_bucket_bounds`` is the Python inverse of Trino's
     ``date_trunc(granularity, col)``. The detector reads per-file min/max
     timestamps from ``$all_entries.readable_metrics`` and snaps that raw

@@ -1,20 +1,20 @@
-# trino-mv-orchestrator
+# iceberg-ivm
 
 A simple **Iceberg IVM (incremental view maintenance) controller** that delegates
 all computation to Trino.
 
-The orchestrator owns the control plane — view definitions, change detection,
+The service owns the control plane — view definitions, change detection,
 refresh scheduling, watermarks — while Trino executes the actual SQL against
 Iceberg tables. Change detection runs on Iceberg file-level metadata only;
 when source data changes, only the affected time range is recomputed from
 complete source data, guaranteeing correct aggregations. Refreshes are atomic
 via `MERGE INTO`.
 
-**Lightweight by design.** The orchestrator itself moves no data and holds no
+**Lightweight by design.** The service itself moves no data and holds no
 table contents — it only reads Iceberg metadata (`$snapshots`, `$all_entries`)
 and issues SQL to Trino. All data lives in Iceberg; all scans and writes
-happen inside Trino. The orchestrator's resident state is a handful of
-per-view status counters.
+happen inside Trino. Its resident state is a handful of per-view status
+counters.
 
 **Materialized views are Iceberg tables, which makes them chainable.** Because
 each target is a first-class Iceberg table, it can be the *source* of another
@@ -51,8 +51,8 @@ The result is a small, sharply-scoped service: append-only Iceberg sources, `dat
 Pre-requisite: an existing Trino cluster reachable from the container.
 
 Put `config.yaml` and `views.yaml` in a directory you'll mount into the
-container (state survives across image bumps because both files — and the
-orchestrator's `state.db` — live there):
+container (state survives across image bumps because both files — and
+iceberg-ivm's `state.db` — live there):
 
 ```yaml
 # ./data/config.yaml
@@ -71,11 +71,11 @@ views: []     # add views here, or manage them via the web UI
 ```yaml
 # docker-compose.yml
 services:
-  orchestrator:
-    image: jonasbrami/trino-mv-orchestrator:0.2.1
+  iceberg-ivm:
+    image: jonasbrami/iceberg-ivm:0.2.1
     environment:
       TRINO_URL: http://trino:8080
-      TRINO_USER: orchestrator
+      TRINO_USER: iceberg-ivm
       # TRINO_PASSWORD: …            # only if your Trino requires it
     volumes:
       - ./data:/data
@@ -97,7 +97,7 @@ For a full local stack with a sandbox Trino + MinIO + Postgres, see
 
 ```mermaid
 sequenceDiagram
-    participant O as Orchestrator
+    participant O as iceberg-ivm
     participant T as Trino
     participant SRC as Source Table<br/>(Iceberg metadata)
     participant TGT as Target MV<br/>(Iceberg table)
@@ -129,7 +129,7 @@ sequenceDiagram
 
 ### Iceberg metadata: what we read and why
 
-The orchestrator treats Iceberg's metadata tables as a small, structured
+The service treats Iceberg's metadata tables as a small, structured
 log it can poll cheaply. It never scans source *data* for change
 detection — just the metadata describing what data exists.
 
@@ -244,7 +244,7 @@ The two operations mirror each other exactly:
 |---|---|---|
 | **Direction** | timestamp → bucket start | timestamp range → bucket-aligned range |
 | **Operation** | floor to `:00:00` | floor min to `:00:00`, ceil max to next `:00:00` |
-| **Used in** | `GROUP BY` (query) | `WHERE` filter (orchestrator) |
+| **Used in** | `GROUP BY` (query) | `WHERE` filter (iceberg-ivm) |
 | **Guarantees** | rows are grouped by hour | filter covers complete hours |
 
 This is why only simple `date_trunc` is allowed: for any `date_trunc('X', col)`,
@@ -259,7 +259,7 @@ corrupts aggregates.
 - **Iceberg catalog supporting writes from Trino** — Hive Metastore, REST, Nessie, Polaris, Snowflake Open Catalog, or JDBC.
 - **Trino user** with the following privileges:
   - `SELECT` on every source table (plus its `$snapshots`, `$all_entries` metadata tables — these inherit from the base-table grant in Trino's Iceberg connector).
-  - `CREATE TABLE` on the target schema — the orchestrator creates the target on first refresh.
+  - `CREATE TABLE` on the target schema — iceberg-ivm creates the target on first refresh.
   - `SELECT`, `INSERT`, `DELETE`, `UPDATE` on every target table — needed for `MERGE` (incremental) and `DELETE + INSERT` (full refresh).
 - **Iceberg column statistics** on the source `filter_column` — the detector reads `readable_metrics` from `$all_entries`. Statistics are on by default for Trino and Spark ≥ 3.5 writers.
 - **Python ≥ 3.12** — only when running from source (the Docker image does not require this on the host).
@@ -278,7 +278,7 @@ per-environment deployments only need to set a few env vars.
 | `TRINO_USER` | yes | Trino username. |
 | `TRINO_PASSWORD` | no | BasicAuth password. Omit (or leave empty) for anonymous access — e.g. the local dev compose stack. |
 
-The orchestrator refuses to start if `TRINO_URL` or `TRINO_USER` is missing.
+The service refuses to start if `TRINO_URL` or `TRINO_USER` is missing.
 
 ### 2. Create two YAML files
 
@@ -312,7 +312,7 @@ views:
     refresh_interval_seconds: 30
 ```
 
-The orchestrator parses each query and derives `source_table`, `filter_column`,
+The service parses each query and derives `source_table`, `filter_column`,
 `filter_granularity`, and `merge_keys` from it. At refresh time the time-range
 WHERE predicate is AST-injected automatically — there is no `{range_filter}`
 placeholder. Column types are auto-discovered via `DESCRIBE OUTPUT` and the
@@ -327,9 +327,9 @@ Install dependencies, export the credential env vars, and start the service:
 ```bash
 uv sync
 export TRINO_URL=http://localhost:8080
-export TRINO_USER=orchestrator
+export TRINO_USER=iceberg-ivm
 # export TRINO_PASSWORD=…            # only if your Trino requires it
-uv run trino-mv-orchestrator -c config.yaml --views views.yaml
+uv run iceberg-ivm -c config.yaml --views views.yaml
 # Web UI:  http://localhost:8000
 # Metrics: http://localhost:8000/metrics
 ```
@@ -362,7 +362,7 @@ uv run --with trino python tests/seed_data.py
 # stays unset:
 export TRINO_URL=http://localhost:18080
 export TRINO_USER=demo
-uv run trino-mv-orchestrator -c config.yaml --views views.yaml
+uv run iceberg-ivm -c config.yaml --views views.yaml
 ```
 
 ## Using it
@@ -406,7 +406,7 @@ On the first refresh of a brand-new view you'll see:
 
 1. `discover_columns` (a `PREPARE` + `DESCRIBE OUTPUT`, no data scan) resolves the target column types.
 2. `CREATE TABLE IF NOT EXISTS target (…)` creates the Iceberg table. The target is **unpartitioned by default**; set `target_partitioning` on the view to partition it (e.g. `"ARRAY['day(minute)']"`).
-3. The detector sees no `last_source_snapshot` recorded in the orchestrator's `state.db` and returns `FULL_REFRESH`.
+3. The detector sees no `last_source_snapshot` recorded in iceberg-ivm's `state.db` and returns `FULL_REFRESH`.
 4. `execute_full_refresh` runs `DELETE FROM target WHERE true` then `INSERT INTO target SELECT …` (your original query, verbatim — no WHERE injected).
 5. The source snapshot ID is written to `state.db` (`view_status.last_source_snapshot`).
 
@@ -419,15 +419,15 @@ Every subsequent cycle is incremental unless you delete the bookmark.
 | Add / edit a view | Edit `views.yaml` (or use UI / API). Takes effect at next config reload. |
 | Delete a view | UI → Delete, or `DELETE /api/views/{name}`. Removes it from the schedule **only** — the target Iceberg table is untouched. Drop it separately if you want the data gone. |
 | Force a full refresh | Delete the view via the UI / `DELETE /api/views/{name}` and recreate it (this clears the SQLite bookmark), then `DROP TABLE <target>` if you also want the data gone. Just dropping the target by itself will not full-refresh — the next tick will incremental-refresh against an empty table. |
-| Restart the orchestrator | Safe. The bookmark lives in `state.db` (mounted alongside `views.yaml`); restart picks up where it left off. |
+| Restart iceberg-ivm | Safe. The bookmark lives in `state.db` (mounted alongside `views.yaml`); restart picks up where it left off. |
 | Manual refresh | UI → Refresh, or `POST /api/views/{name}/refresh`. Runs one cycle synchronously and returns the action taken. |
 | Health check | `curl http://localhost:8000/health` → `{"status":"ok","views":N}` |
 
 ### Deployment notes
 
-- **Single-instance.** The orchestrator is not HA. One process per target catalog/schema. Two instances against the same targets would race on `ALTER TABLE SET PROPERTIES` and produce conflicting MERGEs.
-- **Crash-safe.** Refresh-correctness state lives in Iceberg, not in the orchestrator. Kill/restart leaves no cleanup.
-- **Persist the SQLite state DB.** The UI's "recent queries" panel is backed by a SQLite file (`server.state_db_path`, default `state.db` next to `config.yaml`). If you run in docker, mount a volume at that path — otherwise the file is recreated empty on every container replacement and history disappears. Example: `-v mv-state:/app/state.db`.
+- **Single-instance.** iceberg-ivm is not HA. One process per target catalog/schema. Two instances against the same targets would race on `ALTER TABLE SET PROPERTIES` and produce conflicting MERGEs.
+- **Crash-safe.** Refresh-correctness state lives in Iceberg, not in iceberg-ivm. Kill/restart leaves no cleanup.
+- **Persist the SQLite state DB.** The UI's "recent queries" panel is backed by a SQLite file (`server.state_db_path`, default `state.db` next to `config.yaml`). If you run in docker, mount a volume at that path — otherwise the file is recreated empty on every container replacement and history disappears. Example: `-v ivm-state:/app/state.db`.
 - **What to monitor** (all labels `view`):
   - `rate(mv_refresh_errors_total[5m]) > 0` — refresh is failing.
   - `time() - mv_refresh_last_success_timestamp > 3 * refresh_interval_seconds` — view is stalled.
@@ -440,7 +440,7 @@ Every subsequent cycle is incremental unless you delete the bookmark.
 | `name` | yes | Unique view name |
 | `query` | yes | The full SELECT — exactly what you would write after `CREATE MATERIALIZED VIEW … AS`. `source_table`, `filter_column`, `filter_granularity`, and `merge_keys` are derived from this |
 | `target_table` | no | Defaults to `{catalog}.{schema}.{name}` |
-| `target_partitioning` | no | Iceberg `ARRAY[...]` string for the target table's partitioning (e.g. `"ARRAY['day(minute)']"`). Unpartitioned if omitted — the orchestrator does not auto-inherit from the source, because the source's partition column is typically consumed by `date_trunc(...)` and no longer exists on the target (see issue #22). |
+| `target_partitioning` | no | Iceberg `ARRAY[...]` string for the target table's partitioning (e.g. `"ARRAY['day(minute)']"`). Unpartitioned if omitted — iceberg-ivm does not auto-inherit from the source, because the source's partition column is typically consumed by `date_trunc(...)` and no longer exists on the target (see issue #22). |
 | `refresh_interval_seconds` | no | Defaults to 60 |
 
 ### API
@@ -479,7 +479,7 @@ graph LR
         D3["day=Apr 8 (Wed) ← NEW"]
     end
 
-    subgraph Orchestrator
+    subgraph IVM["iceberg-ivm"]
         FS["File stats: ts ∈ [Apr 8 10:00, Apr 8 15:30]"]
         SR["expand_to_bucket_bounds('week'): [Apr 6, Apr 13)"]
         FS --> SR
@@ -510,7 +510,7 @@ weekly bar.
 
 ## Query parsing
 
-At config-load time the orchestrator parses every view query with an AST-based
+At config-load time iceberg-ivm parses every view query with an AST-based
 parser (`sqlparse`). It derives:
 
 - `source_table` — from the FROM clause
@@ -520,7 +520,7 @@ parser (`sqlparse`). It derives:
 - `merge_keys` — resolved from the GROUP BY list against the projection
   (positional `GROUP BY 1, 2` refs are handled too)
 
-At refresh time the orchestrator AST-injects the time-range `WHERE` predicate
+At refresh time iceberg-ivm AST-injects the time-range `WHERE` predicate
 directly into the query:
 
 ```sql
@@ -530,7 +530,7 @@ FROM iceberg.md.trades
 WHERE color = 'red'
 GROUP BY 1, 2
 
--- orchestrator runs:
+-- iceberg-ivm runs:
 MERGE INTO iceberg.md.trades_weekly AS t USING (
   SELECT symbol, date_trunc('week', ts) AS week, sum(qty) AS volume
   FROM iceberg.md.trades
@@ -565,7 +565,7 @@ FROM iceberg.market_data.trades
 GROUP BY 1, 2
 ```
 
-**Pre-filtered view** (your `WHERE` is preserved; the orchestrator `AND`s the
+**Pre-filtered view** (your `WHERE` is preserved; iceberg-ivm `AND`s the
 time-range predicate onto it):
 ```sql
 SELECT symbol, date_trunc('hour', ts) AS hour, count(*) AS c
@@ -694,7 +694,7 @@ parser enforces this at load time and rejects anything else with a clear error.
   `replace` (compaction) snapshot operations are allowed. `replace` is
   skipped — files were rewritten but no data changed. Any other operation
   (`overwrite`, `delete`) fails loudly.
-- **UTC session timezone.** The orchestrator pins every Trino session to
+- **UTC session timezone.** iceberg-ivm pins every Trino session to
   `UTC` so that `date_trunc('day' | 'week' | …, ts)` on `TIMESTAMP WITH
   TIME ZONE` columns aligns with the Python-side `expand_to_bucket_bounds` bucket math.
   Without this pin, a non-UTC session would produce bucket boundaries
@@ -718,7 +718,7 @@ cd tests && docker compose down -v
 ## Project structure
 
 ```
-src/trino_mv_orchestrator/
+src/iceberg_ivm/
     config.py        -- YAML config loading, saving, validation
     detector.py      -- $snapshots + $all_entries file stats + expand_to_bucket_bounds()
     executor.py      -- MERGE SQL generation + execution

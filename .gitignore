@@ -16,7 +16,7 @@ wheels/
 config.yaml
 views.yaml
 
-# Orchestrator state DB (created by running the service)
+# iceberg-ivm state DB (created by running the service)
 *.db
 *.db-journal
 

@@ -1,7 +1,7 @@
 """Tests for the change detector."""
 from datetime import datetime, timedelta, timezone
 
-from trino_mv_orchestrator.detector import (
+from iceberg_ivm.detector import (
     ExpiredSnapshotError,
     MissingFilterColumnError,
     RefreshAction,
@@ -382,7 +382,7 @@ class TestGetCurrentSnapshot:
 class TestGetSnapshotsSince:
     async def test_raises_on_missing_last_snap(self):
         """If last_snap is no longer in $snapshots (Iceberg expired it),
-        the orchestrator must fail loudly rather than silently return []."""
+        iceberg-ivm must fail loudly rather than silently return []."""
         # First execute is the committed_at lookup for last_snap: empty.
         cursor = MockCursor([[]])
         with pytest.raises(ExpiredSnapshotError):

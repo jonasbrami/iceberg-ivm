@@ -1,4 +1,4 @@
-# Trino MV Orchestrator — Learning Guide
+# iceberg-ivm — Learning Guide
 
 A guided tour of the codebase, designed to take you from zero to "I can extend this safely" as quickly as possible. Read top to bottom on the first pass; later, treat it as a map.
 
@@ -8,9 +8,9 @@ A guided tour of the codebase, designed to take you from zero to "I can extend t
 
 Trino's built-in materialized view (MV) refresh only handles **scan-filter-project**. Any `GROUP BY` triggers a **full source rescan**. For append-only analytics tables (trades, logs, events), that's terabytes of repeated work every refresh.
 
-This project orchestrates **incremental** MV refreshes from the outside, using only **Iceberg metadata** — no source data is read during change detection. A typical detect-and-refresh cycle is ~50 ms of metadata work plus a partition-pruned `MERGE`.
+`iceberg-ivm` performs **incremental view maintenance** from the outside, using only **Iceberg metadata** — no source data is read during change detection. A typical detect-and-refresh cycle is ~50 ms of metadata work plus a partition-pruned `MERGE`.
 
-**One-line summary:** *Metadata-driven, externally-orchestrated, incremental MV refresh for Trino on Iceberg.*
+**One-line summary:** *Metadata-driven incremental view maintenance for Iceberg tables on Trino.*
 
 ---
 
@@ -21,7 +21,7 @@ flowchart LR
     subgraph Naive["Naive Trino MV refresh (GROUP BY)"]
         S1[("trades<br/>10 TB")] -->|"full scan every refresh"| MV1["ohlcv_1m"]
     end
-    subgraph Smart["This orchestrator"]
+    subgraph Smart["iceberg-ivm"]
         S2[("trades<br/>10 TB")] -.->|"$snapshots, $all_entries<br/>(metadata only ~50ms)"| D["Detector"]
         D -->|"MERGE WHERE ts in range"| MV2["ohlcv_1m"]
     end
@@ -305,18 +305,19 @@ flowchart LR
 
 Two YAML files.
 
-### `config.yaml` — connection + server
+### `config.yaml` — server + per-deployment Trino catalog/schema
+
+URL, user, and password come from the environment (`TRINO_URL`,
+`TRINO_USER`, `TRINO_PASSWORD`) — never from this file. Only
+`catalog` and `schema` live in YAML:
 
 ```yaml
 server:
   port: 8000
   config_reload_interval_seconds: 30
 trino:
-  host: localhost
-  port: 8080
   catalog: iceberg
   schema: analytics
-  user: orchestrator
 ```
 
 ### Views — defined inline or in a separate `views.yaml`
@@ -432,7 +433,7 @@ flowchart TB
 
 | What | Where |
 |---|---|
-| Entry point | `src/trino_mv_orchestrator/cli.py:8-56` |
+| Entry point | `src/iceberg_ivm/cli.py:8-56` |
 | FastAPI app + lifespan | `server.py:291-317` |
 | Refresh loop | `server.py:264-286` |
 | Per-view refresh | `server.py:177-262` |
@@ -481,4 +482,4 @@ flowchart TB
     L1 --> L2 --> L3 --> Result["Correct incremental aggregates"]
 ```
 
-Get all three right and incremental MV refresh is just metadata + one partition-pruned MERGE per cycle. Get any one wrong and you get silent data corruption that's invisible until someone audits the totals.
+Get all three right and incremental view maintenance is just metadata + one partition-pruned MERGE per cycle. Get any one wrong and you get silent data corruption that's invisible until someone audits the totals.

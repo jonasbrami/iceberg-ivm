@@ -24,11 +24,11 @@ class TestCliMain:
         cfg_path.write_text(CONFIG_YAML)
         monkeypatch.chdir(tmp_path)
 
-        with patch("trino_mv_orchestrator.cli.argparse.ArgumentParser.parse_args") as mock_args, \
+        with patch("iceberg_ivm.cli.argparse.ArgumentParser.parse_args") as mock_args, \
              patch("uvicorn.run") as mock_uvicorn:
             mock_args.return_value = type("Args", (), {"config": str(cfg_path), "views": str(tmp_path / "views.yaml"), "verbose": False})()
 
-            from trino_mv_orchestrator.cli import main
+            from iceberg_ivm.cli import main
             main()
 
             mock_uvicorn.assert_called_once()
@@ -41,11 +41,11 @@ class TestCliMain:
 
         custom.write_text(CONFIG_YAML + "server:\n  port: 9999\n")
 
-        with patch("trino_mv_orchestrator.cli.argparse.ArgumentParser.parse_args") as mock_args, \
+        with patch("iceberg_ivm.cli.argparse.ArgumentParser.parse_args") as mock_args, \
              patch("uvicorn.run") as mock_uvicorn:
             mock_args.return_value = type("Args", (), {"config": str(custom), "views": str(tmp_path / "views.yaml"), "verbose": False})()
 
-            from trino_mv_orchestrator.cli import main
+            from iceberg_ivm.cli import main
             main()
 
             call_kwargs = mock_uvicorn.call_args
@@ -56,12 +56,12 @@ class TestCliMain:
         cfg_path.write_text(CONFIG_YAML)
         monkeypatch.chdir(tmp_path)
 
-        with patch("trino_mv_orchestrator.cli.argparse.ArgumentParser.parse_args") as mock_args, \
+        with patch("iceberg_ivm.cli.argparse.ArgumentParser.parse_args") as mock_args, \
              patch("uvicorn.run"), \
              patch("logging.basicConfig") as mock_logging:
             mock_args.return_value = type("Args", (), {"config": str(cfg_path), "views": str(tmp_path / "views.yaml"), "verbose": True})()
 
-            from trino_mv_orchestrator.cli import main
+            from iceberg_ivm.cli import main
             main()
 
             mock_logging.assert_called_once()

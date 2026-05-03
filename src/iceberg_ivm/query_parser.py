@@ -151,7 +151,7 @@ def _reject_unsupported_shapes(stmt: Statement) -> None:
     if "{range_filter}" in str(stmt):
         raise ValueError(
             "query contains the legacy {range_filter} placeholder; remove it — "
-            "the orchestrator injects the time-range WHERE automatically"
+            "iceberg-ivm injects the time-range WHERE automatically"
         )
     select_count = 0
     saw_group_by = False

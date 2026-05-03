@@ -18,14 +18,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import AsyncIterator
 
-from trino_mv_orchestrator.config import ViewConfig
-from trino_mv_orchestrator.detector import (
+from iceberg_ivm.config import ViewConfig
+from iceberg_ivm.detector import (
     expand_to_bucket_bounds,
     get_source_column_range,
     get_target_bucket_max,
     walk_buckets,
 )
-from trino_mv_orchestrator.query_parser import ParsedView, inject_range_filter
+from iceberg_ivm.query_parser import ParsedView, inject_range_filter
 
 log = logging.getLogger(__name__)
 
@@ -115,7 +115,7 @@ async def _backfill_ranges(
     """Return the ordered (start, end) ranges for a full refresh.
 
     One element = single-shot; N elements = chunked. Resume point comes from
-    target's ``$files`` — no orchestrator cursor state. Empty = empty source.
+    target's ``$files`` — no external cursor state. Empty = empty source.
     """
     source_range = await get_source_column_range(
         cursor, parsed.source_table, parsed.filter_column,

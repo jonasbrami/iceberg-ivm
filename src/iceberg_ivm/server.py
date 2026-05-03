@@ -20,7 +20,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, create_model, field_validator
 
-from trino_mv_orchestrator.config import (
+from iceberg_ivm.config import (
     Config,
     ViewConfig,
     load_config,
@@ -31,18 +31,18 @@ from trino_mv_orchestrator.config import (
     validate_qualified_name,
     validate_view_name,
 )
-from trino_mv_orchestrator.detector import RefreshAction, detect_changes
-from trino_mv_orchestrator.executor import (
+from iceberg_ivm.detector import RefreshAction, detect_changes
+from iceberg_ivm.executor import (
     QueryInfo,
     execute_maintenance,
     execute_refresh,
 )
-from trino_mv_orchestrator.introspect import (
+from iceberg_ivm.introspect import (
     build_create_table_sql,
     discover_columns,
 )
-from trino_mv_orchestrator.query_history import QueryHistory
-from trino_mv_orchestrator.query_parser import parse_view_query
+from iceberg_ivm.query_history import QueryHistory
+from iceberg_ivm.query_parser import parse_view_query
 
 log = logging.getLogger(__name__)
 
@@ -390,7 +390,7 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
             vs.last_action = "skip"
             # Clear any lingering in-flight chunked-backfill progress that may
             # have been hydrated from view_status after a mid-backfill restart.
-            # If the source has caught up while the orchestrator was down, the
+            # If the source has caught up while iceberg-ivm was down, the
             # next tick is NO_CHANGE — but the persisted chunks_total would
             # still claim a backfill is in flight. The committed bookmark
             # (last_source_snapshot) is the source of truth here.
@@ -631,7 +631,7 @@ async def lifespan(app: FastAPI):
             await s.history.close()
 
 
-app = FastAPI(title="trino-mv-orchestrator", lifespan=lifespan)
+app = FastAPI(title="iceberg-ivm", lifespan=lifespan)
 
 
 # ── API models + form schema, all derived from ViewConfig ──

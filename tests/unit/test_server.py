@@ -6,9 +6,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from trino_mv_orchestrator.config import Config, load_config, load_views
-from trino_mv_orchestrator.query_history import QueryHistory
-from trino_mv_orchestrator.server import RECENT_QUERY_LIMIT, AppState, ViewStatus, app, get_app_state
+from iceberg_ivm.config import Config, load_config, load_views
+from iceberg_ivm.query_history import QueryHistory
+from iceberg_ivm.server import RECENT_QUERY_LIMIT, AppState, ViewStatus, app, get_app_state
 
 
 STATIC_CONFIG_YAML = textwrap.dedent("""\
@@ -543,11 +543,11 @@ def test_create_view_empty_file_size_threshold_treated_as_none(client, setup_sta
 async def test_refresh_view_runs_maintenance(setup_state):
     """Piggyback: after a successful refresh, due maintenance ops must run
     on the same cursor and be surfaced in ViewStatus.maintenance."""
-    from trino_mv_orchestrator import server as server_mod
-    from trino_mv_orchestrator.config import Config, ViewConfig
-    from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
-    from trino_mv_orchestrator.executor import QueryInfo
-    from trino_mv_orchestrator.introspect import ColumnInfo
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.config import Config, ViewConfig
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.executor import QueryInfo
+    from iceberg_ivm.introspect import ColumnInfo
 
     v = ViewConfig(
         name="test_view",
@@ -615,8 +615,8 @@ async def test_refresh_view_runs_maintenance(setup_state):
 
 async def test_maintain_view_respects_interval(setup_state):
     """When last_run is within the interval, the op is skipped — no SQL runs."""
-    from trino_mv_orchestrator import server as server_mod
-    from trino_mv_orchestrator.config import ViewConfig
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.config import ViewConfig
 
     v = ViewConfig(
         name="test_view",
@@ -647,8 +647,8 @@ async def test_maintain_view_respects_interval(setup_state):
 async def test_maintain_view_skips_everything_when_interval_zero(setup_state):
     """maintenance_interval_seconds=0 is the global kill switch: even with
     every per-op boolean still True (the defaults), no SQL must run."""
-    from trino_mv_orchestrator import server as server_mod
-    from trino_mv_orchestrator.config import ViewConfig
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.config import ViewConfig
 
     v = ViewConfig(
         name="test_view",
@@ -667,9 +667,9 @@ async def test_maintain_view_skips_everything_when_interval_zero(setup_state):
 
 async def test_maintain_view_respects_per_op_toggle(setup_state):
     """With one op disabled, the other two still run on the shared interval."""
-    from trino_mv_orchestrator import server as server_mod
-    from trino_mv_orchestrator.config import ViewConfig
-    from trino_mv_orchestrator.executor import QueryInfo
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.config import ViewConfig
+    from iceberg_ivm.executor import QueryInfo
 
     v = ViewConfig(
         name="test_view",
@@ -697,10 +697,10 @@ async def test_maintain_view_respects_per_op_toggle(setup_state):
 
 async def test_maintain_view_persists_last_run_to_history(setup_state, tmp_path):
     """Scheduling must survive restart — last_run is written to maintenance_state."""
-    from trino_mv_orchestrator import server as server_mod
-    from trino_mv_orchestrator.config import ViewConfig
-    from trino_mv_orchestrator.executor import QueryInfo
-    from trino_mv_orchestrator.query_history import QueryHistory
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.config import ViewConfig
+    from iceberg_ivm.executor import QueryInfo
+    from iceberg_ivm.query_history import QueryHistory
 
     v = ViewConfig(
         name="test_view",
@@ -733,8 +733,8 @@ async def test_maintain_view_persists_last_run_to_history(setup_state, tmp_path)
 
 async def test_hydrate_rehydrates_maintenance_last_run(setup_state, tmp_path):
     """On startup, maintenance state is read from SQLite so intervals survive restarts."""
-    from trino_mv_orchestrator import server as server_mod
-    from trino_mv_orchestrator.query_history import QueryHistory
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.query_history import QueryHistory
 
     h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
     await h.open()
@@ -761,7 +761,7 @@ async def test_trigger_refresh_signals_worker_and_returns_status(setup_state):
     """POST /refresh sets the worker's wake event, waits for the worker to
     complete one refresh cycle, and returns the resulting status.
     """
-    from trino_mv_orchestrator import server as server_mod
+    from iceberg_ivm import server as server_mod
 
     view = setup_state.config.views[0]
     setup_state._stop = False
@@ -796,10 +796,10 @@ async def test_concurrent_triggers_coalesce_into_single_followup(setup_state):
     every trigger into its own refresh — ``refresh_count`` would grow with
     the burst. Coalescing keeps it at 2 (in-flight + single coalesced pass).
     """
-    from trino_mv_orchestrator import server as server_mod
-    from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
-    from trino_mv_orchestrator.executor import QueryInfo
-    from trino_mv_orchestrator.introspect import ColumnInfo
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.executor import QueryInfo
+    from iceberg_ivm.introspect import ColumnInfo
 
     view = setup_state.config.views[0]
     setup_state._stop = False
@@ -875,8 +875,8 @@ async def test_trigger_bails_when_view_deleted_during_wait(setup_state):
     no hang.
     """
     from fastapi import HTTPException
-    from trino_mv_orchestrator import server as server_mod
-    from trino_mv_orchestrator.config import Config
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.config import Config
 
     view = setup_state.config.views[0]
     setup_state._stop = False
@@ -923,7 +923,7 @@ def test_ui(client):
 # ── Config reload ──
 
 def test_reload_config_on_mtime_change(setup_state, tmp_path):
-    from trino_mv_orchestrator.server import reload_config
+    from iceberg_ivm.server import reload_config
 
     assert len(setup_state.config.views) == 1
 
@@ -941,7 +941,7 @@ def test_reload_config_on_mtime_change(setup_state, tmp_path):
 
 
 def test_reload_config_no_change(setup_state):
-    from trino_mv_orchestrator.server import reload_config
+    from iceberg_ivm.server import reload_config
 
     before = setup_state.config
     reload_config(setup_state)
@@ -960,14 +960,14 @@ def test_get_trino_connection_pins_timezone_to_utc(setup_state):
     wrong aggregates. Pinning to UTC makes the two sides agree by
     construction.
     """
-    from trino_mv_orchestrator.server import get_trino_connection
+    from iceberg_ivm.server import get_trino_connection
 
     captured = {}
     def fake_connect(**kwargs):
         captured.update(kwargs)
         return object()
 
-    with patch("trino_mv_orchestrator.server.aiotrino.dbapi.connect",
+    with patch("iceberg_ivm.server.aiotrino.dbapi.connect",
                side_effect=fake_connect):
         get_trino_connection(setup_state)
 
@@ -979,7 +979,7 @@ def test_get_trino_connection_pins_timezone_to_utc(setup_state):
 def test_get_trino_connection_uses_env_credentials(setup_state):
     """The connection opens with host/port/scheme parsed from TRINO_URL
     and uses BasicAuthentication from TRINO_USER / TRINO_PASSWORD."""
-    from trino_mv_orchestrator.server import get_trino_connection
+    from iceberg_ivm.server import get_trino_connection
     from aiotrino.auth import BasicAuthentication
 
     captured = {}
@@ -987,7 +987,7 @@ def test_get_trino_connection_uses_env_credentials(setup_state):
         captured.update(kwargs)
         return object()
 
-    with patch("trino_mv_orchestrator.server.aiotrino.dbapi.connect",
+    with patch("iceberg_ivm.server.aiotrino.dbapi.connect",
                side_effect=fake_connect):
         get_trino_connection(setup_state)
 
@@ -1000,7 +1000,7 @@ def test_get_trino_connection_uses_env_credentials(setup_state):
 
 def test_get_trino_connection_parses_https_url(setup_state, monkeypatch):
     """https:// URL produces http_scheme='https' and the right port."""
-    from trino_mv_orchestrator.server import get_trino_connection
+    from iceberg_ivm.server import get_trino_connection
     monkeypatch.setenv("TRINO_URL", "https://trino.prod.internal:8443")
     setup_state.config = load_config(setup_state.config_path)  # reload with new env
 
@@ -1009,7 +1009,7 @@ def test_get_trino_connection_parses_https_url(setup_state, monkeypatch):
         captured.update(kwargs)
         return object()
 
-    with patch("trino_mv_orchestrator.server.aiotrino.dbapi.connect",
+    with patch("iceberg_ivm.server.aiotrino.dbapi.connect",
                side_effect=fake_connect):
         get_trino_connection(setup_state)
 
@@ -1020,7 +1020,7 @@ def test_get_trino_connection_parses_https_url(setup_state, monkeypatch):
 
 def test_get_trino_connection_omits_auth_when_no_password(setup_state, monkeypatch):
     """When TRINO_PASSWORD is unset the connection opens without auth."""
-    from trino_mv_orchestrator.server import get_trino_connection
+    from iceberg_ivm.server import get_trino_connection
     monkeypatch.delenv("TRINO_PASSWORD")
     setup_state.config = load_config(setup_state.config_path)  # reload
 
@@ -1029,7 +1029,7 @@ def test_get_trino_connection_omits_auth_when_no_password(setup_state, monkeypat
         captured.update(kwargs)
         return object()
 
-    with patch("trino_mv_orchestrator.server.aiotrino.dbapi.connect",
+    with patch("iceberg_ivm.server.aiotrino.dbapi.connect",
                side_effect=fake_connect):
         get_trino_connection(setup_state)
 
@@ -1045,9 +1045,9 @@ async def test_refresh_view_advances_state_on_empty_append_no_change(setup_state
     still be written — otherwise the view re-detects the same
     snapshots forever.
     """
-    from trino_mv_orchestrator import server as server_mod
-    from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
-    from trino_mv_orchestrator.introspect import ColumnInfo
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.introspect import ColumnInfo
 
     view = setup_state.config.views[0]
 
@@ -1089,10 +1089,10 @@ async def test_refresh_view_appends_recent_queries(setup_state, client):
     """A successful refresh must surface the MERGE / INSERT query IDs on
     the view's status so the UI can link to the Trino UI.
     """
-    from trino_mv_orchestrator import server as server_mod
-    from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
-    from trino_mv_orchestrator.executor import QueryInfo
-    from trino_mv_orchestrator.introspect import ColumnInfo
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.executor import QueryInfo
+    from iceberg_ivm.introspect import ColumnInfo
 
     view = setup_state.config.views[0]
 
@@ -1143,10 +1143,10 @@ async def test_refresh_persists_queries_and_hydrates_on_restart(
     """End-to-end: attaching a QueryHistory to AppState must cause refresh_view
     to persist QueryInfo rows, and a fresh ViewStatus with an empty
     recent_queries must re-hydrate from the DB via hydrate_view_state."""
-    from trino_mv_orchestrator import server as server_mod
-    from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
-    from trino_mv_orchestrator.executor import QueryInfo
-    from trino_mv_orchestrator.introspect import ColumnInfo
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.executor import QueryInfo
+    from iceberg_ivm.introspect import ColumnInfo
 
     view = setup_state.config.views[0]
 
@@ -1195,7 +1195,7 @@ async def test_refresh_persists_queries_and_hydrates_on_restart(
 
 
 async def test_delete_view_purges_history(setup_state, tmp_path, client):
-    from trino_mv_orchestrator.executor import QueryInfo
+    from iceberg_ivm.executor import QueryInfo
 
     h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
     await h.open()
@@ -1224,10 +1224,10 @@ async def test_refresh_persists_view_status_counters(setup_state, tmp_path):
     """After a refresh, ``view_status`` must hold the new counters so a
     restart re-hydrates them (the bug from issue #40 was that ``total_refreshes``,
     ``last_refresh``, ``chunks_done`` etc. all reset to zero on every restart)."""
-    from trino_mv_orchestrator import server as server_mod
-    from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
-    from trino_mv_orchestrator.executor import QueryInfo
-    from trino_mv_orchestrator.introspect import ColumnInfo
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.executor import QueryInfo
+    from iceberg_ivm.introspect import ColumnInfo
 
     view = setup_state.config.views[0]
     setup_state._stop = False  # fixture defaults to True; refresh_view bails on stop
@@ -1278,7 +1278,7 @@ async def test_refresh_persists_view_status_counters(setup_state, tmp_path):
 async def test_hydrate_view_state_restores_persisted_counters(setup_state, tmp_path):
     """A fresh ViewStatus (counters at zero) must adopt the persisted
     snapshot — that's the user-visible fix for issue #40."""
-    from trino_mv_orchestrator import server as server_mod
+    from iceberg_ivm import server as server_mod
 
     h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
     await h.open()
@@ -1315,10 +1315,10 @@ async def test_hydrate_view_state_restores_persisted_counters(setup_state, tmp_p
 async def test_refresh_then_restart_round_trips_total_refreshes(setup_state, tmp_path):
     """End-to-end: refresh once, simulate restart (drop ViewStatus, re-hydrate),
     and ``total_refreshes`` survives. This is the headline fix for issue #40."""
-    from trino_mv_orchestrator import server as server_mod
-    from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
-    from trino_mv_orchestrator.executor import QueryInfo
-    from trino_mv_orchestrator.introspect import ColumnInfo
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.executor import QueryInfo
+    from iceberg_ivm.introspect import ColumnInfo
 
     view = setup_state.config.views[0]
     setup_state.view_statuses[view.name] = ViewStatus(name=view.name)
@@ -1371,9 +1371,9 @@ async def test_refresh_failure_persists_last_error(setup_state, tmp_path):
     """A refresh that raises must persist ``last_error`` / ``total_errors``
     so the UI doesn't lose the failure on restart (issue #40 explicitly
     flags this as desirable)."""
-    from trino_mv_orchestrator import server as server_mod
-    from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
-    from trino_mv_orchestrator.introspect import ColumnInfo
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.introspect import ColumnInfo
 
     view = setup_state.config.views[0]
     setup_state.view_statuses[view.name] = ViewStatus(name=view.name)
@@ -1418,9 +1418,9 @@ async def test_post_restart_no_change_clears_chunks_total(setup_state, tmp_path)
     """A NO_CHANGE tick after a restart that hydrated mid-backfill state
     must clear ``chunks_total``. Otherwise the UI keeps showing a phantom
     backfill in flight after the source caught up."""
-    from trino_mv_orchestrator import server as server_mod
-    from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
-    from trino_mv_orchestrator.introspect import ColumnInfo
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.introspect import ColumnInfo
 
     view = setup_state.config.views[0]
     h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
@@ -1473,9 +1473,9 @@ async def test_post_restart_no_change_clears_chunks_total(setup_state, tmp_path)
 async def test_maintenance_persists_full_field_dict(setup_state, tmp_path):
     """``maintain_view`` must persist every MaintenanceOpStatus field, not
     just last_run — so total_runs / last_duration etc. survive restart."""
-    from trino_mv_orchestrator import server as server_mod
-    from trino_mv_orchestrator.config import ViewConfig
-    from trino_mv_orchestrator.executor import QueryInfo
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.config import ViewConfig
+    from iceberg_ivm.executor import QueryInfo
 
     v = ViewConfig(
         name="test_view",
@@ -1513,7 +1513,7 @@ async def test_maintenance_persists_full_field_dict(setup_state, tmp_path):
 
 async def test_hydrate_restores_full_maintenance_state(setup_state, tmp_path):
     """Hydration must rebuild every MaintenanceOpStatus field, not just last_run."""
-    from trino_mv_orchestrator import server as server_mod
+    from iceberg_ivm import server as server_mod
 
     h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
     await h.open()
@@ -1542,7 +1542,7 @@ async def test_hydrate_restores_full_maintenance_state(setup_state, tmp_path):
 
 def test_new_metrics_defined():
     """Verify the enhanced metrics are importable."""
-    from trino_mv_orchestrator.server import (
+    from iceberg_ivm.server import (
         DETECTION_DURATION,
         REFRESH_BYTES,
         REFRESH_ROWS,
@@ -1630,7 +1630,7 @@ def test_create_view_rejects_legacy_range_filter(client, setup_state):
 
 
 def _chunked_view_config():
-    from trino_mv_orchestrator.config import ViewConfig
+    from iceberg_ivm.config import ViewConfig
     return ViewConfig(
         name="test_view",
         query=(
@@ -1644,7 +1644,7 @@ def _chunked_view_config():
 
 def _install_chunked_view(s):
     """Swap setup_state's view for one with full_refresh_chunk='day'."""
-    from trino_mv_orchestrator.config import Config
+    from iceberg_ivm.config import Config
     view = _chunked_view_config()
     s.config = Config(trino=s.config.trino, views=[view], server=s.config.server)
     return view
@@ -1668,10 +1668,10 @@ async def test_refresh_view_chunked_backfill_completes(setup_state, tmp_path):
     the executor, and write ``last_source_snapshot`` on clean completion."""
     from datetime import datetime, timezone
 
-    from trino_mv_orchestrator import server as server_mod
-    from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
-    from trino_mv_orchestrator.executor import QueryInfo
-    from trino_mv_orchestrator.introspect import ColumnInfo
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.executor import QueryInfo
+    from iceberg_ivm.introspect import ColumnInfo
 
     view = _install_chunked_view(setup_state)
     setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
@@ -1724,10 +1724,10 @@ async def test_refresh_view_interrupt_skips_last_snapshot_write(setup_state, tmp
     Partial chunks already appended to recent_queries are preserved."""
     from datetime import datetime, timezone
 
-    from trino_mv_orchestrator import server as server_mod
-    from trino_mv_orchestrator.detector import ChangeResult, RefreshAction
-    from trino_mv_orchestrator.executor import QueryInfo
-    from trino_mv_orchestrator.introspect import ColumnInfo
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.executor import QueryInfo
+    from iceberg_ivm.introspect import ColumnInfo
 
     view = _install_chunked_view(setup_state)
     setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
@@ -1782,7 +1782,7 @@ async def test_refresh_view_interrupt_skips_last_snapshot_write(setup_state, tmp
 def test_chunk_metrics_defined():
     """Per-chunk Prometheus metrics are registered so operators can build
     chunked-backfill dashboards without scraping stdout."""
-    from trino_mv_orchestrator import server as server_mod
+    from iceberg_ivm import server as server_mod
     assert hasattr(server_mod, "CHUNKS_COMPLETED")
     assert hasattr(server_mod, "CHUNK_DURATION")
     assert hasattr(server_mod, "CHUNK_ROWS")

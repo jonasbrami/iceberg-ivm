@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import pytest
 
-from trino_mv_orchestrator.executor import QueryInfo
-from trino_mv_orchestrator.query_history import QueryHistory
+from iceberg_ivm.executor import QueryInfo
+from iceberg_ivm.query_history import QueryHistory
 
 
 def _q(qid: str, started_at: float, stage: str = "merge") -> QueryInfo:

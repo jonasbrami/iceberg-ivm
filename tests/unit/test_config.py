@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from trino_mv_orchestrator.config import (
+from iceberg_ivm.config import (
     ViewConfig,
     load_config,
     load_views,
