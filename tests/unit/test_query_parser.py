@@ -117,6 +117,24 @@ class TestParseViewQuery:
         # First merge key comes from the bare `symbol` projection
         assert p.merge_keys[0] == "symbol"
 
+    def test_from_table_with_alias_strips_alias(self):
+        # Regression: an alias on the FROM table used to leak into source_table,
+        # producing invalid system-table references like "iceberg.x.y t$snapshots".
+        sql = (
+            "SELECT date_trunc('day', ts) AS d "
+            "FROM iceberg.market.trades t GROUP BY 1"
+        )
+        p = parse_view_query(sql)
+        assert p.source_table == "iceberg.market.trades"
+
+    def test_from_table_with_as_alias_strips_alias(self):
+        sql = (
+            "SELECT date_trunc('day', ts) AS d "
+            "FROM iceberg.market.trades AS t GROUP BY 1"
+        )
+        p = parse_view_query(sql)
+        assert p.source_table == "iceberg.market.trades"
+
 
 # ---------------------------------------------------------------------------
 # Rejection cases
@@ -357,6 +375,47 @@ class TestInjectRangeFilter:
         out = inject_range_filter(sql, "ts", start, end)
         assert "TIMESTAMP '2026-04-06 00:00:00.000000 UTC'" in out
         assert "TIMESTAMP '2026-04-13 00:00:00.000000 UTC'" in out
+
+    def test_existing_where_with_string_literal_containing_where(self):
+        # Regex paranoia: a string literal whose value contains the word
+        # 'WHERE' must land inside the parens, not split the body.
+        sql = (
+            "SELECT date_trunc('day', ts) AS d FROM t "
+            "WHERE label = 'WHERE clause' GROUP BY 1"
+        )
+        out = inject_range_filter(sql, "ts", self.START, self.END)
+        body = out.split("WHERE", 1)[1].split("GROUP BY", 1)[0]
+        assert "(label = 'WHERE clause')" in body
+        assert self._predicate() in out
+
+    def test_existing_where_multiline_with_or(self):
+        sql = (
+            "SELECT date_trunc('day', ts) AS d FROM t\n"
+            "WHERE region = 'US'\n"
+            "   OR region = 'EU'\n"
+            "GROUP BY 1"
+        )
+        out = inject_range_filter(sql, "ts", self.START, self.END)
+        body = out.split("WHERE", 1)[1].split("GROUP BY", 1)[0]
+        assert "(" in body and ")" in body
+        assert "region = 'US'" in body and "region = 'EU'" in body
+        assert self._predicate() in out
+
+    def test_existing_where_with_or_is_parenthesised(self):
+        # Regression: AND binds tighter than OR, so AND-appending the time
+        # predicate onto `WHERE A OR B` used to yield `A OR (B AND ts in range)`,
+        # leaving A-rows unfiltered by time and silently corrupting the target.
+        sql = (
+            "SELECT date_trunc('day', ts) AS d FROM t "
+            "WHERE region = 'US' OR region = 'EU' GROUP BY 1"
+        )
+        out = inject_range_filter(sql, "ts", self.START, self.END)
+        # The injected SQL must filter every branch of the OR.
+        # Re-parsing as a simple precedence check: the OR must be inside parens
+        # so the trailing AND-chain applies to the whole disjunction.
+        where_body = out.split("WHERE", 1)[1].split("GROUP BY", 1)[0]
+        assert "(region = 'US' OR region = 'EU')" in where_body
+        assert self._predicate() in out
 
     def test_result_parses_as_valid_query(self):
         """Round-trip: inject, re-parse, extract same fields."""

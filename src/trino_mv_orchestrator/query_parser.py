@@ -89,6 +89,7 @@ def parse_view_query(sql: str) -> ParsedView:
 
 
 _TRAILING_CLAUSES = ("GROUP BY", "HAVING", "ORDER BY", "LIMIT", "OFFSET", "FETCH")
+_WHERE_BODY_RE = re.compile(r"^(\s*WHERE\s+)(.*)$", re.IGNORECASE | re.DOTALL)
 
 
 def inject_range_filter(
@@ -105,12 +106,18 @@ def inject_range_filter(
 
     where = next((t for t in stmt.tokens if isinstance(t, Where)), None)
     if where is not None:
-        # Append " AND <predicate>" onto the existing WHERE, keeping any
-        # trailing whitespace so the next keyword stays separated.
+        # Wrap the existing WHERE body in parens before AND-appending the
+        # range predicate. AND binds tighter than OR, so an unparenthesised
+        # `WHERE A OR B` would become `A OR (B AND ts in range)` — leaving
+        # A-rows unfiltered by time and silently corrupting the target.
         original = str(where)
         stripped = original.rstrip()
         trailing = original[len(stripped):] or " "
-        where.tokens = [Token(None, f"{stripped} AND {predicate}{trailing}")]
+        m = _WHERE_BODY_RE.match(stripped)
+        if not m:
+            raise ValueError(f"could not parse WHERE clause: {stripped!r}")
+        prefix, body = m.group(1), m.group(2).strip()
+        where.tokens = [Token(None, f"{prefix}({body}) AND {predicate}{trailing}")]
         return str(stmt)
 
     # No WHERE: insert one before the first trailing clause, else at end.
@@ -169,7 +176,7 @@ def _reject_unsupported_shapes(stmt: Statement) -> None:
 
 
 def _extract_source_table(stmt: Statement) -> str:
-    """Return the qualified name following FROM."""
+    """Return the qualified name following FROM, stripping any alias."""
     from_idx = next(
         (i for i, t in enumerate(stmt.tokens)
          if t.ttype is Keyword and t.normalized.upper() == "FROM"),
@@ -180,13 +187,32 @@ def _extract_source_table(stmt: Statement) -> str:
     _, t = stmt.token_next(from_idx, skip_ws=True, skip_cm=True)
     if isinstance(t, Parenthesis):
         raise ValueError("subqueries in FROM are not supported")
-    if isinstance(t, Identifier) or (t is not None and t.ttype is Name):
-        name = str(t).strip()
-        # A subquery-with-alias (e.g. `(SELECT …) x`) is wrapped as an
-        # Identifier whose text starts with `(`.
-        if name.startswith("("):
+    if isinstance(t, Identifier):
+        # Subquery-with-alias (e.g. `(SELECT …) x`) wraps as an Identifier
+        # whose text starts with `(`.
+        if str(t).lstrip().startswith("("):
             raise ValueError("subqueries in FROM are not supported")
-        return name
+        # The qualified table name is the leading run of Name + `.` tokens;
+        # everything after (whitespace, `AS`, alias) is dropped so a FROM
+        # like `iceberg.x.y t` doesn't leak the alias into source_table.
+        parts: list[str] = []
+        for child in t.tokens:
+            if child.ttype is Name:
+                parts.append(str(child))
+            elif child.ttype is Punctuation and str(child) == ".":
+                parts.append(".")
+            else:
+                break
+        if parts:
+            return "".join(parts)
+        # Fallback for Identifier shapes whose first child isn't a Name —
+        # e.g. quoted identifiers (`"cat"."tbl"`) tokenise as String.Symbol
+        # children. Returning the raw text preserves the qualified name but
+        # may carry a trailing alias; QUALIFIED_NAME_RE downstream rejects
+        # quoted forms anyway.
+        return str(t).strip()
+    if t is not None and t.ttype is Name:
+        return str(t).strip()
     raise ValueError(
         f"could not parse table reference after FROM: {str(t)!r}"
     )
