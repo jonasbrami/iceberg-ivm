@@ -378,7 +378,7 @@ Open http://localhost:8000 after starting the service. You get a single-page app
   - stats row: total `Refreshes`, last `Duration`, polled `Interval`, `Last` refresh timestamp, cumulative `Errors`
   - **Refresh / Edit / Delete** buttons
   - a collapsible **query** panel with the raw SQL
-  - a collapsible **recent queries (N)** panel with one row per refresh-time query (`merge` / `full_delete` / `full_insert`) — click any row to open that query in the Trino UI
+  - a collapsible **recent queries (N)** panel with one row per refresh-time query (`merge`, `chunk_merge`, or `maintenance_<op>`) — click any row to open that query in the Trino UI
 - **Live query parsing** — while you type in the create/edit modal, a debounced panel under the query textarea shows the parser's derived `source`, `filter col`, `granularity`, and `merge keys`, or a red parse error.
 - **Refresh toast** — clicking Refresh pops a small bottom-right toast reporting the action (`no changes` / `incremental refresh` / `full refresh` / error message).
 

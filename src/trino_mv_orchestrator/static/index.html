@@ -197,7 +197,7 @@
                         d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3" />
                 </svg>
                 <span class="text-[11px] font-mono text-[#5c5c7a]"
-                      x-text="view.target_table || 'auto'"></span>
+                      x-text="view.target_table"></span>
               </div>
             </div>
 
@@ -360,18 +360,19 @@
             <div class="mt-[9px] bg-[#f4f4f9] border border-[rgba(15,15,30,0.06)] rounded-lg
                         divide-y divide-[rgba(15,15,30,0.05)]">
               <template x-for="q in view.status.recent_queries" :key="q.query_id">
-                <a :href="q.info_uri" target="_blank" rel="noopener"
+                <a :href="q.info_uri || null"
+                   :target="q.info_uri ? '_blank' : null"
+                   rel="noopener"
+                   :class="q.info_uri ? '' : 'pointer-events-none'"
                    class="flex items-center gap-[10px] px-3 py-[8px] hover:bg-white/60 transition-colors duration-100">
                   <!-- stage chip -->
                   <span class="shrink-0 text-[9.5px] uppercase tracking-[0.08em] font-mono font-medium
                                px-[7px] py-[2px] rounded-md"
-                        :class="q.stage === 'merge'
+                        :class="(q.stage === 'merge' || q.stage === 'chunk_merge')
                                   ? 'bg-indigo-500/[0.10] text-indigo-700 border border-indigo-500/[0.25]'
-                                  : q.stage === 'full_insert'
-                                    ? 'bg-emerald-500/[0.10] text-emerald-800 border border-emerald-500/[0.25]'
-                                    : q.stage?.startsWith('maintenance_')
-                                      ? 'bg-purple-500/[0.10] text-purple-700 border border-purple-500/[0.25]'
-                                      : 'bg-[rgba(15,15,30,0.05)] text-[#666684] border border-[rgba(15,15,30,0.10)]'"
+                                  : q.stage?.startsWith('maintenance_')
+                                    ? 'bg-purple-500/[0.10] text-purple-700 border border-purple-500/[0.25]'
+                                    : 'bg-[rgba(15,15,30,0.05)] text-[#666684] border border-[rgba(15,15,30,0.10)]'"
                         x-text="q.stage"></span>
 
                   <!-- query id -->
@@ -590,8 +591,8 @@
                 </div>
               </template>
 
-              <!-- string / array (single-line input) -->
-              <template x-if="field.type === 'string' || field.type === 'array'">
+              <!-- string (single-line input) -->
+              <template x-if="field.type === 'string'">
                 <input
                   x-model="form[field.name]"
                   type="text"
@@ -803,11 +804,7 @@ function app() {
       const populated = {};
       for (const f of this.schema) {
         const v = view[f.name];
-        if (f.type === 'array') {
-          populated[f.name] = Array.isArray(v) ? v.join(', ') : (v || '');
-        } else {
-          populated[f.name] = v != null ? v : '';
-        }
+        populated[f.name] = v != null ? v : '';
       }
       this.form = populated;
       this.formError = '';
@@ -815,17 +812,16 @@ function app() {
       this.parseError = '';
       this.showForm = true;
       // Populate the parsed panel immediately so the user sees the
-      // current derivation without waiting for the debounce.
-      this.scheduleParse();
+      // current derivation without the 350ms debounce.
+      const q = (this.form.query || '').trim();
+      if (q) this.runParse(q);
     },
 
     buildBody() {
       const body = {};
       for (const f of this.schema) {
         const raw = this.form[f.name];
-        if (f.type === 'array') {
-          body[f.name] = String(raw || '').split(',').map(s => s.trim()).filter(Boolean);
-        } else if (f.type === 'boolean') {
+        if (f.type === 'boolean') {
           body[f.name] = !!raw;
         } else if (f.type === 'number') {
           body[f.name] = raw;
@@ -842,10 +838,7 @@ function app() {
       for (const f of this.schema) {
         if (!f.required) continue;
         const v = this.form[f.name];
-        const empty = f.type === 'array'
-          ? String(v || '').split(',').map(s => s.trim()).filter(Boolean).length === 0
-          : v === '' || v == null;
-        if (empty) return `${f.label} is required.`;
+        if (v === '' || v == null) return `${f.label} is required.`;
       }
       return null;
     },
