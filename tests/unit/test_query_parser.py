@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from trino_mv_orchestrator.query_parser import (
+from iceberg_ivm.query_parser import (
     ParsedView,
     VALID_GRANULARITIES,
     inject_range_filter,

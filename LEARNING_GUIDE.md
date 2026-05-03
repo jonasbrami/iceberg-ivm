@@ -432,7 +432,7 @@ flowchart TB
 
 | What | Where |
 |---|---|
-| Entry point | `src/trino_mv_orchestrator/cli.py:8-56` |
+| Entry point | `src/iceberg_ivm/cli.py:8-56` |
 | FastAPI app + lifespan | `server.py:291-317` |
 | Refresh loop | `server.py:264-286` |
 | Per-view refresh | `server.py:177-262` |

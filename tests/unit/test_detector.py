@@ -1,7 +1,7 @@
 """Tests for the change detector."""
 from datetime import datetime, timedelta, timezone
 
-from trino_mv_orchestrator.detector import (
+from iceberg_ivm.detector import (
     ExpiredSnapshotError,
     MissingFilterColumnError,
     RefreshAction,

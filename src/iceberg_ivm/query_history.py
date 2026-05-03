@@ -17,7 +17,7 @@ from pathlib import Path
 
 import aiosqlite
 
-from trino_mv_orchestrator.executor import QueryInfo
+from iceberg_ivm.executor import QueryInfo
 
 log = logging.getLogger(__name__)
 

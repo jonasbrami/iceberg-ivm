@@ -1,13 +1,13 @@
 """Tests for the refresh executor."""
 from datetime import datetime, timezone
 
-from trino_mv_orchestrator.config import ViewConfig
-from trino_mv_orchestrator.executor import (
+from iceberg_ivm.config import ViewConfig
+from iceberg_ivm.executor import (
     build_merge_sql,
     execute_maintenance,
     execute_refresh,
 )
-from trino_mv_orchestrator.query_parser import parse_view_query
+from iceberg_ivm.query_parser import parse_view_query
 
 
 def make_view(**overrides) -> ViewConfig:

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import yaml
 
-from trino_mv_orchestrator.query_parser import (
+from iceberg_ivm.query_parser import (
     IDENTIFIER_RE,
     QUALIFIED_NAME_RE,
     VALID_GRANULARITIES,

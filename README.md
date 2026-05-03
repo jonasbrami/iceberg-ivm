@@ -1,4 +1,4 @@
-# trino-mv-orchestrator
+# iceberg-ivm
 
 A simple **Iceberg IVM (incremental view maintenance) controller** that delegates
 all computation to Trino.
@@ -72,7 +72,7 @@ views: []     # add views here, or manage them via the web UI
 # docker-compose.yml
 services:
   orchestrator:
-    image: jonasbrami/trino-mv-orchestrator:0.2.1
+    image: jonasbrami/iceberg-ivm:0.2.1
     environment:
       TRINO_URL: http://trino:8080
       TRINO_USER: orchestrator
@@ -329,7 +329,7 @@ uv sync
 export TRINO_URL=http://localhost:8080
 export TRINO_USER=orchestrator
 # export TRINO_PASSWORD=…            # only if your Trino requires it
-uv run trino-mv-orchestrator -c config.yaml --views views.yaml
+uv run iceberg-ivm -c config.yaml --views views.yaml
 # Web UI:  http://localhost:8000
 # Metrics: http://localhost:8000/metrics
 ```
@@ -362,7 +362,7 @@ uv run --with trino python tests/seed_data.py
 # stays unset:
 export TRINO_URL=http://localhost:18080
 export TRINO_USER=demo
-uv run trino-mv-orchestrator -c config.yaml --views views.yaml
+uv run iceberg-ivm -c config.yaml --views views.yaml
 ```
 
 ## Using it
@@ -718,7 +718,7 @@ cd tests && docker compose down -v
 ## Project structure
 
 ```
-src/trino_mv_orchestrator/
+src/iceberg_ivm/
     config.py        -- YAML config loading, saving, validation
     detector.py      -- $snapshots + $all_entries file stats + expand_to_bucket_bounds()
     executor.py      -- MERGE SQL generation + execution

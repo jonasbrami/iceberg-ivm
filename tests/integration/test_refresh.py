@@ -6,11 +6,11 @@ from __future__ import annotations
 
 import pytest
 
-from trino_mv_orchestrator.config import ViewConfig
-from trino_mv_orchestrator.detector import RefreshAction, detect_changes
-from trino_mv_orchestrator.executor import execute_refresh
-from trino_mv_orchestrator.introspect import build_create_table_sql, discover_columns
-from trino_mv_orchestrator.query_parser import parse_view_query
+from iceberg_ivm.config import ViewConfig
+from iceberg_ivm.detector import RefreshAction, detect_changes
+from iceberg_ivm.executor import execute_refresh
+from iceberg_ivm.introspect import build_create_table_sql, discover_columns
+from iceberg_ivm.query_parser import parse_view_query
 
 pytestmark = [pytest.mark.integration, pytest.mark.xdist_group("integration")]
 

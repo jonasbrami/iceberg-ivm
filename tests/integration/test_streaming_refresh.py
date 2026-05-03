@@ -18,8 +18,8 @@ from datetime import datetime, timezone
 
 import pytest
 
-from trino_mv_orchestrator.config import ViewConfig
-from trino_mv_orchestrator.server import refresh_view
+from iceberg_ivm.config import ViewConfig
+from iceberg_ivm.server import refresh_view
 
 from ._driver import Cycle, Trade, fetch_target_rows, insert_trades_batch
 from ._oracle import OhlcvOracle

@@ -61,4 +61,4 @@ services:
       - ../config.yaml:/app/config.yaml
     ports:
       - "8000:8000"
-    command: ["trino-mv-orchestrator", "-c", "/app/config.yaml"]
+    command: ["iceberg-ivm", "-c", "/app/config.yaml"]

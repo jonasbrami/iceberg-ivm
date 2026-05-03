@@ -11,9 +11,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from trino_mv_orchestrator.config import Config, TrinoConfig, ServerConfig
-from trino_mv_orchestrator.query_history import QueryHistory
-from trino_mv_orchestrator.server import AppState, RECENT_QUERY_LIMIT
+from iceberg_ivm.config import Config, TrinoConfig, ServerConfig
+from iceberg_ivm.query_history import QueryHistory
+from iceberg_ivm.server import AppState, RECENT_QUERY_LIMIT
 
 
 @dataclass

@@ -104,7 +104,7 @@ views:
     print("  export TRINO_URL=http://localhost:18080")
     print("  export TRINO_USER=demo")
     print("  # TRINO_PASSWORD is optional — omit for the local anonymous-access compose stack")
-    print("  uv run trino-mv-orchestrator -c config.yaml --views views.yaml")
+    print("  uv run iceberg-ivm -c config.yaml --views views.yaml")
     print("\nOpen: http://localhost:8000")
 
     conn.close()

@@ -1,6 +1,6 @@
 """Tests for the introspection module."""
 
-from trino_mv_orchestrator.introspect import (
+from iceberg_ivm.introspect import (
     ColumnInfo,
     build_create_table_sql,
     discover_columns,
