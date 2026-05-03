@@ -800,6 +800,9 @@ function app() {
     },
 
     editView(view) {
+      // Cancel any debounced parse from the previous form session so a stale
+      // timer can't fire after we've already populated the panel below.
+      if (this._parseTimer) { clearTimeout(this._parseTimer); this._parseTimer = null; }
       this.editingView = view.name;
       const populated = {};
       for (const f of this.schema) {

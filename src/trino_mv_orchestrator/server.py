@@ -720,18 +720,21 @@ VIEW_FORM_SCHEMA: list[dict] = _build_form_schema()
 def _build_view_create_model() -> type[BaseModel]:
     """Pydantic ViewCreate model auto-derived from ViewConfig fields.
 
-    ``name`` is optional at the API boundary — empty strings round-trip and
-    are substituted with ``target_table`` inside the create handler.
+    ``name`` is optional at the API boundary — both ``""`` and ``null``
+    round-trip and are substituted with ``target_table`` inside the create
+    handler. The ``str | None`` typing keeps any reasonable client (UI
+    JS that emits ``null`` for blank optional fields, curl, etc.) from
+    needing to know our defaulting rule.
     """
     fields_spec: dict[str, tuple] = {}
     for f in dataclasses.fields(ViewConfig):
         if f.name == "name":
-            default = ""
-        elif f.default is dataclasses.MISSING:
-            default = ...
+            field_type: object = typing.Optional[str]
+            default = None
         else:
-            default = f.default
-        fields_spec[f.name] = (_VIEW_TYPES[f.name], default)
+            field_type = _VIEW_TYPES[f.name]
+            default = ... if f.default is dataclasses.MISSING else f.default
+        fields_spec[f.name] = (field_type, default)
 
     def _check_name(cls, v):
         if not v:

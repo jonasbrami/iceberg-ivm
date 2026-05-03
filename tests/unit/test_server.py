@@ -214,6 +214,40 @@ def test_create_view_blank_name_defaults_to_target_table(client):
     assert r.json()["name"] == "iceberg.analytics.blank_name_view"
 
 
+def test_create_view_null_name_defaults_to_target_table(client):
+    """The web UI's buildBody emits null for blank non-required string fields.
+    The API must accept that shape — regression for an earlier version that
+    typed name as str (rejected null with a 422)."""
+    r = client.post("/api/views", json={
+        "name": None,
+        "target_table": "iceberg.analytics.null_name_view",
+        "query": (
+            "SELECT date_trunc('day', ts) AS d FROM iceberg.db.t GROUP BY 1"
+        ),
+    })
+    assert r.status_code == 201, r.text
+    assert r.json()["name"] == "iceberg.analytics.null_name_view"
+
+
+def test_create_view_with_dotted_fqdn_name(client):
+    """A dotted-FQDN name (the default behavior shape) round-trips through
+    POST and is accessible via subsequent /api/views/{name} routes."""
+    fqdn = "iceberg.analytics.dotted_view"
+    r = client.post("/api/views", json={
+        "target_table": fqdn,
+        "query": (
+            "SELECT date_trunc('day', ts) AS d FROM iceberg.db.t GROUP BY 1"
+        ),
+    })
+    assert r.status_code == 201
+    assert r.json()["name"] == fqdn
+    # GET-via-list returns it
+    listed = {v["name"] for v in client.get("/api/views").json()}
+    assert fqdn in listed
+    # DELETE by FQDN-name path-param works
+    assert client.delete(f"/api/views/{fqdn}").status_code == 204
+
+
 def test_create_duplicate(client):
     r = client.post("/api/views", json={
         "name": "test_view",
