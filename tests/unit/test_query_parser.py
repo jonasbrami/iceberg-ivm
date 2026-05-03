@@ -376,6 +376,31 @@ class TestInjectRangeFilter:
         assert "TIMESTAMP '2026-04-06 00:00:00.000000 UTC'" in out
         assert "TIMESTAMP '2026-04-13 00:00:00.000000 UTC'" in out
 
+    def test_existing_where_with_string_literal_containing_where(self):
+        # Regex paranoia: a string literal whose value contains the word
+        # 'WHERE' must land inside the parens, not split the body.
+        sql = (
+            "SELECT date_trunc('day', ts) AS d FROM t "
+            "WHERE label = 'WHERE clause' GROUP BY 1"
+        )
+        out = inject_range_filter(sql, "ts", self.START, self.END)
+        body = out.split("WHERE", 1)[1].split("GROUP BY", 1)[0]
+        assert "(label = 'WHERE clause')" in body
+        assert self._predicate() in out
+
+    def test_existing_where_multiline_with_or(self):
+        sql = (
+            "SELECT date_trunc('day', ts) AS d FROM t\n"
+            "WHERE region = 'US'\n"
+            "   OR region = 'EU'\n"
+            "GROUP BY 1"
+        )
+        out = inject_range_filter(sql, "ts", self.START, self.END)
+        body = out.split("WHERE", 1)[1].split("GROUP BY", 1)[0]
+        assert "(" in body and ")" in body
+        assert "region = 'US'" in body and "region = 'EU'" in body
+        assert self._predicate() in out
+
     def test_existing_where_with_or_is_parenthesised(self):
         # Regression: AND binds tighter than OR, so AND-appending the time
         # predicate onto `WHERE A OR B` used to yield `A OR (B AND ts in range)`,

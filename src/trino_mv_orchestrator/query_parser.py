@@ -205,6 +205,11 @@ def _extract_source_table(stmt: Statement) -> str:
                 break
         if parts:
             return "".join(parts)
+        # Fallback for Identifier shapes whose first child isn't a Name —
+        # e.g. quoted identifiers (`"cat"."tbl"`) tokenise as String.Symbol
+        # children. Returning the raw text preserves the qualified name but
+        # may carry a trailing alias; QUALIFIED_NAME_RE downstream rejects
+        # quoted forms anyway.
         return str(t).strip()
     if t is not None and t.ttype is Name:
         return str(t).strip()
