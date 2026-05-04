@@ -31,7 +31,10 @@ class MissingFilterColumnError(Exception):
 
 
 class UnexpectedOperationError(Exception):
-    """Source snapshot used a non-append/replace operation — append-only assumption violated."""
+    """Source snapshot used a `delete` (or otherwise unknown) op — the
+    no-data-loss assumption is violated. Allowed ops are `append` and
+    `overwrite` (real data changes that drive incremental refresh) and
+    `replace` (compaction, skipped)."""
 
 
 @dataclass
@@ -87,7 +90,18 @@ async def get_snapshots_since(cursor, source_table: str, last_snap: int) -> list
     return [{"snapshot_id": r[0], "operation": r[1]} for r in await cursor.fetchall()]
 
 
-ALLOWED_OPS = frozenset({"append", "replace"})
+# Snapshot ops the detector understands. `delete` and any unknown op fall
+# through to UnexpectedOperationError below.
+#
+#   append    — new data, drive incremental refresh
+#   overwrite — MERGE INTO (e.g. an upstream chained MV's refresh): treat
+#               its added files exactly like an append for file-stats
+#               purposes and drive incremental refresh
+#   replace   — compaction / OPTIMIZE: no logical data change, skip the
+#               refresh but advance the bookmark
+CHANGE_OPS = frozenset({"append", "overwrite"})
+NOOP_OPS = frozenset({"replace"})
+ALLOWED_OPS = CHANGE_OPS | NOOP_OPS
 
 
 async def get_new_files_column_range(
@@ -311,19 +325,20 @@ async def detect_changes(
     ops = [s["operation"] for s in snapshots]
     log.debug("%s: %d new snapshots, operations: %s", source_table, len(snapshots), ops)
 
-    # Classify operations under the append-only assumption:
-    #   append   → real new data, drive incremental refresh
-    #   replace  → compaction (files rewritten, no data change) — skip
-    #   anything else → fail loudly, assumption violated
+    # Classify operations:
+    #   append, overwrite → real data changes, drive incremental refresh
+    #   replace           → compaction (files rewritten, no data change) — skip
+    #   anything else     → fail loudly (delete, or some new Iceberg op)
     unknown = [op for op in ops if op not in ALLOWED_OPS]
     if unknown:
         raise UnexpectedOperationError(
             f"{source_table}: unexpected snapshot operations {unknown} — "
-            f"source table must be append-only (compaction allowed)."
+            f"source must only see append / overwrite (data changes) or "
+            f"replace (compaction); pure deletes are not supported."
         )
 
-    append_snaps = [s for s in snapshots if s["operation"] == "append"]
-    if not append_snaps:
+    change_snaps = [s for s in snapshots if s["operation"] in CHANGE_OPS]
+    if not change_snaps:
         # Only compactions since last_snap; advance state, don't refresh.
         log.info(
             "%s: only compaction (replace) snapshots since %d → advance state, skip",
@@ -331,9 +346,10 @@ async def detect_changes(
         )
         return ChangeResult(action=RefreshAction.NO_CHANGE, current_snapshot=current_snap)
 
-    # Read column range from files added in APPEND snapshots only.
-    # Including compaction-added files would uselessly expand the range.
-    snap_ids = [s["snapshot_id"] for s in append_snaps]
+    # Read column range from files added in CHANGE snapshots only
+    # (append + overwrite). Including compaction-added files would
+    # uselessly expand the range with rewritten copies of unchanged data.
+    snap_ids = [s["snapshot_id"] for s in change_snaps]
     col_range = await get_new_files_column_range(cursor, source_table, snap_ids, filter_column)
     if col_range is None:
         # New snapshots but no data files (e.g. compaction-only)

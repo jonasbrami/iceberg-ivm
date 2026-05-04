@@ -563,17 +563,78 @@ class TestDetectChanges:
         )
         assert "51" not in file_query
 
-    async def test_unexpected_operation_raises(self):
-        """`overwrite`, `delete`, and any unknown op violate the
-        append-only assumption and must raise, not silently trigger a
-        FULL_REFRESH (which was the old behavior)."""
+    async def test_delete_operation_raises(self):
+        """`delete` and any unknown op violate the no-data-loss assumption
+        and must raise, not silently trigger a FULL_REFRESH (which was the
+        old behavior)."""
         cursor = MockCursor([
             [(200,)],
             [(1_700_000_000_000,)],
-            [(200, "overwrite")],
+            [(200, "delete")],
         ])
         with pytest.raises(UnexpectedOperationError):
             await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
+
+    async def test_unknown_operation_raises(self):
+        """An entirely unknown operation name must also raise loudly so
+        new Iceberg ops are surfaced to the operator instead of silently
+        ignored."""
+        cursor = MockCursor([
+            [(200,)],
+            [(1_700_000_000_000,)],
+            [(200, "rewrite")],   # not in the allowed set
+        ])
+        with pytest.raises(UnexpectedOperationError):
+            await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
+
+    async def test_overwrite_drives_incremental_refresh(self):
+        """`overwrite` snapshots are produced by MERGE INTO (e.g. an upstream
+        chained MV's refresh). They are real data changes and must drive
+        an incremental refresh exactly like `append`, scoping the
+        $all_entries file-range query to the overwrite snapshot's added
+        files."""
+        cursor = MockCursor([
+            [(200,)],                                                    # current_snapshot
+            [(1_700_000_000_000,)],                                      # committed_at lookup
+            [(200, "overwrite")],                                        # one MERGE-driven snapshot
+            [({"ts": {"lower_bound": "2026-04-08T10:00:00+00:00",
+                      "upper_bound": "2026-04-08T15:30:00+00:00"}},)],
+        ])
+        r = await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
+        assert r.action == RefreshAction.INCREMENTAL
+        assert r.current_snapshot == 200
+        assert r.filter_range is not None
+        start, end = r.filter_range
+        # Day granularity: should snap to full day [Apr 8, Apr 9)
+        assert start == datetime(2026, 4, 8, tzinfo=timezone.utc)
+        assert end == datetime(2026, 4, 9, tzinfo=timezone.utc)
+        # The file-range query must scope to snapshot 200.
+        file_query = next(s for s in cursor.executed_sql if "all_entries" in s)
+        assert "IN (200)" in file_query
+
+    async def test_mixed_append_overwrite_replace_uses_change_snapshots(self):
+        """When the new-snapshot set mixes append, overwrite (MERGE) and
+        replace (compaction), the file-range query must scope to the
+        change-driving snapshots only (append + overwrite), never to
+        compaction-rewritten files."""
+        cursor = MockCursor([
+            [(53,)],                                                     # current_snapshot
+            [(1_700_000_000_000,)],                                      # committed_at lookup
+            [(50, "append"),
+             (51, "replace"),
+             (52, "overwrite"),
+             (53, "replace")],                                           # mixed
+            [({"ts": {"lower_bound": "2026-04-08T09:00:00+00:00",
+                      "upper_bound": "2026-04-08T10:00:00+00:00"}},)],
+        ])
+        r = await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
+        assert r.action == RefreshAction.INCREMENTAL
+        file_query = next(s for s in cursor.executed_sql if "all_entries" in s)
+        # Both 50 (append) and 52 (overwrite) drive change; 51/53 (replace) must not.
+        assert "50" in file_query
+        assert "52" in file_query
+        assert "51" not in file_query
+        assert "53" not in file_query
 
 
 # ── walk_buckets ──
