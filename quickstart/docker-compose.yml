@@ -63,7 +63,7 @@ services:
     restart: "no"
 
   iceberg-ivm:
-    image: ghcr.io/jonasbrami/iceberg-ivm:0.5.0
+    image: ghcr.io/jonasbrami/iceberg-ivm:0.6.0
     depends_on:
       seed:
         condition: service_completed_successfully
