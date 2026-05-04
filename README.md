@@ -3,6 +3,12 @@
 A simple **Iceberg IVM (incremental view maintenance) controller** that delegates
 all computation to Trino.
 
+> **Want to try it in one command?** See [`./quickstart`](./quickstart) — a
+> fully self-contained Trino + MinIO + Postgres + iceberg-ivm stack with
+> sample data and 8 pre-loaded materialized views.
+
+![iceberg-ivm UI](docs/screenshots/ui-overview.png)
+
 The service owns the control plane — view definitions, change detection,
 refresh scheduling, watermarks — while Trino executes the actual SQL against
 Iceberg tables. Change detection runs on Iceberg file-level metadata only;
@@ -91,7 +97,9 @@ curl localhost:8000/health          # → {"status":"ok","views":0}
 ```
 
 For a full local stack with a sandbox Trino + MinIO + Postgres, see
-[Quick start](#quick-start) below.
+**[`./quickstart`](./quickstart)** (one `docker compose up`, 8 pre-loaded
+views, no setup) or read the [Quick start](#quick-start) section below for
+the manual flow.
 
 ## How it works
 
@@ -348,8 +356,11 @@ hot-reloaded on mtime change at `server.config_reload_interval_seconds` (default
 
 ### Running against a local Trino stack
 
-A `tests/docker-compose.yml` brings up Trino + MinIO + Postgres for local
-development:
+For a turnkey demo, see **[`./quickstart`](./quickstart)** — one
+`docker compose up`, sample data seeded, 8 views pre-loaded.
+
+For development against the codebase, `tests/docker-compose.yml` brings up
+just Trino + MinIO + Postgres:
 
 ```bash
 cd tests && docker compose up -d trino

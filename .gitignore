@@ -13,8 +13,8 @@ wheels/
 .claude/
 
 # Runtime-generated config — use config.yaml.example as the template
-config.yaml
-views.yaml
+/config.yaml
+/views.yaml
 
 # iceberg-ivm state DB (created by running the service)
 *.db

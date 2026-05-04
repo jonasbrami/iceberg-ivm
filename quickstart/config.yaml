@@ -1,0 +1,8 @@
+server:
+  port: 8000
+  config_reload_interval_seconds: 30
+  state_db_path: /data/state/state.db
+
+trino:
+  catalog: iceberg
+  schema: analytics
