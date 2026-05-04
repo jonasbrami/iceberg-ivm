@@ -94,6 +94,7 @@ async def clean_tables(trino_conn):
     tables = [
         "iceberg.test_schema.trades",
         "iceberg.test_schema.ohlcv_1m",
+        "iceberg.test_schema.ohlcv_1h",
         "iceberg.test_schema.ohlcv_weekly",
         "iceberg.test_schema.ohlcv_monthly",
         "iceberg.test_schema.streaming_ohlcv",

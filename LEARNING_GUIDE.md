@@ -6,7 +6,7 @@ A guided tour of the codebase, designed to take you from zero to "I can extend t
 
 ## 1. The 60-Second Pitch
 
-Trino's built-in materialized view (MV) refresh only handles **scan-filter-project**. Any `GROUP BY` triggers a **full source rescan**. For append-only analytics tables (trades, logs, events), that's terabytes of repeated work every refresh.
+Trino's built-in materialized view (MV) refresh only handles **scan-filter-project**. Any `GROUP BY` triggers a **full source rescan**. For analytics tables that grow append-mostly (trades, logs, events) — and for chained MVs whose upstream writes via `MERGE INTO` — that's terabytes of repeated work every refresh.
 
 `iceberg-ivm` performs **incremental view maintenance** from the outside, using only **Iceberg metadata** — no source data is read during change detection. A typical detect-and-refresh cycle is ~50 ms of metadata work plus a partition-pruned `MERGE`.
 

@@ -149,23 +149,27 @@ tz.
 `server.get_trino_connection`. `date_trunc` on tz-aware columns then
 operates in UTC, aligning with `expand_to_bucket_bounds` by construction.
 
-### Append-only source assumption
+### No-data-loss-without-replacement source assumption
 
-The service assumes source tables are append-only. The only
-legitimate Iceberg snapshot operations are:
+The service assumes source tables don't lose data without replacement.
+The Iceberg snapshot operations the detector recognises:
 
 - `append` — real new data, drives incremental refresh.
+- `overwrite` — rows replaced (most commonly written by `MERGE INTO`,
+  including upstream chained-MV refreshes). Treated as a real data change:
+  the detector reads `$all_entries` for added files exactly as it does for
+  `append`, and drives incremental refresh.
 - `replace` — compaction rewrote files; no data changed. The detector
   advances state past the snapshot but does not run a refresh. Files
   added by `replace` snapshots are deliberately excluded from the
   `$all_entries` min/max scan (they're just rewritten rows and would
   uselessly expand the range).
 
-Anything else (`overwrite`, `delete`, or an unknown future op name)
-raises `UnexpectedOperationError` and surfaces in the view status. The
-old behavior — treating every non-append as a full refresh — was wrong
-under this assumption because compactions triggered needless full
-rewrites.
+Pure `delete` snapshots (or any unknown future op name) raise
+`UnexpectedOperationError` and surface in the view status — the
+correctness model can't reconstruct a removed bucket from `$all_entries`.
+The old behavior — treating every non-append as a full refresh — was wrong
+because compactions triggered needless full rewrites.
 
 ### Why not dbt?
 
@@ -181,8 +185,9 @@ Trino does NOT support multi-statement transactions on Iceberg. Each DML
 auto-commits immediately (`START TRANSACTION` / `COMMIT` / `ROLLBACK` are
 syntactic but don't provide atomicity -- verified in integration tests).
 
-MERGE is a single Iceberg commit = atomic. For append-only sources, MERGE
-correctly handles both updates (recomputed rows) and inserts (new rows).
+MERGE is a single Iceberg commit = atomic. It correctly handles both
+updates (recomputed rows) and inserts (new rows) for the source contract
+above (append + overwrite + replace).
 
 ### Why file-level stats, not partition diff?
 

@@ -3,6 +3,12 @@
 A simple **Iceberg IVM (incremental view maintenance) controller** that delegates
 all computation to Trino.
 
+> **Want to try it in one command?** See [`./quickstart`](./quickstart) — a
+> fully self-contained Trino + MinIO + Postgres + iceberg-ivm stack with
+> sample data and 8 pre-loaded materialized views.
+
+![iceberg-ivm UI](docs/screenshots/ui-overview.png)
+
 The service owns the control plane — view definitions, change detection,
 refresh scheduling, watermarks — while Trino executes the actual SQL against
 Iceberg tables. Change detection runs on Iceberg file-level metadata only;
@@ -44,7 +50,7 @@ This project combines three things no other option does together:
 2. **Snap that range outward to complete GROUP BY bucket boundaries** so re-aggregation produces correct results, regardless of how the source is partitioned.
 3. **Recompute the affected buckets from full source data via `MERGE`** — works for any aggregate (including non-decomposable ones like `min_by`, `max_by`, percentiles), and tolerates compaction by treating `replace` snapshots as no-ops.
 
-The result is a small, sharply-scoped service: append-only Iceberg sources, `date_trunc`-bucketed aggregations, Trino as the executor. No DAG, no second CLI, no fork of the engine.
+The result is a small, sharply-scoped service: Iceberg sources, `date_trunc`-bucketed aggregations, Trino as the executor. No DAG, no second CLI, no fork of the engine.
 
 ## Run it (TL;DR)
 
@@ -91,7 +97,9 @@ curl localhost:8000/health          # → {"status":"ok","views":0}
 ```
 
 For a full local stack with a sandbox Trino + MinIO + Postgres, see
-[Quick start](#quick-start) below.
+**[`./quickstart`](./quickstart)** (one `docker compose up`, 8 pre-loaded
+views, no setup) or read the [Quick start](#quick-start) section below for
+the manual flow.
 
 ## How it works
 
@@ -135,7 +143,7 @@ detection — just the metadata describing what data exists.
 
 | Table | What we read | What it tells us |
 |---|---|---|
-| `source.$snapshots` | `(snapshot_id, operation, committed_at)` | Did the source change since our last refresh? And was the change a legitimate `append`, a `replace` (compaction — no new data), or something else (`overwrite` / `delete`, which we reject)? |
+| `source.$snapshots` | `(snapshot_id, operation, committed_at)` | Did the source change since our last refresh? Classify the op: `append` / `overwrite` (real data changes — both drive incremental refresh; `overwrite` is what `MERGE INTO` writes, including upstream chained MVs), `replace` (compaction — no new data, skipped), or `delete` / unknown (rejected loudly). |
 | `source.$all_entries` | `readable_metrics` JSON on files added in new snapshots (filtered by `snapshot_id IN (new)` and `status = 1`) | Per-file column-level min/max bounds. Gives us the tightest `[min_ts, max_ts]` bracket over the new data without reading a single data file. |
 
 **Why `$all_entries` and not `$partitions`?** An earlier prototype diffed
@@ -348,8 +356,11 @@ hot-reloaded on mtime change at `server.config_reload_interval_seconds` (default
 
 ### Running against a local Trino stack
 
-A `tests/docker-compose.yml` brings up Trino + MinIO + Postgres for local
-development:
+For a turnkey demo, see **[`./quickstart`](./quickstart)** — one
+`docker compose up`, sample data seeded, 8 views pre-loaded.
+
+For development against the codebase, `tests/docker-compose.yml` brings up
+just Trino + MinIO + Postgres:
 
 ```bash
 cd tests && docker compose up -d trino
@@ -682,18 +693,24 @@ parser enforces this at load time and rejects anything else with a clear error.
   width cannot be reliably inferred.
 - **Projection columns without an alias on computed expressions** — rejected
   so the target-table columns have stable names.
-- **Source deletes/overwrites** — detected via `$snapshots`, raises
-  `UnexpectedOperationError` (the project assumes append-only sources).
+- **Source pure-delete snapshots** — detected via `$snapshots`, raise
+  `UnexpectedOperationError`. Data may not disappear without replacement.
+  (`MERGE INTO`, which Iceberg labels as an `overwrite` snapshot, *is*
+  supported — that's how chained MVs work.)
 - **Missing column stats** — if the source writer disables Iceberg column
   statistics, the detector can't determine the affected range and raises
   `MissingFilterColumnError`.
 
 ### Assumptions
 
-- **Append-only sources** (trades, logs, events). Only Iceberg `append` and
-  `replace` (compaction) snapshot operations are allowed. `replace` is
-  skipped — files were rewritten but no data changed. Any other operation
-  (`overwrite`, `delete`) fails loudly.
+- **Sources don't lose data without replacement.** The detector accepts
+  three Iceberg snapshot operations: `append` and `overwrite` are treated
+  as real data changes and drive incremental refresh (`overwrite` is what
+  `MERGE INTO` writes — both for raw sources mutated by external MERGEs
+  and, importantly, for upstream chained MVs whose own refresh is a
+  MERGE); `replace` (compaction) is skipped — files were rewritten but no
+  data changed. Any other operation (`delete`, or some unknown new op)
+  fails loudly.
 - **UTC session timezone.** iceberg-ivm pins every Trino session to
   `UTC` so that `date_trunc('day' | 'week' | …, ts)` on `TIMESTAMP WITH
   TIME ZONE` columns aligns with the Python-side `expand_to_bucket_bounds` bucket math.

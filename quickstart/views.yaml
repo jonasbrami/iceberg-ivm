@@ -1,0 +1,108 @@
+views:
+  - name: ohlcv_1m
+    query: |
+      SELECT
+        symbol,
+        date_trunc('minute', ts) AS bucket,
+        min_by(price, ts) AS open,
+        max(price)        AS high,
+        min(price)        AS low,
+        max_by(price, ts) AS close,
+        sum(quantity)     AS volume,
+        count(*)          AS trade_count
+      FROM iceberg.market_data.trades
+      GROUP BY symbol, date_trunc('minute', ts)
+    target_table: iceberg.analytics.ohlcv_1m
+    target_partitioning: "ARRAY['day(bucket)']"
+    refresh_interval_seconds: 20
+
+  - name: ohlcv_1h
+    query: |
+      SELECT
+        symbol,
+        date_trunc('hour', ts) AS bucket,
+        min_by(price, ts) AS open,
+        max(price)        AS high,
+        min(price)        AS low,
+        max_by(price, ts) AS close,
+        sum(quantity)     AS volume,
+        count(*)          AS trade_count
+      FROM iceberg.market_data.trades
+      GROUP BY symbol, date_trunc('hour', ts)
+    target_table: iceberg.analytics.ohlcv_1h
+    refresh_interval_seconds: 25
+
+  - name: ohlcv_1d
+    query: |
+      SELECT
+        symbol,
+        date_trunc('day', ts) AS bucket,
+        min_by(price, ts) AS open,
+        max(price)        AS high,
+        min(price)        AS low,
+        max_by(price, ts) AS close,
+        sum(quantity)     AS volume,
+        count(*)          AS trade_count
+      FROM iceberg.market_data.trades
+      GROUP BY symbol, date_trunc('day', ts)
+    target_table: iceberg.analytics.ohlcv_1d
+    refresh_interval_seconds: 30
+
+  - name: weekly_volume
+    query: |
+      SELECT
+        symbol,
+        date_trunc('week', ts) AS week,
+        sum(quantity) AS volume,
+        count(*)      AS trade_count
+      FROM iceberg.market_data.trades
+      GROUP BY 1, 2
+    target_table: iceberg.analytics.weekly_volume
+    refresh_interval_seconds: 30
+
+  - name: monthly_volume
+    query: |
+      SELECT
+        symbol,
+        date_trunc('month', ts) AS month,
+        sum(quantity) AS volume,
+        count(*)      AS trade_count
+      FROM iceberg.market_data.trades
+      GROUP BY 1, 2
+    target_table: iceberg.analytics.monthly_volume
+    refresh_interval_seconds: 30
+
+  - name: hourly_trade_count
+    query: |
+      SELECT
+        date_trunc('hour', ts) AS hour,
+        count(*) AS trade_count
+      FROM iceberg.market_data.trades
+      GROUP BY 1
+    target_table: iceberg.analytics.hourly_trade_count
+    refresh_interval_seconds: 20
+
+  - name: symbol_daily_high
+    query: |
+      SELECT
+        symbol,
+        date_trunc('day', ts) AS day,
+        max(price)            AS high,
+        max_by(quantity, price) AS high_qty
+      FROM iceberg.market_data.trades
+      GROUP BY 1, 2
+    target_table: iceberg.analytics.symbol_daily_high
+    refresh_interval_seconds: 25
+
+  - name: large_trades_hourly
+    query: |
+      SELECT
+        symbol,
+        date_trunc('hour', ts) AS hour,
+        count(*)      AS trade_count,
+        sum(quantity) AS volume
+      FROM iceberg.market_data.trades
+      WHERE quantity > 500
+      GROUP BY 1, 2
+    target_table: iceberg.analytics.large_trades_hourly
+    refresh_interval_seconds: 25

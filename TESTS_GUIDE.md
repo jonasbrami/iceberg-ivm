@@ -155,7 +155,10 @@ If you ever change `expand_to_bucket_bounds`, these are the tests to keep green.
 - `test_no_data_files_in_new_snapshots` — append snapshot with no entries → `NO_CHANGE`
 - `test_compaction_only_no_change_advances_state` — only `replace` ops since last snap → `NO_CHANGE` with the **advanced** snapshot id, and **no** `$all_entries` query (the file-stats lookup is skipped)
 - `test_mixed_append_and_replace_uses_only_append_snapshots` — when an append and a compaction are both new, the file-stats query is scoped to the append snapshot only (`IN (50)`, not `IN (50, 51)`) — compaction-rewritten files would uselessly inflate the range
-- `test_unexpected_operation_raises` — `overwrite` / `delete` / unknown op → `UnexpectedOperationError`. Enforces the project's append-only assumption.
+- `test_overwrite_drives_incremental_refresh` — `overwrite` (e.g. from an upstream chained MV's MERGE) drives incremental refresh; the file-stats query is scoped to the overwrite snapshot.
+- `test_mixed_append_overwrite_replace_uses_change_snapshots` — append + overwrite + replace in the same batch; both append and overwrite snapshots feed the file-stats range, replace is excluded.
+- `test_delete_operation_raises` — `delete` snapshot → `UnexpectedOperationError`. The correctness model can't reconstruct removed buckets.
+- `test_unknown_operation_raises` — any unknown op name → `UnexpectedOperationError`.
 
 ### `test_executor.py` — SQL generation + execution
 
