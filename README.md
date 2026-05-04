@@ -78,7 +78,7 @@ views: []     # add views here, or manage them via the web UI
 # docker-compose.yml
 services:
   iceberg-ivm:
-    image: jonasbrami/iceberg-ivm:0.2.1
+    image: jonasbrami/iceberg-ivm:0.6.0
     environment:
       TRINO_URL: http://trino:8080
       TRINO_USER: iceberg-ivm
@@ -126,14 +126,14 @@ sequenceDiagram
     T->>TGT: atomic Iceberg commit
     T-->>O: done
 
-    O->>T: ALTER TABLE target SET PROPERTIES {last_snapshot: 200}
+    O->>O: state.db: UPDATE view_status SET last_source_snapshot=200
 ```
 
 1. **Detect** -- query `$snapshots` to check if source changed (<50ms)
 2. **Measure** -- read `$all_entries` for new files' column-level min/max bounds (metadata only)
 3. **Snap** -- expand the time range to complete GROUP BY bucket boundaries (pure Python)
 4. **Refresh** -- `MERGE INTO` with a plain column range filter (Trino pushes down to partition pruning)
-5. **Persist** -- store snapshot ID in target table's Iceberg properties
+5. **Persist** -- record the snapshot ID in iceberg-ivm's SQLite state DB (`view_status.last_source_snapshot`)
 
 ### Iceberg metadata: what we read and why
 
@@ -311,7 +311,7 @@ views:
     query: |
       SELECT
         symbol,
-        date_trunc('minute', ts) AS minute,
+        date_trunc('minute', ts) AS minute_ts,
         min_by(price, ts) AS open, max(price) AS high,
         min(price) AS low,        max_by(price, ts) AS close,
         sum(quantity) AS volume,  count(*) AS trade_count
@@ -437,8 +437,8 @@ Every subsequent cycle is incremental unless you delete the bookmark.
 ### Deployment notes
 
 - **Single-instance.** iceberg-ivm is not HA. One process per target catalog/schema. Two instances against the same targets would race on `ALTER TABLE SET PROPERTIES` and produce conflicting MERGEs.
-- **Crash-safe.** Refresh-correctness state lives in Iceberg, not in iceberg-ivm. Kill/restart leaves no cleanup.
-- **Persist the SQLite state DB.** The UI's "recent queries" panel is backed by a SQLite file (`server.state_db_path`, default `state.db` next to `config.yaml`). If you run in docker, mount a volume at that path — otherwise the file is recreated empty on every container replacement and history disappears. Example: `-v ivm-state:/app/state.db`.
+- **Crash-safe.** All correctness state is the SQLite bookmark on disk plus committed Iceberg snapshots. Kill/restart picks up exactly where it left off — provided `state.db` is on a persistent volume (next bullet).
+- **Persist the SQLite state DB.** Backed by a SQLite file (`server.state_db_path`, default `state.db` next to `views.yaml`). It also holds the per-view source-snapshot bookmark (`view_status.last_source_snapshot`), so losing it forces every view to full-refresh on next start (and the UI's "recent queries" history disappears too). If you run in docker, mount a volume at the directory containing it — e.g. `-v ivm-state:/data` to match the compose example above.
 - **What to monitor** (all labels `view`):
   - `rate(mv_refresh_errors_total[5m]) > 0` — refresh is failing.
   - `time() - mv_refresh_last_success_timestamp > 3 * refresh_interval_seconds` — view is stalled.
@@ -560,7 +560,7 @@ MERGE INTO iceberg.md.trades_weekly AS t USING (
 ```sql
 SELECT
   symbol,
-  date_trunc('minute', ts) AS minute,
+  date_trunc('minute', ts) AS minute_ts,
   min_by(price, ts) AS open, max(price) AS high,
   min(price) AS low,         max_by(price, ts) AS close,
   sum(quantity) AS volume,   count(*) AS trade_count
@@ -594,11 +594,13 @@ GROUP BY 1, 2
 ```
 
 **Chained MV** (a view whose source is another view's target — since every
-target is an Iceberg table, it's a normal source for the next hop):
+target is an Iceberg table, it's a normal source for the next hop). The
+upstream `ohlcv_1m` example above projects its bucket column as `minute_ts`,
+so the chained query reads `minute_ts`:
 ```sql
-SELECT symbol, date_trunc('hour', bucket) AS hour_bucket,
-       min_by(open, bucket) AS open, max(high) AS high,
-       min(low) AS low,       max_by(close, bucket) AS close,
+SELECT symbol, date_trunc('hour', minute_ts) AS hour_bucket,
+       min_by(open, minute_ts) AS open, max(high) AS high,
+       min(low) AS low,       max_by(close, minute_ts) AS close,
        sum(volume) AS volume, sum(trade_count) AS trade_count
 FROM iceberg.analytics.ohlcv_1m
 GROUP BY 1, 2
@@ -606,7 +608,7 @@ GROUP BY 1, 2
 Note: avoid naming the upstream MV's time column with a SQL reserved word
 (`minute`, `hour`, `day`, `week`, `month`, `quarter`, `year`) — the parser
 rejects bare reserved words as the second arg of `date_trunc(...)`. Use a
-non-reserved alias like `bucket` or `minute_ts` in the upstream view.
+non-reserved alias like `minute_ts` or `bucket` in the upstream view.
 
 ### ❌ Not supported — rejected at config load
 
@@ -740,12 +742,13 @@ src/iceberg_ivm/
     detector.py      -- $snapshots + $all_entries file stats + expand_to_bucket_bounds()
     executor.py      -- MERGE SQL generation + execution
     introspect.py    -- DESCRIBE OUTPUT, EXPLAIN IO, SHOW CREATE TABLE
+    query_parser.py  -- AST-based parser for view queries (source/filter/granularity/keys)
     query_history.py -- SQLite-backed view_status / query history / source-snapshot bookmark
     server.py        -- FastAPI: web UI, REST API, Prometheus, refresh loop
     cli.py           -- Entry point, starts uvicorn
     static/
         index.html   -- Web UI (Tailwind CSS + Alpine.js)
 tests/
-    unit/            -- 43 tests (mock cursors, FastAPI test client)
-    integration/     -- 10 e2e tests (Trino + Iceberg + MinIO via docker compose)
+    unit/            -- 262 tests (mock cursors, FastAPI test client)
+    integration/     -- 17 e2e tests (Trino + Iceberg + MinIO via docker compose)
 ```
