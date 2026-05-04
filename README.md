@@ -7,7 +7,7 @@ all computation to Trino.
 > fully self-contained Trino + MinIO + Postgres + iceberg-ivm stack with
 > sample data and 8 pre-loaded materialized views.
 
-![iceberg-ivm UI](docs/screenshots/ui-overview.png)
+<p align="center"><img src="docs/screenshots/ui-overview.png" alt="iceberg-ivm UI" width="720"></p>
 
 The service owns the control plane — view definitions, change detection,
 refresh scheduling, watermarks — while Trino executes the actual SQL against
@@ -28,10 +28,6 @@ view. Example: a `trades → 1-minute bars` MV feeding a `1-minute → 1-hour
 bars` MV. The second view only needs metadata from the first's target table,
 so the chain stays cheap: each hop is still a bounded `MERGE` on a snapped
 time range.
-
-> This project was designed and implemented through a conversation between a
-> human prompter and Claude Code. See [DESIGN.md](DESIGN.md) for the full
-> design rationale and conversation context.
 
 ## Why this project exists
 
@@ -54,52 +50,32 @@ The result is a small, sharply-scoped service: Iceberg sources, `date_trunc`-buc
 
 ## Run it (TL;DR)
 
-Pre-requisite: an existing Trino cluster reachable from the container.
-
-Put `config.yaml` and `views.yaml` in a directory you'll mount into the
-container (state survives across image bumps because both files — and
-iceberg-ivm's `state.db` — live there):
-
-```yaml
-# ./data/config.yaml
-server:
-  port: 8000
-trino:
-  catalog: iceberg
-  schema: analytics
-```
-
-```yaml
-# ./data/views.yaml
-views: []     # add views here, or manage them via the web UI
-```
+Against an existing Trino cluster, drop `config.yaml` + `views.yaml` (see
+[Quick start](#quick-start) below) into `./data/` and bring the container up:
 
 ```yaml
 # docker-compose.yml
 services:
   iceberg-ivm:
-    image: jonasbrami/iceberg-ivm:0.2.1
+    image: jonasbrami/iceberg-ivm:0.6.0
     environment:
       TRINO_URL: http://trino:8080
       TRINO_USER: iceberg-ivm
       # TRINO_PASSWORD: …            # only if your Trino requires it
     volumes:
-      - ./data:/data
+      - ./data:/data            # config.yaml, views.yaml, and state.db all live here
     command: ["-c", "/data/config.yaml", "--views", "/data/views.yaml"]
     ports:
       - "8000:8000"
 ```
 
 ```bash
-docker compose up -d
-open http://localhost:8000          # web UI
-curl localhost:8000/health          # → {"status":"ok","views":0}
+docker compose up -d && open http://localhost:8000
 ```
 
-For a full local stack with a sandbox Trino + MinIO + Postgres, see
-**[`./quickstart`](./quickstart)** (one `docker compose up`, 8 pre-loaded
-views, no setup) or read the [Quick start](#quick-start) section below for
-the manual flow.
+No Trino cluster handy? **[`./quickstart`](./quickstart)** brings up Trino +
+MinIO + Postgres + iceberg-ivm with sample data and 8 pre-loaded views in one
+`docker compose up`.
 
 ## How it works
 
@@ -126,14 +102,27 @@ sequenceDiagram
     T->>TGT: atomic Iceberg commit
     T-->>O: done
 
-    O->>T: ALTER TABLE target SET PROPERTIES {last_snapshot: 200}
+    O->>O: state.db: UPDATE view_status SET last_source_snapshot=200
 ```
 
-1. **Detect** -- query `$snapshots` to check if source changed (<50ms)
-2. **Measure** -- read `$all_entries` for new files' column-level min/max bounds (metadata only)
-3. **Snap** -- expand the time range to complete GROUP BY bucket boundaries (pure Python)
-4. **Refresh** -- `MERGE INTO` with a plain column range filter (Trino pushes down to partition pruning)
-5. **Persist** -- store snapshot ID in target table's Iceberg properties
+The five phases — **Detect** (`$snapshots`, ~50 ms), **Measure**
+(`$all_entries` file stats, metadata only), **Snap** (range expansion in
+pure Python), **Refresh** (`MERGE INTO` whose range filter Trino pushes
+down to partition pruning), **Persist** (bookmark to SQLite) — recur on
+every cycle. On a quiet source the cycle is dominated by the `$snapshots`
+poll; on a busy one, by the `MERGE` itself.
+
+### What a first run looks like
+
+On the first refresh of a brand-new view you'll see:
+
+1. `discover_columns` (a `PREPARE` + `DESCRIBE OUTPUT`, no data scan) resolves the target column types.
+2. `CREATE TABLE IF NOT EXISTS target (…)` creates the Iceberg table. The target is **unpartitioned by default**; set `target_partitioning` on the view to partition it (e.g. `"ARRAY['day(minute)']"`).
+3. The detector sees no `last_source_snapshot` recorded in iceberg-ivm's `state.db` and returns `FULL_REFRESH`.
+4. `execute_full_refresh` runs `DELETE FROM target WHERE true` then `INSERT INTO target SELECT …` (your original query, verbatim — no WHERE injected).
+5. The source snapshot ID is written to `state.db` (`view_status.last_source_snapshot`).
+
+Every subsequent cycle is incremental unless you delete the bookmark.
 
 ### Iceberg metadata: what we read and why
 
@@ -143,8 +132,14 @@ detection — just the metadata describing what data exists.
 
 | Table | What we read | What it tells us |
 |---|---|---|
-| `source.$snapshots` | `(snapshot_id, operation, committed_at)` | Did the source change since our last refresh? Classify the op: `append` / `overwrite` (real data changes — both drive incremental refresh; `overwrite` is what `MERGE INTO` writes, including upstream chained MVs), `replace` (compaction — no new data, skipped), or `delete` / unknown (rejected loudly). |
+| `source.$snapshots` | `(snapshot_id, operation, committed_at)` | Did the source change since our last refresh? And what kind of change? (See operation classification below.) |
 | `source.$all_entries` | `readable_metrics` JSON on files added in new snapshots (filtered by `snapshot_id IN (new)` and `status = 1`) | Per-file column-level min/max bounds. Gives us the tightest `[min_ts, max_ts]` bracket over the new data without reading a single data file. |
+
+**`$snapshots.operation` classification:**
+
+- `append` / `overwrite` — real data changes; drive incremental refresh. `overwrite` is what `MERGE INTO` writes, so this also catches upstream chained MVs whose own refresh is a `MERGE`.
+- `replace` — compaction (files rewritten, no data change). Skipped.
+- `delete` or anything else — rejected loudly. Sources are not allowed to lose data without replacement.
 
 **Why `$all_entries` and not `$partitions`?** An earlier prototype diffed
 `$partitions` between snapshots — but when the GROUP BY granularity is
@@ -180,35 +175,10 @@ min/max timestamps from new files, compute a filter range that covers **every
 complete GROUP BY bucket** touched by that data. This is done by inverting
 the `date_trunc` function used in the query's GROUP BY.
 
-```mermaid
-flowchart TB
-    subgraph forward["<b>Forward: date_trunc('hour', ts)</b> — many timestamps → one bucket"]
-        direction LR
-        t1["09:15:42"] & t2["09:47:03"] -->|date_trunc| b1["<b>09:00</b>"]
-        t3["10:22:18"] & t4["10:55:31"] -->|date_trunc| b2["<b>10:00</b>"]
-    end
-
-    subgraph inverse["<b>Inverse: expand_to_bucket_bounds('hour')</b> — file stats → complete bucket boundaries"]
-        direction LR
-        stats["file stats<br/><b>min=09:15, max=10:55</b>"]
-        snap["expand_to_bucket_bounds"]
-        result["filter range<br/><b>[09:00, 11:00)</b>"]
-        stats --> snap --> result
-    end
-
-    forward -..->|"expand_to_bucket_bounds reverses date_trunc"| inverse
-
-    style forward fill:#1a1a2e,stroke:#16213e,color:#e0e0e0
-    style inverse fill:#0f3460,stroke:#16213e,color:#e0e0e0
-    style b1 fill:#2d6a4f,stroke:#40916c,color:#fff
-    style b2 fill:#2d6a4f,stroke:#40916c,color:#fff
-    style result fill:#2d6a4f,stroke:#40916c,color:#fff
-```
-
 `date_trunc` is a **many-to-one** function: it maps every timestamp within a
-bucket to the same boundary value. `expand_to_bucket_bounds` is its inverse: it expands a
-raw timestamp range outward to the nearest bucket boundaries so the filter
-captures all rows that belong to any touched bucket.
+bucket to the same boundary value. `expand_to_bucket_bounds` is its inverse:
+it expands a raw timestamp range outward to the nearest bucket boundaries so
+the filter captures all rows that belong to any touched bucket.
 
 ```mermaid
 flowchart LR
@@ -311,7 +281,7 @@ views:
     query: |
       SELECT
         symbol,
-        date_trunc('minute', ts) AS minute,
+        date_trunc('minute', ts) AS minute_ts,
         min_by(price, ts) AS open, max(price) AS high,
         min(price) AS low,        max_by(price, ts) AS close,
         sum(quantity) AS volume,  count(*) AS trade_count
@@ -411,17 +381,7 @@ One asyncio task ticks every **1 second**. On each tick:
 
 Refreshes are **sequential** — one view at a time, no pool, no queue. A single slow refresh delays the next tick's scheduling; plan `refresh_interval_seconds` accordingly.
 
-### What the first run looks like
-
-On the first refresh of a brand-new view you'll see:
-
-1. `discover_columns` (a `PREPARE` + `DESCRIBE OUTPUT`, no data scan) resolves the target column types.
-2. `CREATE TABLE IF NOT EXISTS target (…)` creates the Iceberg table. The target is **unpartitioned by default**; set `target_partitioning` on the view to partition it (e.g. `"ARRAY['day(minute)']"`).
-3. The detector sees no `last_source_snapshot` recorded in iceberg-ivm's `state.db` and returns `FULL_REFRESH`.
-4. `execute_full_refresh` runs `DELETE FROM target WHERE true` then `INSERT INTO target SELECT …` (your original query, verbatim — no WHERE injected).
-5. The source snapshot ID is written to `state.db` (`view_status.last_source_snapshot`).
-
-Every subsequent cycle is incremental unless you delete the bookmark.
+(For a step-by-step trace of a brand-new view's first refresh, see [What a first run looks like](#what-a-first-run-looks-like) above.)
 
 ### Day-2 operations
 
@@ -437,8 +397,8 @@ Every subsequent cycle is incremental unless you delete the bookmark.
 ### Deployment notes
 
 - **Single-instance.** iceberg-ivm is not HA. One process per target catalog/schema. Two instances against the same targets would race on `ALTER TABLE SET PROPERTIES` and produce conflicting MERGEs.
-- **Crash-safe.** Refresh-correctness state lives in Iceberg, not in iceberg-ivm. Kill/restart leaves no cleanup.
-- **Persist the SQLite state DB.** The UI's "recent queries" panel is backed by a SQLite file (`server.state_db_path`, default `state.db` next to `config.yaml`). If you run in docker, mount a volume at that path — otherwise the file is recreated empty on every container replacement and history disappears. Example: `-v ivm-state:/app/state.db`.
+- **Crash-safe.** All correctness state is the SQLite bookmark on disk plus committed Iceberg snapshots. Kill/restart picks up exactly where it left off — provided `state.db` is on a persistent volume (next bullet).
+- **Persist the SQLite state DB.** Backed by a SQLite file (`server.state_db_path`, default `state.db` next to `views.yaml`). It also holds the per-view source-snapshot bookmark (`view_status.last_source_snapshot`), so losing it forces every view to full-refresh on next start (and the UI's "recent queries" history disappears too). If you run in docker, mount a volume at the directory containing it — e.g. `-v ivm-state:/data` to match the compose example above.
 - **What to monitor** (all labels `view`):
   - `rate(mv_refresh_errors_total[5m]) > 0` — refresh is failing.
   - `time() - mv_refresh_last_success_timestamp > 3 * refresh_interval_seconds` — view is stalled.
@@ -560,7 +520,7 @@ MERGE INTO iceberg.md.trades_weekly AS t USING (
 ```sql
 SELECT
   symbol,
-  date_trunc('minute', ts) AS minute,
+  date_trunc('minute', ts) AS minute_ts,
   min_by(price, ts) AS open, max(price) AS high,
   min(price) AS low,         max_by(price, ts) AS close,
   sum(quantity) AS volume,   count(*) AS trade_count
@@ -594,11 +554,13 @@ GROUP BY 1, 2
 ```
 
 **Chained MV** (a view whose source is another view's target — since every
-target is an Iceberg table, it's a normal source for the next hop):
+target is an Iceberg table, it's a normal source for the next hop). The
+upstream `ohlcv_1m` example above projects its bucket column as `minute_ts`,
+so the chained query reads `minute_ts`:
 ```sql
-SELECT symbol, date_trunc('hour', bucket) AS hour_bucket,
-       min_by(open, bucket) AS open, max(high) AS high,
-       min(low) AS low,       max_by(close, bucket) AS close,
+SELECT symbol, date_trunc('hour', minute_ts) AS hour_bucket,
+       min_by(open, minute_ts) AS open, max(high) AS high,
+       min(low) AS low,       max_by(close, minute_ts) AS close,
        sum(volume) AS volume, sum(trade_count) AS trade_count
 FROM iceberg.analytics.ohlcv_1m
 GROUP BY 1, 2
@@ -606,7 +568,7 @@ GROUP BY 1, 2
 Note: avoid naming the upstream MV's time column with a SQL reserved word
 (`minute`, `hour`, `day`, `week`, `month`, `quarter`, `year`) — the parser
 rejects bare reserved words as the second arg of `date_trunc(...)`. Use a
-non-reserved alias like `bucket` or `minute_ts` in the upstream view.
+non-reserved alias like `minute_ts` or `bucket` in the upstream view.
 
 ### ❌ Not supported — rejected at config load
 
@@ -677,22 +639,17 @@ SELECT symbol, price FROM trades
 The query must be a `SELECT … GROUP BY` over a **single source table**. The
 parser enforces this at load time and rejects anything else with a clear error.
 
-### Not supported
+### Rejected at parse time
 
-- **Joins.** The query must reference exactly one source table. Change
-  detection only inspects the parsed source table; if a query joined a second
-  table, updates to that other table would never trigger a refresh and the MV
-  would silently go stale. Parser rejects queries containing `JOIN`.
-- **Set operations** (`UNION` / `INTERSECT` / `EXCEPT`) — rejected at parse.
-- **CTEs** (`WITH …`) — rejected at parse.
-- **Subqueries in FROM** — rejected at parse.
-- **Queries without `GROUP BY`** — rejected at parse. The correctness model
-  is built around `date_trunc('X', col)` defining aggregation buckets.
-- **`date_trunc` wrapped in arithmetic** (e.g. 5-minute bars via
-  `date_trunc(...) - INTERVAL ...`) — rejected at parse because the bucket
-  width cannot be reliably inferred.
-- **Projection columns without an alias on computed expressions** — rejected
-  so the target-table columns have stable names.
+Joins, CTEs (`WITH …`), subqueries in FROM, set operations (`UNION` /
+`INTERSECT` / `EXCEPT`), queries without `GROUP BY`, `date_trunc` wrapped in
+arithmetic (5-minute-bar style), and computed projections without an alias
+are all rejected at config load with a clear error. See
+[❌ Not supported](#-not-supported--rejected-at-config-load) above for the
+SQL shapes and the reasoning behind each.
+
+### Rejected at refresh time
+
 - **Source pure-delete snapshots** — detected via `$snapshots`, raise
   `UnexpectedOperationError`. Data may not disappear without replacement.
   (`MERGE INTO`, which Iceberg labels as an `overwrite` snapshot, *is*
@@ -740,12 +697,19 @@ src/iceberg_ivm/
     detector.py      -- $snapshots + $all_entries file stats + expand_to_bucket_bounds()
     executor.py      -- MERGE SQL generation + execution
     introspect.py    -- DESCRIBE OUTPUT, EXPLAIN IO, SHOW CREATE TABLE
+    query_parser.py  -- AST-based parser for view queries (source/filter/granularity/keys)
     query_history.py -- SQLite-backed view_status / query history / source-snapshot bookmark
     server.py        -- FastAPI: web UI, REST API, Prometheus, refresh loop
     cli.py           -- Entry point, starts uvicorn
     static/
         index.html   -- Web UI (Tailwind CSS + Alpine.js)
 tests/
-    unit/            -- 43 tests (mock cursors, FastAPI test client)
-    integration/     -- 10 e2e tests (Trino + Iceberg + MinIO via docker compose)
+    unit/            -- 262 tests (mock cursors, FastAPI test client)
+    integration/     -- 17 e2e tests (Trino + Iceberg + MinIO via docker compose)
 ```
+
+---
+
+*Designed and implemented through a conversation between a human prompter
+and Claude Code. See [DESIGN.md](DESIGN.md) for the full design rationale
+and conversation context.*
