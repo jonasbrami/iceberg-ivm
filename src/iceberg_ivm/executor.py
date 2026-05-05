@@ -130,8 +130,15 @@ async def _backfill_ranges(
     if view.full_refresh_chunk is None:
         return [(start, end)]  # single-shot full refresh
 
-    # Chunked: resume from max(bucket_alias) in target (if any).
-    target_max = await get_target_bucket_max(cursor, target_table, parsed.bucket_alias or "")
+    # Chunked: resume from max(bucket_alias) in target (if any). Config
+    # validation guarantees bucket_alias is set whenever full_refresh_chunk
+    # is — fall through with an assertion so a future refactor can't
+    # silently re-introduce the "" fallback that would skip the resume.
+    assert parsed.bucket_alias is not None, (
+        "chunked full refresh requires bucket_alias; "
+        "validate_chunk_compatibility should have rejected this view"
+    )
+    target_max = await get_target_bucket_max(cursor, target_table, parsed.bucket_alias)
     if target_max is not None:
         start = expand_to_bucket_bounds(target_max, target_max, view.full_refresh_chunk)[1]
     return list(walk_buckets(start, end, view.full_refresh_chunk))

@@ -180,6 +180,33 @@ class QueryHistory:
         await self._db.execute("DELETE FROM view_status WHERE view = ?", (view,))
         await self._db.commit()
 
+    async def _upsert(
+        self,
+        table: str,
+        pk_cols: tuple[str, ...],
+        pk_values: tuple,
+        allowed_cols: tuple[str, ...],
+        fields: dict,
+    ) -> None:
+        """Generic INSERT … ON CONFLICT(pk) DO UPDATE … helper.
+
+        Builds the column / placeholder / SET clauses from ``allowed_cols``
+        intersected with ``fields`` (so callers may pass ``dataclasses.asdict``
+        with extra keys without filtering them out). Single trip + commit.
+        """
+        cols = [c for c in allowed_cols if c in fields]
+        values = [fields[c] for c in cols]
+        col_list = ", ".join([*pk_cols, *cols])
+        placeholders = ", ".join(["?"] * (len(pk_cols) + len(cols)))
+        pk_conflict = ", ".join(pk_cols)
+        update_clause = ", ".join(f"{c} = excluded.{c}" for c in cols)
+        await self._db.execute(
+            f"INSERT INTO {table} ({col_list}) VALUES ({placeholders}) "
+            f"ON CONFLICT({pk_conflict}) DO UPDATE SET {update_clause}",
+            (*pk_values, *values),
+        )
+        await self._db.commit()
+
     # ── view_status ───────────────────────────────────────────────────
 
     async def upsert_view_status(self, view: str, fields: dict) -> None:
@@ -190,17 +217,9 @@ class QueryHistory:
         a full ``dataclasses.asdict(vs)`` without filtering ``recent_queries``
         / ``maintenance`` themselves.
         """
-        cols = [c for c in _VIEW_STATUS_COLS if c in fields]
-        values = [fields[c] for c in cols]
-        col_list = ", ".join(["view", *cols])
-        placeholders = ", ".join(["?"] * (len(cols) + 1))
-        update_clause = ", ".join(f"{c} = excluded.{c}" for c in cols)
-        await self._db.execute(
-            f"INSERT INTO view_status ({col_list}) VALUES ({placeholders}) "
-            f"ON CONFLICT(view) DO UPDATE SET {update_clause}",
-            (view, *values),
+        await self._upsert(
+            "view_status", ("view",), (view,), _VIEW_STATUS_COLS, fields,
         )
-        await self._db.commit()
 
     async def get_view_status(self, view: str) -> dict | None:
         """Return the persisted ViewStatus fields for ``view`` or ``None``."""
@@ -247,17 +266,10 @@ class QueryHistory:
         """
         if "last_run" not in fields or fields["last_run"] is None:
             raise ValueError("upsert_maintenance requires a non-null last_run")
-        cols = [c for c in _MAINTENANCE_COLS if c in fields]
-        values = [fields[c] for c in cols]
-        col_list = ", ".join(["view", "op", *cols])
-        placeholders = ", ".join(["?"] * (len(cols) + 2))
-        update_clause = ", ".join(f"{c} = excluded.{c}" for c in cols)
-        await self._db.execute(
-            f"INSERT INTO maintenance_state ({col_list}) VALUES ({placeholders}) "
-            f"ON CONFLICT(view, op) DO UPDATE SET {update_clause}",
-            (view, op, *values),
+        await self._upsert(
+            "maintenance_state", ("view", "op"), (view, op),
+            _MAINTENANCE_COLS, fields,
         )
-        await self._db.commit()
 
     async def all_maintenance(self, view: str) -> dict[str, dict]:
         """Return ``{op: {col: value, ...}}`` for every op recorded against ``view``.

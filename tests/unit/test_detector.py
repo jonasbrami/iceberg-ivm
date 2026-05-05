@@ -376,6 +376,21 @@ class TestGetCurrentSnapshot:
     async def test_returns_none(self):
         assert await get_current_snapshot(MockCursor([[]]), "db.t") is None
 
+    async def test_sql_uses_snapshot_id_tiebreak(self):
+        """ORDER BY committed_at alone is non-deterministic when two siblings
+        share a millisecond-precision committed_at — the wrong winner can leave
+        last_snapshot == current_snap on the next tick and skip real new data.
+        Mirrors the tiebreak in get_snapshots_since."""
+        cursor = MockCursor([[(12345,)]])
+        await get_current_snapshot(cursor, "db.t")
+        sql = cursor.executed_sql[0]
+        assert "snapshot_id" in sql
+        # Both keys should be in the ORDER BY (committed_at first, snapshot_id
+        # as the tiebreak), descending so LIMIT 1 returns the head.
+        order_by = sql.split("ORDER BY", 1)[1]
+        assert "committed_at" in order_by
+        assert "snapshot_id" in order_by
+
 
 # ── get_snapshots_since ──
 
@@ -798,3 +813,13 @@ class TestGetTargetBucketMax:
             ({"other": {"lower_bound": "1", "upper_bound": "2"}},),
         ]])
         assert await get_target_bucket_max(cursor, "db.t", "minute") is None
+
+    async def test_filters_out_delete_files(self):
+        """$files exposes V2 position/equality delete files via the `content`
+        column (0=DATA, 1=POS_DELETES, 2=EQ_DELETES). The resume point must
+        be computed from data files only — including delete-file metrics
+        would skew the max upward and skip live buckets on resume."""
+        cursor = MockCursor([[(None,)]])
+        await get_target_bucket_max(cursor, "db.t", "minute")
+        sql = cursor.executed_sql[0]
+        assert "content = 0" in sql or "content=0" in sql

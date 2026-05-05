@@ -639,7 +639,7 @@ async def test_maintain_view_respects_interval(setup_state):
         raise AssertionError("should not have run")
 
     with patch.object(server_mod, "execute_maintenance", fake_maintenance):
-        await server_mod.maintain_view(setup_state, v, cursor=None, target_table="t")
+        await server_mod.maintain_view(setup_state, v, conn=_FakeConn(), target_table="t")
 
     assert calls == []
 
@@ -662,7 +662,7 @@ async def test_maintain_view_skips_everything_when_interval_zero(setup_state):
         raise AssertionError(f"{op} should not have run when interval is 0")
 
     with patch.object(server_mod, "execute_maintenance", fake_maintenance):
-        await server_mod.maintain_view(setup_state, v, cursor=None, target_table="t")
+        await server_mod.maintain_view(setup_state, v, conn=_FakeConn(), target_table="t")
 
 
 async def test_maintain_view_respects_per_op_toggle(setup_state):
@@ -690,7 +690,7 @@ async def test_maintain_view_respects_per_op_toggle(setup_state):
         )
 
     with patch.object(server_mod, "execute_maintenance", fake_maintenance):
-        await server_mod.maintain_view(setup_state, v, cursor=None, target_table="t")
+        await server_mod.maintain_view(setup_state, v, conn=_FakeConn(), target_table="t")
 
     assert calls == ["expire_snapshots", "remove_orphan_files"]
 
@@ -722,7 +722,7 @@ async def test_maintain_view_persists_last_run_to_history(setup_state, tmp_path)
             )
 
         with patch.object(server_mod, "execute_maintenance", fake_maintenance):
-            await server_mod.maintain_view(setup_state, v, cursor=None, target_table="t")
+            await server_mod.maintain_view(setup_state, v, conn=_FakeConn(), target_table="t")
 
         persisted = await h.all_maintenance("test_view")
         assert "optimize" in persisted
@@ -1271,6 +1271,10 @@ async def test_refresh_persists_view_status_counters(setup_state, tmp_path):
         assert persisted["last_refresh"] is not None
         assert persisted["last_duration"] == pytest.approx(0.25)
         assert persisted["chunks_total"] is None
+        # chunks_done must reset alongside chunks_total — otherwise a
+        # non-chunked single-shot refresh leaves chunks_done=1 lingering in
+        # both memory and persisted state, and the UI reports phantom progress.
+        assert persisted["chunks_done"] == 0
     finally:
         await h.close()
 
@@ -1466,6 +1470,9 @@ async def test_post_restart_no_change_clears_chunks_total(setup_state, tmp_path)
         assert vs.chunks_total is None, (
             "stale chunks_total from a mid-backfill restart was not cleared"
         )
+        assert vs.chunks_done == 0, (
+            "stale chunks_done from a mid-backfill restart was not cleared"
+        )
     finally:
         await h.close()
 
@@ -1497,7 +1504,7 @@ async def test_maintenance_persists_full_field_dict(setup_state, tmp_path):
             )
 
         with patch.object(server_mod, "execute_maintenance", fake_maintenance):
-            await server_mod.maintain_view(setup_state, v, cursor=None, target_table="t")
+            await server_mod.maintain_view(setup_state, v, conn=_FakeConn(), target_table="t")
 
         persisted = await h.all_maintenance("test_view")
         assert "optimize" in persisted

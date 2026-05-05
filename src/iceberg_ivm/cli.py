@@ -8,7 +8,7 @@ from pathlib import Path
 import uvicorn
 
 from iceberg_ivm.config import load_config
-from iceberg_ivm.server import app, set_config_path, set_views_path
+from iceberg_ivm.server import app
 
 
 def main() -> None:
@@ -41,8 +41,8 @@ def main() -> None:
     )
 
     config_path = Path(args.config)
-    set_config_path(config_path)
-    set_views_path(Path(args.views))
+    app.state.config_path = config_path
+    app.state.views_path = Path(args.views)
 
     # Pre-load config to get the port; lifespan does the real init.
     cfg = load_config(config_path)

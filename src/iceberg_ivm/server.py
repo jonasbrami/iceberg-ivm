@@ -73,7 +73,7 @@ CHUNK_ROWS = Counter("mv_chunk_rows_written_total", "Rows written per chunk in a
 RECENT_QUERY_LIMIT = 50
 
 
-@dataclass
+@dataclass(slots=True)
 class MaintenanceOpStatus:
     """Per-op runtime status for one view (e.g. optimize, expire_snapshots).
 
@@ -89,7 +89,7 @@ class MaintenanceOpStatus:
     total_errors: int = 0
 
 
-@dataclass
+@dataclass(slots=True)
 class ViewStatus:
     name: str
     last_refresh: float | None = None
@@ -135,24 +135,27 @@ class AppState:
     views_mtime: float = 0
     view_statuses: dict[str, ViewStatus] = field(default_factory=dict)
     view_runtimes: dict[str, ViewRuntime] = field(default_factory=dict)
+    # Live worker tasks, keyed by view name. Owned by the supervisor; exposed
+    # on AppState so delete_view can cancel its worker synchronously rather
+    # than waiting up to one supervisor tick (which races with the worker
+    # writing rows for an already-deleted view).
+    workers: dict[str, "asyncio.Task[None]"] = field(default_factory=dict)
     history: QueryHistory | None = None
-    _stop: bool = False
+    stop_event: asyncio.Event = field(default_factory=asyncio.Event)
 
+    @property
+    def _stop(self) -> bool:
+        return self.stop_event.is_set()
 
-# ── Path bootstrap (set by CLI before uvicorn starts) ──
-
-_config_path: Path = Path("config.yaml")
-_views_path: Path = Path("views.yaml")
-
-
-def set_config_path(path: Path) -> None:
-    global _config_path
-    _config_path = path
-
-
-def set_views_path(path: Path) -> None:
-    global _views_path
-    _views_path = path
+    @_stop.setter
+    def _stop(self, value: bool) -> None:
+        # Tests and lifespan code historically set ``s._stop = True/False``;
+        # keep that surface working while the underlying primitive is an
+        # asyncio.Event the supervisor can ``wait_for`` on.
+        if value:
+            self.stop_event.set()
+        else:
+            self.stop_event.clear()
 
 
 # ── Dependency injection ──
@@ -200,8 +203,6 @@ def reload_config(s: AppState) -> None:
         new_cfg = load_config(s.config_path)
         new_views = load_views(s.views_path)
         s.config = Config(trino=new_cfg.trino, views=new_views, server=new_cfg.server)
-        s.config_mtime = config_mtime
-        s.views_mtime = views_mtime
         VIEWS_CONFIGURED.set(len(new_views))
         CONFIG_RELOADS.inc()
         log.info("config reloaded: %d views", len(new_views))
@@ -209,6 +210,12 @@ def reload_config(s: AppState) -> None:
             s.view_statuses.setdefault(v.name, ViewStatus(name=v.name))
     except Exception:
         log.exception("failed to reload config")
+    finally:
+        # Always advance mtimes — on failure the file is broken; retrying it
+        # every tick spams logs and serves no purpose. The next legitimate
+        # edit bumps the mtime and triggers a fresh attempt.
+        s.config_mtime = config_mtime
+        s.views_mtime = views_mtime
 
 
 def _view_status_persist_fields(vs: ViewStatus) -> dict:
@@ -288,14 +295,18 @@ async def hydrate_view_state(s: AppState) -> None:
 
 
 async def maintain_view(
-    s: AppState, view: ViewConfig, cursor, target_table: str,
+    s: AppState, view: ViewConfig, conn, target_table: str,
 ) -> None:
-    """Run any due Iceberg maintenance ops after a refresh, on the same cursor.
+    """Run any due Iceberg maintenance ops after a refresh.
 
     Serialising with refresh avoids Iceberg commit conflicts.
     ``maintenance_interval_seconds == 0`` disables maintenance entirely;
     each per-op boolean toggles that op individually. Per-op last-run
     times are persisted so restarts resume the schedule.
+
+    A fresh cursor is opened per op so that an op which raises (and
+    leaves the cursor in an undefined Trino state) can't cascade into
+    misreported failures on the next op.
     """
     interval = view.maintenance_interval_seconds
     if interval <= 0:
@@ -318,6 +329,7 @@ async def maintain_view(
         if ms.last_run is not None and now - ms.last_run < interval:
             continue
         try:
+            cursor = await conn.cursor()
             qi = await execute_maintenance(cursor, target_table, op, params)
             ms.last_run = time.time()
             ms.last_duration = qi.elapsed_ms / 1000.0
@@ -395,6 +407,7 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
             # still claim a backfill is in flight. The committed bookmark
             # (last_source_snapshot) is the source of truth here.
             vs.chunks_total = None
+            vs.chunks_done = 0
             REFRESH_TOTAL.labels(view=view.name, type="skip").inc()
             # Advance state past empty-append / compaction-only snapshots so
             # we don't re-detect them every cycle.
@@ -402,7 +415,7 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
                 if s.history is not None:
                     await s.history.set_last_source_snapshot(view.name, result.current_snapshot)
             await _persist_view_status(s, view.name, vs)
-            await maintain_view(s, view, cursor, target_table)
+            await maintain_view(s, view, conn, target_table)
             return
 
         # Set vs.last_action up-front so /api/views reflects what's running,
@@ -433,8 +446,15 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
             vs.last_duration = q.elapsed_ms / 1000.0
             vs.last_error = None
             vs.last_range = f"[{q.range_start}, {q.range_end})"
-            vs.chunks_done = q.chunks_done
-            vs.chunks_total = q.chunks_total if q.chunks_total > 1 else None
+            # Keep chunks_done aligned with chunks_total: a non-chunked
+            # single-shot still arrives with q.chunks_done=1, q.chunks_total=1,
+            # and persisting "1/None" creates phantom progress in the UI.
+            if q.chunks_total > 1:
+                vs.chunks_done = q.chunks_done
+                vs.chunks_total = q.chunks_total
+            else:
+                vs.chunks_done = 0
+                vs.chunks_total = None
             await _record_query(s, view.name, vs, q)
             await _persist_view_status(s, view.name, vs)
             if q.chunks_total > 1:
@@ -456,13 +476,16 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
         if s.history is not None:
             await s.history.set_last_source_snapshot(view.name, result.current_snapshot)
         vs.total_refreshes += 1
+        # Clear the "in-flight" marker on clean completion. Leave chunks_done
+        # at its last value so the UI can show "12/12 done" alongside total
+        # counters until the next tick overwrites it.
         vs.chunks_total = None
         REFRESH_DURATION.labels(view=view.name).observe(total_elapsed)
         REFRESH_LAST_SUCCESS.labels(view=view.name).set(vs.last_refresh or time.time())
         REFRESH_BYTES.labels(view=view.name).inc(total_bytes)
         REFRESH_ROWS.labels(view=view.name).inc(total_rows)
         await _persist_view_status(s, view.name, vs)
-        await maintain_view(s, view, cursor, target_table)
+        await maintain_view(s, view, conn, target_table)
 
     except Exception as e:
         vs.last_error = str(e)
@@ -471,7 +494,13 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
         log.exception("%s: refresh failed", view.name)
         await _persist_view_status(s, view.name, vs)
     finally:
-        await conn.close()
+        # Shield the close so a task cancellation mid-execute (e.g. delete_view
+        # cancelling its worker) doesn't cancel the close itself and leak the
+        # underlying Trino connection.
+        try:
+            await asyncio.shield(conn.close())
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 async def view_worker(s: AppState, name: str) -> None:
@@ -525,14 +554,20 @@ async def view_worker(s: AppState, name: str) -> None:
 async def supervisor(s: AppState) -> None:
     """Reload config periodically and keep one worker task per configured view."""
     reload_config(s)
-    workers: dict[str, asyncio.Task] = {}
-    last_reload = time.time()
+    workers = s.workers
 
     def sync_workers() -> None:
         current = {v.name for v in (s.config.views if s.config else [])}
         for name in list(workers):
             t = workers[name]
             if name not in current or t.done():
+                if t.done() and not t.cancelled():
+                    exc = t.exception()
+                    if exc is not None:
+                        log.exception(
+                            "%s: worker task exited with unhandled exception",
+                            name, exc_info=exc,
+                        )
                 t.cancel()
                 workers.pop(name)
         for name in current:
@@ -543,19 +578,24 @@ async def supervisor(s: AppState) -> None:
     try:
         sync_workers()
         while not s._stop:
-            await asyncio.sleep(1)
-            now = time.time()
             reload_interval = (
                 s.config.server.config_reload_interval_seconds if s.config else 30
             )
-            if now - last_reload >= reload_interval:
-                reload_config(s)
-                last_reload = now
+            try:
+                # Wait on the stop event with a timeout — woken either by
+                # shutdown (clean exit) or the timeout (config reload tick).
+                await asyncio.wait_for(s.stop_event.wait(), timeout=reload_interval)
+            except asyncio.TimeoutError:
+                pass
+            if s._stop:
+                break
+            reload_config(s)
             sync_workers()
     finally:
         for t in workers.values():
             t.cancel()
         await asyncio.gather(*workers.values(), return_exceptions=True)
+        workers.clear()
 
 
 # ── FastAPI lifespan ──
@@ -590,7 +630,10 @@ async def lifespan(app: FastAPI):
         s = app.state.s
         log.info("using pre-seeded app state")
     else:
-        s = AppState(config_path=_config_path, views_path=_views_path)
+        s = AppState(
+            config_path=getattr(app.state, "config_path", Path("config.yaml")),
+            views_path=getattr(app.state, "views_path", Path("views.yaml")),
+        )
         reload_config(s)
         app.state.s = s
 
@@ -616,17 +659,15 @@ async def lifespan(app: FastAPI):
         "starting supervisor — %d views configured",
         len(s.config.views) if s.config else 0,
     )
-    task = asyncio.create_task(supervisor(s))
     try:
-        yield
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(supervisor(s))
+            try:
+                yield
+            finally:
+                log.info("shutting down supervisor")
+                s._stop = True
     finally:
-        log.info("shutting down supervisor")
-        s._stop = True
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
         if s.history is not None:
             await s.history.close()
 
@@ -737,15 +778,17 @@ def _build_view_create_model() -> type[BaseModel]:
         fields_spec[f.name] = (field_type, default)
 
     def _check_name(cls, v):
-        if not v:
-            return v
-        validate_view_name(v, "name")
+        if v:
+            validate_view_name(v, "name")
+        return v
+
+    def _check_target_table(cls, v):
+        validate_qualified_name(v, "target_table")
         return v
 
     validators = {
-        "_v_name": field_validator("name")(classmethod(_check_name)),
-        "_v_target_table": field_validator("target_table")(classmethod(
-            lambda cls, v: (validate_qualified_name(v, "target_table"), v)[1])),
+        "_v_name": field_validator("name")(_check_name),
+        "_v_target_table": field_validator("target_table")(_check_target_table),
     }
     return create_model("ViewCreate", __validators__=validators, **fields_spec)
 
@@ -938,6 +981,18 @@ async def delete_view(name: str, s: AppState = Depends(get_app_state)):
     save_views(new_views, s.views_path)
     s.config = new_cfg
     s.views_mtime = s.views_path.stat().st_mtime
+    # Cancel and await the worker before clearing runtime state and history.
+    # The supervisor's sync_workers would do this on its next tick (~1s
+    # later), during which the worker could keep writing view_status and
+    # MERGE rows for an already-deleted view. Synchronous cancellation
+    # closes that window.
+    task = s.workers.pop(name, None)
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
     s.view_statuses.pop(name, None)
     s.view_runtimes.pop(name, None)
     if s.history is not None:
