@@ -143,20 +143,6 @@ class AppState:
     history: QueryHistory | None = None
     stop_event: asyncio.Event = field(default_factory=asyncio.Event)
 
-    @property
-    def _stop(self) -> bool:
-        return self.stop_event.is_set()
-
-    @_stop.setter
-    def _stop(self, value: bool) -> None:
-        # Tests and lifespan code historically set ``s._stop = True/False``;
-        # keep that surface working while the underlying primitive is an
-        # asyncio.Event the supervisor can ``wait_for`` on.
-        if value:
-            self.stop_event.set()
-        else:
-            self.stop_event.clear()
-
 
 # ── Dependency injection ──
 
@@ -461,7 +447,7 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
                 CHUNKS_COMPLETED.labels(view=view.name).inc()
                 CHUNK_DURATION.labels(view=view.name).observe(q.elapsed_ms / 1000.0)
                 CHUNK_ROWS.labels(view=view.name).inc(q.processed_rows)
-            if s._stop:
+            if s.stop_event.is_set():
                 # Graceful shutdown mid-backfill — leave last_source_snapshot
                 # unset so the next tick resumes from target metadata.
                 log.info("%s: refresh interrupted after chunk %d/%d",
@@ -496,11 +482,15 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
     finally:
         # Shield the close so a task cancellation mid-execute (e.g. delete_view
         # cancelling its worker) doesn't cancel the close itself and leak the
-        # underlying Trino connection.
+        # underlying Trino connection. CancelledError must propagate so the
+        # task actually finishes cancelling; only swallow non-cancellation
+        # close failures.
         try:
             await asyncio.shield(conn.close())
-        except (asyncio.CancelledError, Exception):
-            pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("%s: conn.close failed", view.name)
 
 
 async def view_worker(s: AppState, name: str) -> None:
@@ -514,7 +504,7 @@ async def view_worker(s: AppState, name: str) -> None:
     """
     rt = s.view_runtimes.setdefault(name, ViewRuntime())
     try:
-        while not s._stop:
+        while not s.stop_event.is_set():
             view = next(
                 (v for v in (s.config.views if s.config else []) if v.name == name),
                 None,
@@ -530,7 +520,18 @@ async def view_worker(s: AppState, name: str) -> None:
                 # refresh_view already logs + records its own exceptions; this is a
                 # last-resort guard so the worker never dies on an unexpected error.
                 log.exception("%s: worker caught unexpected error", name)
-            rt.refresh_in_flight = False
+            finally:
+                # Reset in_flight unconditionally — CancelledError (BaseException)
+                # skips except-Exception and would otherwise leave it True for
+                # any respawned worker reusing this ViewRuntime.
+                rt.refresh_in_flight = False
+            # seq/notify are intentionally outside the finally: on CancelledError
+            # a parked trigger_refresh waiter is woken by the outer finally's
+            # notify_all and bails via the s.config.views check (delete path)
+            # or the socket drop (shutdown). Bumping seq from within a cancel
+            # unwind would also require shielding an async lock acquire to be
+            # safe against re-cancellation — not worth the complexity for paths
+            # that already terminate the waiter another way.
             rt.refresh_seq += 1
             async with rt.refresh_cond:
                 rt.refresh_cond.notify_all()
@@ -552,14 +553,18 @@ async def view_worker(s: AppState, name: str) -> None:
 
 
 async def supervisor(s: AppState) -> None:
-    """Reload config periodically and keep one worker task per configured view."""
+    """Reload config periodically and keep one worker task per configured view.
+
+    ``s.workers`` is the shared worker map: the supervisor owns its lifecycle,
+    but ``delete_view`` reaches in to cancel a worker synchronously rather
+    than waiting for the next supervisor tick.
+    """
     reload_config(s)
-    workers = s.workers
 
     def sync_workers() -> None:
         current = {v.name for v in (s.config.views if s.config else [])}
-        for name in list(workers):
-            t = workers[name]
+        for name in list(s.workers):
+            t = s.workers[name]
             if name not in current or t.done():
                 if t.done() and not t.cancelled():
                     exc = t.exception()
@@ -569,15 +574,15 @@ async def supervisor(s: AppState) -> None:
                             name, exc_info=exc,
                         )
                 t.cancel()
-                workers.pop(name)
+                s.workers.pop(name)
         for name in current:
-            if name not in workers:
+            if name not in s.workers:
                 log.info("spawning worker for %r", name)
-                workers[name] = asyncio.create_task(view_worker(s, name))
+                s.workers[name] = asyncio.create_task(view_worker(s, name))
 
     try:
         sync_workers()
-        while not s._stop:
+        while not s.stop_event.is_set():
             reload_interval = (
                 s.config.server.config_reload_interval_seconds if s.config else 30
             )
@@ -587,15 +592,15 @@ async def supervisor(s: AppState) -> None:
                 await asyncio.wait_for(s.stop_event.wait(), timeout=reload_interval)
             except asyncio.TimeoutError:
                 pass
-            if s._stop:
+            if s.stop_event.is_set():
                 break
             reload_config(s)
             sync_workers()
     finally:
-        for t in workers.values():
+        for t in s.workers.values():
             t.cancel()
-        await asyncio.gather(*workers.values(), return_exceptions=True)
-        workers.clear()
+        await asyncio.gather(*s.workers.values(), return_exceptions=True)
+        s.workers.clear()
 
 
 # ── FastAPI lifespan ──
@@ -625,7 +630,7 @@ def resolve_state_db_path(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Allow tests to pre-seed state (with _stop=True to skip loop)
+    # Allow tests to pre-seed state (with stop_event set to skip loop).
     if hasattr(app.state, "s"):
         s = app.state.s
         log.info("using pre-seeded app state")
@@ -666,7 +671,7 @@ async def lifespan(app: FastAPI):
                 yield
             finally:
                 log.info("shutting down supervisor")
-                s._stop = True
+                s.stop_event.set()
     finally:
         if s.history is not None:
             await s.history.close()

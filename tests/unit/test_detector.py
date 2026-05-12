@@ -384,12 +384,14 @@ class TestGetCurrentSnapshot:
         cursor = MockCursor([[(12345,)]])
         await get_current_snapshot(cursor, "db.t")
         sql = cursor.executed_sql[0]
-        assert "snapshot_id" in sql
-        # Both keys should be in the ORDER BY (committed_at first, snapshot_id
-        # as the tiebreak), descending so LIMIT 1 returns the head.
+        # Both keys should be in the ORDER BY with committed_at first and
+        # snapshot_id as the tiebreak, descending so LIMIT 1 returns the head.
+        # Snapshot IDs are not strictly time-ordered across writers, so key
+        # order matters.
         order_by = sql.split("ORDER BY", 1)[1]
         assert "committed_at" in order_by
         assert "snapshot_id" in order_by
+        assert order_by.index("committed_at") < order_by.index("snapshot_id")
 
 
 # ── get_snapshots_since ──
@@ -819,7 +821,7 @@ class TestGetTargetBucketMax:
         column (0=DATA, 1=POS_DELETES, 2=EQ_DELETES). The resume point must
         be computed from data files only — including delete-file metrics
         would skew the max upward and skip live buckets on resume."""
-        cursor = MockCursor([[(None,)]])
+        cursor = MockCursor([[]])
         await get_target_bucket_max(cursor, "db.t", "minute")
         sql = cursor.executed_sql[0]
         assert "content = 0" in sql or "content=0" in sql
