@@ -712,7 +712,8 @@ _FIELD_META: dict[str, dict] = {
                            "label": "Full Refresh Chunk Size",
                            "help": ("If set, the first-run backfill is split into chunks of this size "
                                     "and each chunk is committed independently. Must be coarser-or-equal "
-                                    "to the view's own date_trunc granularity.")},
+                                    "to the view's own date_trunc granularity. Sub-second views "
+                                    "(second / millisecond) must pick minute or coarser.")},
     "maintenance_interval_seconds": {"min": 0, "suffix": "seconds", "group": "maintenance",
                                      "label": "Maintenance Interval",
                                      "help": "Shared interval for every enabled op. 0 disables maintenance entirely."},

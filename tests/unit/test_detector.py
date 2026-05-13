@@ -165,6 +165,38 @@ class TestExpandToBucketBoundsBoundaryExact:
     returns the boundary itself instead of the next boundary.
     """
 
+    def test_both_at_millisecond_boundary(self):
+        ts = datetime(2026, 4, 8, 10, 30, 45, 1000, tzinfo=timezone.utc)
+        s, e = expand_to_bucket_bounds(ts, ts, "millisecond")
+        assert s == ts
+        assert e == ts + timedelta(milliseconds=1)
+
+    def test_max_exactly_at_next_millisecond(self):
+        # min mid-millisecond (us=500), max exactly on the next ms boundary.
+        s, e = expand_to_bucket_bounds(
+            datetime(2026, 4, 8, 10, 30, 45, 500, tzinfo=timezone.utc),
+            datetime(2026, 4, 8, 10, 30, 45, 1000, tzinfo=timezone.utc),
+            "millisecond",
+        )
+        assert s == datetime(2026, 4, 8, 10, 30, 45, 0, tzinfo=timezone.utc)
+        assert e == datetime(2026, 4, 8, 10, 30, 45, 2000, tzinfo=timezone.utc)
+
+    def test_both_at_second_boundary(self):
+        ts = datetime(2026, 4, 8, 10, 30, 45, 0, tzinfo=timezone.utc)
+        s, e = expand_to_bucket_bounds(ts, ts, "second")
+        assert s == ts
+        assert e == ts + timedelta(seconds=1)
+
+    def test_max_exactly_at_next_second(self):
+        # min mid-second (us=500_000), max exactly on the next-second boundary.
+        s, e = expand_to_bucket_bounds(
+            datetime(2026, 4, 8, 10, 30, 45, 500_000, tzinfo=timezone.utc),
+            datetime(2026, 4, 8, 10, 30, 46, 0, tzinfo=timezone.utc),
+            "second",
+        )
+        assert s == datetime(2026, 4, 8, 10, 30, 45, 0, tzinfo=timezone.utc)
+        assert e == datetime(2026, 4, 8, 10, 30, 47, 0, tzinfo=timezone.utc)
+
     def test_min_and_max_both_at_minute_boundary(self):
         ts = datetime(2026, 4, 8, 10, 0, 0, 0, tzinfo=timezone.utc)
         s, e = expand_to_bucket_bounds(ts, ts, "minute")
@@ -306,6 +338,10 @@ _SAMPLE_PAIRS = [
     # sub-second spread (covers millisecond/second invariants)
     (datetime(2026, 4, 8, 10, 30, 45, 500_000, tzinfo=timezone.utc),
      datetime(2026, 4, 8, 10, 30, 46, 999_000, tzinfo=timezone.utc)),
+    # cross-second with sub-millisecond offset on both ends (exercises
+    # millisecond and second invariants across a whole-second boundary)
+    (datetime(2026, 4, 8, 10, 30, 45, 999_500, tzinfo=timezone.utc),
+     datetime(2026, 4, 8, 10, 30, 47, 1_500, tzinfo=timezone.utc)),
 ]
 
 _GRANULARITIES = [

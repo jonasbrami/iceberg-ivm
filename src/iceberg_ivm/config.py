@@ -12,7 +12,6 @@ import yaml
 from iceberg_ivm.query_parser import (
     IDENTIFIER_RE,
     QUALIFIED_NAME_RE,
-    VALID_GRANULARITIES,
     parse_view_query,
 )
 
