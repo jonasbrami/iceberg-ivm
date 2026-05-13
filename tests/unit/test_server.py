@@ -57,7 +57,7 @@ def setup_state(tmp_path, trino_env):
     s.view_statuses = {
         "test_view": ViewStatus(name="test_view", last_action="skip", total_refreshes=3),
     }
-    s._stop = True  # Prevents refresh loop from running
+    s.stop_event.set()  # Prevents refresh loop from running
     app.state.s = s
     yield s
     if hasattr(app.state, "s"):
@@ -564,7 +564,7 @@ async def test_refresh_view_runs_maintenance(setup_state):
         server=setup_state.config.server,
     )
     setup_state.view_statuses["test_view"] = ViewStatus(name="test_view")
-    setup_state._stop = False  # fixture seeds True to keep the supervisor quiet
+    setup_state.stop_event.clear()  # fixture seeds set() to keep the supervisor quiet
 
     async def fake_detect(*a, **kw):
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=1)
@@ -639,7 +639,7 @@ async def test_maintain_view_respects_interval(setup_state):
         raise AssertionError("should not have run")
 
     with patch.object(server_mod, "execute_maintenance", fake_maintenance):
-        await server_mod.maintain_view(setup_state, v, cursor=None, target_table="t")
+        await server_mod.maintain_view(setup_state, v, conn=_FakeConn(), target_table="t")
 
     assert calls == []
 
@@ -662,7 +662,7 @@ async def test_maintain_view_skips_everything_when_interval_zero(setup_state):
         raise AssertionError(f"{op} should not have run when interval is 0")
 
     with patch.object(server_mod, "execute_maintenance", fake_maintenance):
-        await server_mod.maintain_view(setup_state, v, cursor=None, target_table="t")
+        await server_mod.maintain_view(setup_state, v, conn=_FakeConn(), target_table="t")
 
 
 async def test_maintain_view_respects_per_op_toggle(setup_state):
@@ -690,7 +690,7 @@ async def test_maintain_view_respects_per_op_toggle(setup_state):
         )
 
     with patch.object(server_mod, "execute_maintenance", fake_maintenance):
-        await server_mod.maintain_view(setup_state, v, cursor=None, target_table="t")
+        await server_mod.maintain_view(setup_state, v, conn=_FakeConn(), target_table="t")
 
     assert calls == ["expire_snapshots", "remove_orphan_files"]
 
@@ -722,7 +722,7 @@ async def test_maintain_view_persists_last_run_to_history(setup_state, tmp_path)
             )
 
         with patch.object(server_mod, "execute_maintenance", fake_maintenance):
-            await server_mod.maintain_view(setup_state, v, cursor=None, target_table="t")
+            await server_mod.maintain_view(setup_state, v, conn=_FakeConn(), target_table="t")
 
         persisted = await h.all_maintenance("test_view")
         assert "optimize" in persisted
@@ -764,7 +764,7 @@ async def test_trigger_refresh_signals_worker_and_returns_status(setup_state):
     from iceberg_ivm import server as server_mod
 
     view = setup_state.config.views[0]
-    setup_state._stop = False
+    setup_state.stop_event.clear()
 
     async def fake_refresh_view(s, v):
         vs = s.view_statuses.setdefault(v.name, server_mod.ViewStatus(name=v.name))
@@ -775,7 +775,7 @@ async def test_trigger_refresh_signals_worker_and_returns_status(setup_state):
         try:
             result = await server_mod.trigger_refresh(view.name, setup_state)
         finally:
-            setup_state._stop = True
+            setup_state.stop_event.set()
             worker.cancel()
             try:
                 await worker
@@ -802,7 +802,7 @@ async def test_concurrent_triggers_coalesce_into_single_followup(setup_state):
     from iceberg_ivm.introspect import ColumnInfo
 
     view = setup_state.config.views[0]
-    setup_state._stop = False
+    setup_state.stop_event.clear()
 
     class FakeConn:
         async def cursor(self): return FakeCursor()
@@ -851,7 +851,7 @@ async def test_concurrent_triggers_coalesce_into_single_followup(setup_state):
                 server_mod.trigger_refresh(view.name, setup_state) for _ in range(10)
             ])
         finally:
-            setup_state._stop = True
+            setup_state.stop_event.set()
             worker.cancel()
             try:
                 await worker
@@ -879,7 +879,7 @@ async def test_trigger_bails_when_view_deleted_during_wait(setup_state):
     from iceberg_ivm.config import Config
 
     view = setup_state.config.views[0]
-    setup_state._stop = False
+    setup_state.stop_event.clear()
 
     # A refresh that blocks until cancelled — simulates a long-running INSERT.
     async def hanging_refresh_view(s, v):
@@ -910,6 +910,53 @@ async def test_trigger_bails_when_view_deleted_during_wait(setup_state):
         with pytest.raises(HTTPException) as exc:
             await trigger
         assert exc.value.status_code == 410
+
+
+async def test_view_worker_resets_refresh_in_flight_on_cancel(setup_state):
+    """A cancelled mid-refresh must leave ``rt.refresh_in_flight = False``.
+
+    ``CancelledError`` is a ``BaseException`` and bypasses ``view_worker``'s
+    ``except Exception`` clause. Unless the reset is in a ``finally``, a
+    respawned worker reusing the same ``ViewRuntime`` inherits a stale
+    ``refresh_in_flight=True`` flag, and the next ``trigger_refresh``
+    computes ``target = seq + 2`` instead of ``seq + 1`` — over-waiting by
+    one full refresh interval.
+    """
+    from iceberg_ivm import server as server_mod
+
+    view = setup_state.config.views[0]
+    setup_state.stop_event.clear()
+
+    refresh_started = asyncio.Event()
+
+    async def hanging_refresh(s, v):
+        refresh_started.set()
+        await asyncio.Event().wait()  # hang until the worker task is cancelled
+
+    with patch.object(server_mod, "refresh_view", hanging_refresh):
+        worker = asyncio.create_task(server_mod.view_worker(setup_state, view.name))
+        try:
+            await asyncio.wait_for(refresh_started.wait(), timeout=1.0)
+            rt = setup_state.view_runtimes[view.name]
+            assert rt.refresh_in_flight is True, "fixture sanity: refresh in-flight"
+
+            worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
+
+            assert rt.refresh_in_flight is False, (
+                "view_worker did not reset refresh_in_flight on CancelledError; "
+                "a respawned worker would inherit a stale True flag"
+            )
+        finally:
+            if not worker.done():
+                worker.cancel()
+                try:
+                    await worker
+                except asyncio.CancelledError:
+                    pass
 
 
 # ── UI ──
@@ -946,6 +993,39 @@ def test_reload_config_no_change(setup_state):
     before = setup_state.config
     reload_config(setup_state)
     assert setup_state.config is before  # unchanged
+
+
+def test_reload_config_advances_mtime_on_parse_failure(setup_state):
+    """A broken config file must still advance the recorded mtime.
+
+    Otherwise the supervisor re-attempts the parse on every tick and spams
+    log.exception. The next legitimate edit bumps the mtime again and
+    triggers a fresh attempt. ``s.config`` stays at its last-good value.
+    """
+    from iceberg_ivm.server import reload_config
+
+    before_config = setup_state.config
+    assert before_config is not None
+
+    setup_state.views_path.write_text(
+        "views:\n"
+        "  - name: broken_view\n"
+        "    query: |\n"
+        "      SELECT date_trunc('day', ts) AS d FROM iceberg.db.t GROUP BY 1\n"
+        "    target_table: not a qualified name\n"  # fails validate_qualified_name
+    )
+    new_mtime = setup_state.views_path.stat().st_mtime
+    assert new_mtime > setup_state.views_mtime  # fixture sanity
+
+    reload_config(setup_state)
+
+    assert setup_state.views_mtime == new_mtime, (
+        "broken views.yaml mtime was not recorded; supervisor would retry "
+        "(and log.exception) on every reload tick"
+    )
+    assert setup_state.config is before_config, (
+        "broken parse must not replace s.config — the last-good value stays in effect"
+    )
 
 
 # ── Trino connection ──
@@ -1194,6 +1274,51 @@ async def test_refresh_persists_queries_and_hydrates_on_restart(
         await h.close()
 
 
+async def test_delete_view_cancels_live_worker_synchronously(setup_state):
+    """delete_view must cancel + await the worker before returning.
+
+    Without the synchronous cancel, the supervisor's next sync_workers tick
+    (~1s later) would clean up — during which the worker keeps writing
+    view_status / MERGE rows for the just-deleted view. The fix is that
+    delete_view itself pops the worker from s.workers, cancels it, and
+    awaits its completion before clearing runtime state.
+    """
+    from iceberg_ivm import server as server_mod
+
+    worker_running = asyncio.Event()
+
+    async def hanging_worker() -> None:
+        worker_running.set()
+        await asyncio.Event().wait()  # hang until cancelled
+
+    task = asyncio.create_task(hanging_worker())
+    setup_state.workers["test_view"] = task
+
+    try:
+        await asyncio.wait_for(worker_running.wait(), timeout=1.0)
+        assert not task.done(), "fixture sanity: worker is live"
+
+        await server_mod.delete_view("test_view", setup_state)
+
+        # The fix is observable here: by the time delete_view returns the
+        # worker task must already be done. Without the synchronous cancel,
+        # task.done() would be False until the supervisor's next tick.
+        assert task.done(), (
+            "delete_view returned without cancelling the live worker; "
+            "the worker would keep writing rows for a deleted view until "
+            "the next supervisor tick"
+        )
+        assert "test_view" not in setup_state.workers
+        assert "test_view" not in setup_state.view_statuses
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+
 async def test_delete_view_purges_history(setup_state, tmp_path, client):
     from iceberg_ivm.executor import QueryInfo
 
@@ -1230,7 +1355,7 @@ async def test_refresh_persists_view_status_counters(setup_state, tmp_path):
     from iceberg_ivm.introspect import ColumnInfo
 
     view = setup_state.config.views[0]
-    setup_state._stop = False  # fixture defaults to True; refresh_view bails on stop
+    setup_state.stop_event.clear()  # fixture sets stop_event; refresh_view bails on stop
 
     h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
     await h.open()
@@ -1271,6 +1396,10 @@ async def test_refresh_persists_view_status_counters(setup_state, tmp_path):
         assert persisted["last_refresh"] is not None
         assert persisted["last_duration"] == pytest.approx(0.25)
         assert persisted["chunks_total"] is None
+        # chunks_done must reset alongside chunks_total — otherwise a
+        # non-chunked single-shot refresh leaves chunks_done=1 lingering in
+        # both memory and persisted state, and the UI reports phantom progress.
+        assert persisted["chunks_done"] == 0
     finally:
         await h.close()
 
@@ -1322,7 +1451,7 @@ async def test_refresh_then_restart_round_trips_total_refreshes(setup_state, tmp
 
     view = setup_state.config.views[0]
     setup_state.view_statuses[view.name] = ViewStatus(name=view.name)
-    setup_state._stop = False  # fixture defaults to True; refresh_view bails on stop
+    setup_state.stop_event.clear()  # fixture sets stop_event; refresh_view bails on stop
 
     h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
     await h.open()
@@ -1466,6 +1595,9 @@ async def test_post_restart_no_change_clears_chunks_total(setup_state, tmp_path)
         assert vs.chunks_total is None, (
             "stale chunks_total from a mid-backfill restart was not cleared"
         )
+        assert vs.chunks_done == 0, (
+            "stale chunks_done from a mid-backfill restart was not cleared"
+        )
     finally:
         await h.close()
 
@@ -1497,7 +1629,7 @@ async def test_maintenance_persists_full_field_dict(setup_state, tmp_path):
             )
 
         with patch.object(server_mod, "execute_maintenance", fake_maintenance):
-            await server_mod.maintain_view(setup_state, v, cursor=None, target_table="t")
+            await server_mod.maintain_view(setup_state, v, conn=_FakeConn(), target_table="t")
 
         persisted = await h.all_maintenance("test_view")
         assert "optimize" in persisted
@@ -1675,7 +1807,7 @@ async def test_refresh_view_chunked_backfill_completes(setup_state, tmp_path):
 
     view = _install_chunked_view(setup_state)
     setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
-    setup_state._stop = False
+    setup_state.stop_event.clear()
 
     h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
     await h.open()
@@ -1718,7 +1850,7 @@ async def test_refresh_view_chunked_backfill_completes(setup_state, tmp_path):
 
 
 async def test_refresh_view_interrupt_skips_last_snapshot_write(setup_state, tmp_path):
-    """When ``s._stop`` trips between chunks, ``refresh_view`` breaks out of
+    """When ``s.stop_event`` trips between chunks, ``refresh_view`` breaks out of
     the async-for without writing ``last_source_snapshot`` (next tick resumes
     from the persisted bookmark) and without incrementing ``total_refreshes``.
     Partial chunks already appended to recent_queries are preserved."""
@@ -1743,7 +1875,7 @@ async def test_refresh_view_interrupt_skips_last_snapshot_write(setup_state, tmp
         return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
 
     async def fake_execute_refresh(*a, **kw):
-        # Yield one chunk, then the refresh_view sets _stop before the next.
+        # Yield one chunk, then trip the stop_event before the next.
         yield QueryInfo(
             query_id="q1", info_uri="http://trino/q1",
             stage="chunk_merge", started_at=1.0, elapsed_ms=250.0,
@@ -1752,7 +1884,7 @@ async def test_refresh_view_interrupt_skips_last_snapshot_write(setup_state, tmp
             range_end=datetime(2026, 4, 9, tzinfo=timezone.utc),
             chunks_done=1, chunks_total=3,
         )
-        setup_state._stop = True
+        setup_state.stop_event.set()
         yield QueryInfo(
             query_id="q2", info_uri="http://trino/q2", stage="chunk_merge",
             started_at=2.0, elapsed_ms=100.0, chunks_done=2, chunks_total=3,

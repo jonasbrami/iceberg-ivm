@@ -101,6 +101,11 @@ def inject_range_filter(
     Returns the resulting SQL as a string.  The query is never executed here;
     Trino parses the emitted string at refresh time.
     """
+    # Strip comments first so a trailing `-- …` in the WHERE clause can't
+    # swallow the appended ` AND <predicate>` (Trino's lexer treats `--`
+    # as comment-to-end-of-line; the wrapped body would silently neutralise
+    # the time filter and force a full-source rebuild every refresh).
+    sql = sqlparse.format(sql, strip_comments=True)
     stmt = _single_statement(sql)
     predicate = _build_range_predicate(filter_column, start, end)
 

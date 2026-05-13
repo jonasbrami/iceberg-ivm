@@ -428,3 +428,31 @@ class TestInjectRangeFilter:
         assert p.granularity == "week"
         assert p.filter_column == "ts"
         assert p.merge_keys == ("symbol", "week")
+
+    def test_line_comment_in_where_does_not_swallow_predicate(self):
+        # A `--` line comment in the WHERE clause must not consume the
+        # appended `AND ts >= ...` — that would silently drop the time
+        # filter and force a full-source rebuild on every refresh. The
+        # predicate must survive comment stripping (i.e., it's not shadowed
+        # by a `--` that runs through end-of-line).
+        import sqlparse
+        sql = (
+            "SELECT date_trunc('day', ts) AS d FROM t\n"
+            "WHERE color = 'red' -- restrict to red rows\n"
+            "GROUP BY 1"
+        )
+        out = inject_range_filter(sql, "ts", self.START, self.END)
+        stripped = sqlparse.format(out, strip_comments=True)
+        assert "ts >= TIMESTAMP" in stripped
+        assert "ts < TIMESTAMP" in stripped
+
+    def test_block_comment_in_where_does_not_break_injection(self):
+        import sqlparse
+        sql = (
+            "SELECT date_trunc('day', ts) AS d FROM t "
+            "WHERE color = 'red' /* note */ GROUP BY 1"
+        )
+        out = inject_range_filter(sql, "ts", self.START, self.END)
+        stripped = sqlparse.format(out, strip_comments=True)
+        assert "ts >= TIMESTAMP" in stripped
+        assert "ts < TIMESTAMP" in stripped

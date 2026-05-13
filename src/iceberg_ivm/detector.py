@@ -56,10 +56,16 @@ def system_table(table: str, suffix: str) -> str:
 
 
 async def get_current_snapshot(cursor, source_table: str) -> int | None:
-    """Get latest snapshot_id from source table. Metadata-only."""
+    """Get latest snapshot_id from source table. Metadata-only.
+
+    The (committed_at, snapshot_id) tiebreak matches get_snapshots_since:
+    sibling snapshots can share a millisecond-precision committed_at, so
+    ordering by committed_at alone is non-deterministic and would let the
+    next tick observe last_snapshot == current_snap and skip real new data.
+    """
     await cursor.execute(
         f"SELECT snapshot_id FROM {system_table(source_table, 'snapshots')} "
-        f"ORDER BY committed_at DESC LIMIT 1"
+        f"ORDER BY committed_at DESC, snapshot_id DESC LIMIT 1"
     )
     row = await cursor.fetchone()
     return row[0] if row else None
@@ -191,16 +197,21 @@ async def get_source_column_range(
 async def get_target_bucket_max(
     cursor, target_table: str, bucket_alias: str,
 ) -> datetime | None:
-    """Read the max ``upper_bound`` of ``bucket_alias`` across live files in
-    ``target_table``.
+    """Read the max ``upper_bound`` of ``bucket_alias`` across live data
+    files in ``target_table``.
 
     The chunked full-refresh uses this as its resume point: the target's
     own Iceberg metadata, rather than a separate cursor key, records what
     has been committed. Returns ``None`` for an empty target or one whose
     files carry no bounds on ``bucket_alias`` yet.
+
+    Filters ``content = 0`` (data files) so V2 position/equality delete
+    files don't skew the max upward and cause the resume to skip live
+    buckets.
     """
     await cursor.execute(
-        f"SELECT readable_metrics FROM {system_table(target_table, 'files')}"
+        f"SELECT readable_metrics FROM {system_table(target_table, 'files')} "
+        f"WHERE content = 0"
     )
     rows = await cursor.fetchall()
     if not rows:
@@ -219,26 +230,41 @@ def _add_months(dt: datetime, n: int) -> datetime:
     return dt.replace(year=idx // 12, month=(idx % 12) + 1)
 
 
-def _q_start(dt: datetime) -> datetime:
-    return midnight(dt).replace(month=((dt.month - 1) // 3) * 3 + 1, day=1)
+def _floor_minute(d: datetime) -> datetime:
+    return d.replace(second=0, microsecond=0)
+
+
+def _floor_hour(d: datetime) -> datetime:
+    return d.replace(minute=0, second=0, microsecond=0)
+
+
+def _floor_week(d: datetime) -> datetime:
+    return midnight(d - timedelta(days=d.weekday()))
+
+
+def _floor_month(d: datetime) -> datetime:
+    return midnight(d).replace(day=1)
+
+
+def _floor_quarter(d: datetime) -> datetime:
+    return midnight(d).replace(month=((d.month - 1) // 3) * 3 + 1, day=1)
+
+
+def _floor_year(d: datetime) -> datetime:
+    return midnight(d).replace(month=1, day=1)
 
 
 # Per-granularity bucket math: (floor_to_bucket_start, next_bucket_after).
 # ``expand_to_bucket_bounds`` applies ``floor`` to min_ts and ``next_bucket`` to max_ts.
 # ``walk_buckets`` iterates by repeatedly applying ``next_bucket``.
 _BUCKETS: dict[str, tuple[Callable[[datetime], datetime], Callable[[datetime], datetime]]] = {
-    "minute":  (lambda d: d.replace(second=0, microsecond=0),
-                lambda d: d.replace(second=0, microsecond=0) + timedelta(minutes=1)),
-    "hour":    (lambda d: d.replace(minute=0, second=0, microsecond=0),
-                lambda d: d.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)),
-    "day":     (midnight, lambda d: midnight(d) + timedelta(days=1)),
-    "week":    (lambda d: midnight(d - timedelta(days=d.weekday())),
-                lambda d: midnight(d - timedelta(days=d.weekday())) + timedelta(weeks=1)),
-    "month":   (lambda d: midnight(d).replace(day=1),
-                lambda d: _add_months(midnight(d).replace(day=1), 1)),
-    "quarter": (_q_start, lambda d: _add_months(_q_start(d), 3)),
-    "year":    (lambda d: midnight(d).replace(month=1, day=1),
-                lambda d: midnight(d).replace(year=d.year + 1, month=1, day=1)),
+    "minute":  (_floor_minute, lambda d: _floor_minute(d) + timedelta(minutes=1)),
+    "hour":    (_floor_hour,   lambda d: _floor_hour(d) + timedelta(hours=1)),
+    "day":     (midnight,      lambda d: midnight(d) + timedelta(days=1)),
+    "week":    (_floor_week,   lambda d: _floor_week(d) + timedelta(weeks=1)),
+    "month":   (_floor_month,  lambda d: _add_months(_floor_month(d), 1)),
+    "quarter": (_floor_quarter, lambda d: _add_months(_floor_quarter(d), 3)),
+    "year":    (_floor_year,   lambda d: _floor_year(d).replace(year=d.year + 1)),
 }
 
 
