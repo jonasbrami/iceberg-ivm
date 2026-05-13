@@ -230,6 +230,14 @@ def _add_months(dt: datetime, n: int) -> datetime:
     return dt.replace(year=idx // 12, month=(idx % 12) + 1)
 
 
+def _floor_millisecond(d: datetime) -> datetime:
+    return d.replace(microsecond=(d.microsecond // 1000) * 1000)
+
+
+def _floor_second(d: datetime) -> datetime:
+    return d.replace(microsecond=0)
+
+
 def _floor_minute(d: datetime) -> datetime:
     return d.replace(second=0, microsecond=0)
 
@@ -258,6 +266,8 @@ def _floor_year(d: datetime) -> datetime:
 # ``expand_to_bucket_bounds`` applies ``floor`` to min_ts and ``next_bucket`` to max_ts.
 # ``walk_buckets`` iterates by repeatedly applying ``next_bucket``.
 _BUCKETS: dict[str, tuple[Callable[[datetime], datetime], Callable[[datetime], datetime]]] = {
+    "millisecond": (_floor_millisecond, lambda d: _floor_millisecond(d) + timedelta(milliseconds=1)),
+    "second":  (_floor_second,  lambda d: _floor_second(d) + timedelta(seconds=1)),
     "minute":  (_floor_minute, lambda d: _floor_minute(d) + timedelta(minutes=1)),
     "hour":    (_floor_hour,   lambda d: _floor_hour(d) + timedelta(hours=1)),
     "day":     (midnight,      lambda d: midnight(d) + timedelta(days=1)),

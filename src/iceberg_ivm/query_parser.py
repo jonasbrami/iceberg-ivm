@@ -48,7 +48,7 @@ _DATE_TRUNC_RE = re.compile(
 )
 
 VALID_GRANULARITIES = frozenset(
-    ("minute", "hour", "day", "week", "month", "quarter", "year")
+    ("millisecond", "second", "minute", "hour", "day", "week", "month", "quarter", "year")
 )
 
 

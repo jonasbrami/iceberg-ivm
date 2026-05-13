@@ -21,9 +21,22 @@ log = logging.getLogger(__name__)
 # full_refresh_chunk must be coarser-or-equal to the view's own granularity
 # and cleanly contain its buckets. Weeks don't divide months (and vice-versa),
 # so the relation is a partial order — hence the explicit override for "week".
-_GRAN_ORDER = ("minute", "hour", "day", "week", "month", "quarter", "year")
+# Sub-second values (millisecond, second) are valid as view granularities but
+# never as chunk granularities — chunked backfills measured in seconds would
+# create millions of tiny commits.
+_GRAN_ORDER = (
+    "millisecond", "second", "minute", "hour", "day", "week", "month", "quarter", "year",
+)
+_SUBDAY_OR_WEEK = ("millisecond", "second", "minute", "hour", "day", "week")
+_VALID_CHUNK_GRANULARITIES = frozenset(
+    ("minute", "hour", "day", "week", "month", "quarter", "year")
+)
 _CHUNK_COMPATIBILITY: dict[str, frozenset[str]] = {
-    g: frozenset(x for x in _GRAN_ORDER[i:] if x != "week" or g in ("minute", "hour", "day", "week"))
+    g: frozenset(
+        x for x in _GRAN_ORDER[i:]
+        if x in _VALID_CHUNK_GRANULARITIES
+        and (x != "week" or g in _SUBDAY_OR_WEEK)
+    )
     for i, g in enumerate(_GRAN_ORDER)
 }
 _CHUNK_COMPATIBILITY["week"] = frozenset({"week"})
@@ -141,10 +154,10 @@ def validate_chunk_compatibility(chunk: str | None, query: str) -> None:
     if not chunk:
         return
     parsed = parse_view_query(query)
-    if chunk not in VALID_GRANULARITIES:
+    if chunk not in _VALID_CHUNK_GRANULARITIES:
         raise ValueError(
-            f"full_refresh_chunk: {chunk!r} is not a valid granularity; "
-            f"expected one of {sorted(VALID_GRANULARITIES)}"
+            f"full_refresh_chunk: {chunk!r} is not a valid chunk granularity; "
+            f"expected one of {sorted(_VALID_CHUNK_GRANULARITIES)}"
         )
     allowed = _CHUNK_COMPATIBILITY[parsed.granularity]
     if chunk not in allowed:

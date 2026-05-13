@@ -249,7 +249,11 @@ class TestExpandToBucketBoundsBoundaryExact:
 
 def _py_date_trunc(granularity: str, ts: datetime) -> datetime:
     """Python equivalent of Trino's date_trunc — the forward function."""
-    if granularity == "minute":
+    if granularity == "millisecond":
+        return ts.replace(microsecond=(ts.microsecond // 1000) * 1000)
+    elif granularity == "second":
+        return ts.replace(microsecond=0)
+    elif granularity == "minute":
         return ts.replace(second=0, microsecond=0)
     elif granularity == "hour":
         return ts.replace(minute=0, second=0, microsecond=0)
@@ -299,9 +303,14 @@ _SAMPLE_PAIRS = [
     # exact bucket boundary (minute)
     (datetime(2026, 4, 8, 10, 0, 0, 0, tzinfo=timezone.utc),
      datetime(2026, 4, 8, 11, 0, 0, 0, tzinfo=timezone.utc)),
+    # sub-second spread (covers millisecond/second invariants)
+    (datetime(2026, 4, 8, 10, 30, 45, 500_000, tzinfo=timezone.utc),
+     datetime(2026, 4, 8, 10, 30, 46, 999_000, tzinfo=timezone.utc)),
 ]
 
-_GRANULARITIES = ["minute", "hour", "day", "week", "month", "quarter", "year"]
+_GRANULARITIES = [
+    "millisecond", "second", "minute", "hour", "day", "week", "month", "quarter", "year",
+]
 
 
 import pytest

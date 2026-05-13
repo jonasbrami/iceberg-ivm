@@ -262,7 +262,7 @@ def test_full_refresh_chunk_valid(tmp_path):
 
 
 def test_full_refresh_chunk_rejects_invalid_granularity(tmp_path):
-    with pytest.raises(ValueError, match="not a valid granularity"):
+    with pytest.raises(ValueError, match="not a valid chunk granularity"):
         load_views(write_views(tmp_path, _views_yaml_with_chunk("day", "fortnight")))
 
 
@@ -283,6 +283,21 @@ def test_full_refresh_chunk_rejects_incompatible(tmp_path, view_g, chunk_g):
 
 
 @pytest.mark.parametrize("view_g, chunk_g", [
+    # sub-second values are valid view granularities but never valid chunk
+    # granularities — chunked backfills measured in seconds or milliseconds
+    # would create absurd commit counts.
+    ("second", "second"),
+    ("second", "millisecond"),
+    ("millisecond", "millisecond"),
+    ("hour", "second"),
+    ("day", "millisecond"),
+])
+def test_full_refresh_chunk_rejects_subsecond_chunk(tmp_path, view_g, chunk_g):
+    with pytest.raises(ValueError, match="not a valid chunk granularity"):
+        load_views(write_views(tmp_path, _views_yaml_with_chunk(view_g, chunk_g)))
+
+
+@pytest.mark.parametrize("view_g, chunk_g", [
     ("minute", "minute"),
     ("minute", "hour"),
     ("minute", "day"),
@@ -296,6 +311,14 @@ def test_full_refresh_chunk_rejects_incompatible(tmp_path, view_g, chunk_g):
     ("month", "year"),
     ("quarter", "year"),
     ("year", "year"),
+    # sub-second views can still pick coarser chunk values
+    ("second", "minute"),
+    ("second", "hour"),
+    ("second", "day"),
+    ("second", "week"),
+    ("millisecond", "minute"),
+    ("millisecond", "week"),
+    ("millisecond", "year"),
 ])
 def test_full_refresh_chunk_accepts_compatible(tmp_path, view_g, chunk_g):
     views = load_views(write_views(tmp_path, _views_yaml_with_chunk(view_g, chunk_g)))
