@@ -1,16 +1,16 @@
 """FastAPI server: web UI, REST API, Prometheus metrics, refresh loop."""
+
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import os
 import time
 import typing
-from contextlib import asynccontextmanager
-import dataclasses
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-
 from urllib.parse import urlparse
 
 import aiotrino
@@ -82,6 +82,7 @@ class MaintenanceOpStatus:
     restarts (a 7d retention interval is meaningless if every restart
     resets it to ``None`` and re-runs immediately).
     """
+
     last_run: float | None = None
     last_duration: float | None = None
     last_error: str | None = None
@@ -120,6 +121,7 @@ class ViewRuntime:
     Kept separate from ``ViewStatus`` so ``ViewStatus`` stays JSON-serialisable
     (``dataclasses.asdict`` can't walk ``asyncio.Event`` / ``Condition``).
     """
+
     wake: asyncio.Event = field(default_factory=asyncio.Event)
     refresh_cond: asyncio.Condition = field(default_factory=asyncio.Condition)
     refresh_seq: int = 0
@@ -139,18 +141,20 @@ class AppState:
     # on AppState so delete_view can cancel its worker synchronously rather
     # than waiting up to one supervisor tick (which races with the worker
     # writing rows for an already-deleted view).
-    workers: dict[str, "asyncio.Task[None]"] = field(default_factory=dict)
+    workers: dict[str, asyncio.Task[None]] = field(default_factory=dict)
     history: QueryHistory | None = None
     stop_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 # ── Dependency injection ──
 
+
 def get_app_state(request: Request) -> AppState:
     return request.app.state.s
 
 
 # ── Core logic ──
+
 
 def get_trino_connection(s: AppState) -> aiotrino.dbapi.Connection:
     cfg = s.config
@@ -164,13 +168,15 @@ def get_trino_connection(s: AppState) -> aiotrino.dbapi.Connection:
     # Pin every session to UTC so Trino's `date_trunc` on TIMESTAMP WITH
     # TIME ZONE columns agrees with the Python-side expand_to_bucket_bounds math. See
     # DESIGN.md "Timezone assumption" for the full rationale.
-    kwargs = dict(
-        host=host, port=port,
-        http_scheme=scheme,
-        catalog=cfg.trino.catalog, schema=cfg.trino.schema,
-        user=cfg.trino.user,
-        timezone="UTC",
-    )
+    kwargs = {
+        "host": host,
+        "port": port,
+        "http_scheme": scheme,
+        "catalog": cfg.trino.catalog,
+        "schema": cfg.trino.schema,
+        "user": cfg.trino.user,
+        "timezone": "UTC",
+    }
     if cfg.trino.password:
         kwargs["auth"] = BasicAuthentication(cfg.trino.user, cfg.trino.password)
     return aiotrino.dbapi.connect(**kwargs)
@@ -212,15 +218,15 @@ def _view_status_persist_fields(vs: ViewStatus) -> dict:
     accidentally cross the boundary.
     """
     return {
-        "last_refresh":    vs.last_refresh,
-        "last_duration":   vs.last_duration,
-        "last_action":     vs.last_action,
-        "last_range":      vs.last_range,
-        "last_error":      vs.last_error,
+        "last_refresh": vs.last_refresh,
+        "last_duration": vs.last_duration,
+        "last_action": vs.last_action,
+        "last_range": vs.last_range,
+        "last_error": vs.last_error,
         "total_refreshes": vs.total_refreshes,
-        "total_errors":    vs.total_errors,
-        "chunks_done":     vs.chunks_done,
-        "chunks_total":    vs.chunks_total,
+        "total_errors": vs.total_errors,
+        "chunks_done": vs.chunks_done,
+        "chunks_total": vs.chunks_total,
     }
 
 
@@ -239,11 +245,11 @@ async def _persist_view_status(s: AppState, view_name: str, vs: ViewStatus) -> N
 def _maintenance_persist_fields(ms: MaintenanceOpStatus) -> dict:
     """Project ``ms`` to the dict shape stored in ``maintenance_state``."""
     return {
-        "last_run":      ms.last_run,
+        "last_run": ms.last_run,
         "last_duration": ms.last_duration,
-        "last_error":    ms.last_error,
-        "total_runs":    ms.total_runs,
-        "total_errors":  ms.total_errors,
+        "last_error": ms.last_error,
+        "total_runs": ms.total_runs,
+        "total_errors": ms.total_errors,
     }
 
 
@@ -281,7 +287,10 @@ async def hydrate_view_state(s: AppState) -> None:
 
 
 async def maintain_view(
-    s: AppState, view: ViewConfig, conn, target_table: str,
+    s: AppState,
+    view: ViewConfig,
+    conn,
+    target_table: str,
 ) -> None:
     """Run any due Iceberg maintenance ops after a refresh.
 
@@ -298,13 +307,13 @@ async def maintain_view(
     if interval <= 0:
         return
     ops = [
-        ("optimize", view.optimize,
-            {"file_size_threshold": view.optimize_file_size_threshold}
-            if view.optimize_file_size_threshold else {}),
-        ("expire_snapshots", view.expire_snapshots,
-            {"retention_threshold": view.expire_snapshots_retention}),
-        ("remove_orphan_files", view.remove_orphan_files,
-            {"retention_threshold": view.remove_orphan_files_retention}),
+        (
+            "optimize",
+            view.optimize,
+            {"file_size_threshold": view.optimize_file_size_threshold} if view.optimize_file_size_threshold else {},
+        ),
+        ("expire_snapshots", view.expire_snapshots, {"retention_threshold": view.expire_snapshots_retention}),
+        ("remove_orphan_files", view.remove_orphan_files, {"retention_threshold": view.remove_orphan_files_retention}),
     ]
     vs = s.view_statuses.setdefault(view.name, ViewStatus(name=view.name))
     now = time.time()
@@ -324,7 +333,9 @@ async def maintain_view(
             await _record_query(s, view.name, vs, qi)
             if s.history is not None:
                 await s.history.upsert_maintenance(
-                    view.name, op, _maintenance_persist_fields(ms),
+                    view.name,
+                    op,
+                    _maintenance_persist_fields(ms),
                 )
         except Exception as e:
             ms.last_error = str(e)
@@ -336,7 +347,9 @@ async def maintain_view(
             # last_run and there's no useful timestamp to record yet.
             if s.history is not None and ms.last_run is not None:
                 await s.history.upsert_maintenance(
-                    view.name, op, _maintenance_persist_fields(ms),
+                    view.name,
+                    op,
+                    _maintenance_persist_fields(ms),
                 )
 
 
@@ -364,20 +377,24 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
 
         # Create target on first run (unpartitioned by default; see #22).
         columns = await discover_columns(cursor, view.query)
-        await cursor.execute(build_create_table_sql(
-            target_table, columns, view.target_partitioning,
-        ))
+        await cursor.execute(
+            build_create_table_sql(
+                target_table,
+                columns,
+                view.target_partitioning,
+            )
+        )
         value_columns = [c.name for c in columns if c.name not in parsed.merge_keys]
 
-        last_snap = (
-            await s.history.get_last_source_snapshot(view.name)
-            if s.history is not None else None
-        )
+        last_snap = await s.history.get_last_source_snapshot(view.name) if s.history is not None else None
 
         t0 = time.monotonic()
         result = await detect_changes(
-            cursor, parsed.source_table, parsed.filter_column,
-            parsed.granularity, last_snap,
+            cursor,
+            parsed.source_table,
+            parsed.filter_column,
+            parsed.granularity,
+            last_snap,
         )
         DETECTION_DURATION.labels(view=view.name).observe(time.monotonic() - t0)
         log.info("%s: detection → %s (%.3fs)", view.name, result.action.name, time.monotonic() - t0)
@@ -397,9 +414,8 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
             REFRESH_TOTAL.labels(view=view.name, type="skip").inc()
             # Advance state past empty-append / compaction-only snapshots so
             # we don't re-detect them every cycle.
-            if result.current_snapshot is not None and result.current_snapshot != last_snap:
-                if s.history is not None:
-                    await s.history.set_last_source_snapshot(view.name, result.current_snapshot)
+            if result.current_snapshot is not None and result.current_snapshot != last_snap and s.history is not None:
+                await s.history.set_last_source_snapshot(view.name, result.current_snapshot)
             await _persist_view_status(s, view.name, vs)
             await maintain_view(s, view, conn, target_table)
             return
@@ -421,7 +437,11 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
         total_queries = 0
 
         async for q in execute_refresh(
-            cursor, view, target_table, parsed, value_columns,
+            cursor,
+            view,
+            target_table,
+            parsed,
+            value_columns,
             incremental_range=incremental_range,
         ):
             total_elapsed += q.elapsed_ms / 1000.0
@@ -450,15 +470,13 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
             if s.stop_event.is_set():
                 # Graceful shutdown mid-backfill — leave last_source_snapshot
                 # unset so the next tick resumes from target metadata.
-                log.info("%s: refresh interrupted after chunk %d/%d",
-                         view.name, q.chunks_done, q.chunks_total)
+                log.info("%s: refresh interrupted after chunk %d/%d", view.name, q.chunks_done, q.chunks_total)
                 return
 
         # Non-chunked paths (full or incremental) and completed chunked backfills
         # commit the source snapshot bookmark. Empty chunked runs (source empty,
         # or fully caught up) also advance state — total_queries == 0 is fine.
-        REFRESH_TOTAL.labels(view=view.name,
-                             type="incremental" if incremental_range else "full").inc()
+        REFRESH_TOTAL.labels(view=view.name, type="incremental" if incremental_range else "full").inc()
         if s.history is not None:
             await s.history.set_last_source_snapshot(view.name, result.current_snapshot)
         vs.total_refreshes += 1
@@ -536,13 +554,11 @@ async def view_worker(s: AppState, name: str) -> None:
             async with rt.refresh_cond:
                 rt.refresh_cond.notify_all()
 
-            try:
+            with suppress(TimeoutError):
                 await asyncio.wait_for(
                     rt.wake.wait(),
                     timeout=view.refresh_interval_seconds,
                 )
-            except asyncio.TimeoutError:
-                pass
             rt.wake.clear()
     finally:
         # Wake any trigger_refresh waiter that might still be parked on the
@@ -571,7 +587,8 @@ async def supervisor(s: AppState) -> None:
                     if exc is not None:
                         log.exception(
                             "%s: worker task exited with unhandled exception",
-                            name, exc_info=exc,
+                            name,
+                            exc_info=exc,
                         )
                 t.cancel()
                 s.workers.pop(name)
@@ -583,15 +600,11 @@ async def supervisor(s: AppState) -> None:
     try:
         sync_workers()
         while not s.stop_event.is_set():
-            reload_interval = (
-                s.config.server.config_reload_interval_seconds if s.config else 30
-            )
-            try:
-                # Wait on the stop event with a timeout — woken either by
-                # shutdown (clean exit) or the timeout (config reload tick).
+            reload_interval = s.config.server.config_reload_interval_seconds if s.config else 30
+            # Wait on the stop event with a timeout — woken either by
+            # shutdown (clean exit) or the timeout (config reload tick).
+            with suppress(TimeoutError):
                 await asyncio.wait_for(s.stop_event.wait(), timeout=reload_interval)
-            except asyncio.TimeoutError:
-                pass
             if s.stop_event.is_set():
                 break
             reload_config(s)
@@ -605,8 +618,11 @@ async def supervisor(s: AppState) -> None:
 
 # ── FastAPI lifespan ──
 
+
 def resolve_state_db_path(
-    views_path: Path, config_path: Path, configured: str,
+    views_path: Path,
+    config_path: Path,
+    configured: str,
 ) -> Path:
     """Resolve ``state_db_path`` from config to a concrete filesystem path.
 
@@ -644,7 +660,9 @@ async def lifespan(app: FastAPI):
 
     if s.history is None and s.config is not None:
         db_path = resolve_state_db_path(
-            s.views_path, s.config_path, s.config.server.state_db_path,
+            s.views_path,
+            s.config_path,
+            s.config.server.state_db_path,
         )
         if str(db_path).startswith("/app/"):
             log.warning(
@@ -689,47 +707,83 @@ _GRAN_OPTIONS = [{"value": "", "label": "— none (single-shot) —"}] + [
     {"value": g, "label": g} for g in ("hour", "day", "week", "month", "quarter", "year")
 ]
 _FIELD_META: dict[str, dict] = {
-    "name": {"placeholder": "defaults to target table",
-             "disabled_on_edit": True,
-             "help": ("optional label used to identify this view in the API and UI. "
-                      "Leave blank to default to the target table FQDN.")},
-    "query": {"required": True, "type": "text", "rows": 10, "disabled_on_edit": True,
-              "placeholder": (
-                  "SELECT symbol,\n       date_trunc('minute', ts) AS minute,\n"
-                  "       min_by(price, ts) AS open,\n       max(price)        AS high,\n"
-                  "       min(price)        AS low,\n       max_by(price, ts) AS close\n"
-                  "FROM iceberg.market_data.trades\nGROUP BY symbol, date_trunc('minute', ts)"),
-              "help": ("exactly what you would write after CREATE MATERIALIZED VIEW … AS. "
-                       "source table, filter column, granularity and merge keys are "
-                       "derived automatically from the query.")},
-    "target_table": {"required": True, "group": "target",
-                     "placeholder": "iceberg.analytics.my_view"},
-    "target_partitioning": {"group": "target",
-                            "placeholder": "ARRAY['day(minute)']",
-                            "help": "unpartitioned if blank"},
+    "name": {
+        "placeholder": "defaults to target table",
+        "disabled_on_edit": True,
+        "help": (
+            "optional label used to identify this view in the API and UI. "
+            "Leave blank to default to the target table FQDN."
+        ),
+    },
+    "query": {
+        "required": True,
+        "type": "text",
+        "rows": 10,
+        "disabled_on_edit": True,
+        "placeholder": (
+            "SELECT symbol,\n       date_trunc('minute', ts) AS minute,\n"
+            "       min_by(price, ts) AS open,\n       max(price)        AS high,\n"
+            "       min(price)        AS low,\n       max_by(price, ts) AS close\n"
+            "FROM iceberg.market_data.trades\nGROUP BY symbol, date_trunc('minute', ts)"
+        ),
+        "help": (
+            "exactly what you would write after CREATE MATERIALIZED VIEW … AS. "
+            "source table, filter column, granularity and merge keys are "
+            "derived automatically from the query."
+        ),
+    },
+    "target_table": {"required": True, "group": "target", "placeholder": "iceberg.analytics.my_view"},
+    "target_partitioning": {"group": "target", "placeholder": "ARRAY['day(minute)']", "help": "unpartitioned if blank"},
     "refresh_interval_seconds": {"min": 1, "suffix": "seconds", "label": "Refresh Interval"},
-    "full_refresh_chunk": {"type": "select", "group": "target", "options": _GRAN_OPTIONS,
-                           "label": "Full Refresh Chunk Size",
-                           "help": ("If set, the first-run backfill is split into chunks of this size "
-                                    "and each chunk is committed independently. Must be coarser-or-equal "
-                                    "to the view's own date_trunc granularity. Sub-second views "
-                                    "(second / millisecond) must pick minute or coarser.")},
-    "maintenance_interval_seconds": {"min": 0, "suffix": "seconds", "group": "maintenance",
-                                     "label": "Maintenance Interval",
-                                     "help": "Shared interval for every enabled op. 0 disables maintenance entirely."},
-    "optimize": {"group": "maintenance", "label": "Optimize",
-                 "help": "Run ALTER TABLE ... EXECUTE optimize on each tick."},
-    "optimize_file_size_threshold": {"group": "maintenance",
-                                     "label": "Optimize File Size Threshold",
-                                     "placeholder": "e.g. 128MB (default: Trino's 100MB)"},
-    "expire_snapshots": {"group": "maintenance", "label": "Expire Snapshots",
-                         "help": "Run ALTER TABLE ... EXECUTE expire_snapshots on each tick."},
-    "expire_snapshots_retention": {"group": "maintenance", "label": "Expire Snapshots Retention",
-                                   "help": "Trino duration (e.g. '7d'). Must be ≥ catalog's min-retention."},
-    "remove_orphan_files": {"group": "maintenance", "label": "Remove Orphan Files",
-                            "help": "Run ALTER TABLE ... EXECUTE remove_orphan_files on each tick."},
-    "remove_orphan_files_retention": {"group": "maintenance", "label": "Remove Orphan Files Retention",
-                                      "help": "Trino duration (e.g. '7d'). Must be ≥ catalog's min-retention."},
+    "full_refresh_chunk": {
+        "type": "select",
+        "group": "target",
+        "options": _GRAN_OPTIONS,
+        "label": "Full Refresh Chunk Size",
+        "help": (
+            "If set, the first-run backfill is split into chunks of this size "
+            "and each chunk is committed independently. Must be coarser-or-equal "
+            "to the view's own date_trunc granularity. Sub-second views "
+            "(second / millisecond) must pick minute or coarser."
+        ),
+    },
+    "maintenance_interval_seconds": {
+        "min": 0,
+        "suffix": "seconds",
+        "group": "maintenance",
+        "label": "Maintenance Interval",
+        "help": "Shared interval for every enabled op. 0 disables maintenance entirely.",
+    },
+    "optimize": {
+        "group": "maintenance",
+        "label": "Optimize",
+        "help": "Run ALTER TABLE ... EXECUTE optimize on each tick.",
+    },
+    "optimize_file_size_threshold": {
+        "group": "maintenance",
+        "label": "Optimize File Size Threshold",
+        "placeholder": "e.g. 128MB (default: Trino's 100MB)",
+    },
+    "expire_snapshots": {
+        "group": "maintenance",
+        "label": "Expire Snapshots",
+        "help": "Run ALTER TABLE ... EXECUTE expire_snapshots on each tick.",
+    },
+    "expire_snapshots_retention": {
+        "group": "maintenance",
+        "label": "Expire Snapshots Retention",
+        "help": "Trino duration (e.g. '7d'). Must be ≥ catalog's min-retention.",
+    },
+    "remove_orphan_files": {
+        "group": "maintenance",
+        "label": "Remove Orphan Files",
+        "help": "Run ALTER TABLE ... EXECUTE remove_orphan_files on each tick.",
+    },
+    "remove_orphan_files_retention": {
+        "group": "maintenance",
+        "label": "Remove Orphan Files Retention",
+        "help": "Trino duration (e.g. '7d'). Must be ≥ catalog's min-retention.",
+    },
 }
 
 # Resolve string annotations to real types (PEP 563 / `from __future__ import annotations`).
@@ -776,7 +830,7 @@ def _build_view_create_model() -> type[BaseModel]:
     fields_spec: dict[str, tuple] = {}
     for f in dataclasses.fields(ViewConfig):
         if f.name == "name":
-            field_type: object = typing.Optional[str]
+            field_type: object = str | None
             default = None
         else:
             field_type = _VIEW_TYPES[f.name]
@@ -808,6 +862,7 @@ class ViewResponse(BaseModel):
     ``source_table``, ``filter_column``, ``merge_keys`` are derived from the
     query AST and added for the UI's benefit; they are not accepted on POST.
     """
+
     model_config = {"extra": "allow"}
     source_table: str
     filter_column: str
@@ -829,6 +884,7 @@ def _view_to_response(v: ViewConfig, vs: ViewStatus | None) -> ViewResponse:
 
 # ── Endpoints ──
 
+
 @app.get("/api/views/schema")
 def view_schema():
     """Return form field metadata so the UI can render dynamically."""
@@ -843,7 +899,8 @@ def health(s: AppState = Depends(get_app_state)):
 @app.get("/metrics")
 def metrics():
     return PlainTextResponse(
-        generate_latest().decode(), media_type="text/plain; version=0.0.4",
+        generate_latest().decode(),
+        media_type="text/plain; version=0.0.4",
     )
 
 
@@ -875,7 +932,7 @@ def parse_query(body: ParseRequest) -> ParseResponse:
     try:
         p = parse_view_query(body.query)
     except ValueError as exc:
-        raise HTTPException(422, str(exc))
+        raise HTTPException(422, str(exc)) from exc
     return ParseResponse(
         source_table=p.source_table,
         filter_column=p.filter_column,
@@ -886,7 +943,8 @@ def parse_query(body: ParseRequest) -> ParseResponse:
 
 @app.post("/api/views", status_code=201)
 def create_view(
-    body: ViewCreate, s: AppState = Depends(get_app_state),
+    body: ViewCreate,
+    s: AppState = Depends(get_app_state),
 ) -> ViewResponse:
     if not s.config:
         raise HTTPException(500, "config not loaded")
@@ -897,7 +955,7 @@ def create_view(
     try:
         validate_view_name(name, "name")
     except ValueError as exc:
-        raise HTTPException(422, str(exc))
+        raise HTTPException(422, str(exc)) from exc
 
     if any(v.name == name for v in s.config.views):
         raise HTTPException(409, f"view '{name}' already exists")
@@ -909,7 +967,7 @@ def create_view(
         validate_chunk_compatibility(body.full_refresh_chunk, body.query)
         validate_maintenance_config(body.model_dump())
     except ValueError as exc:
-        raise HTTPException(422, str(exc))
+        raise HTTPException(422, str(exc)) from exc
 
     # Normalize the UI's empty-string sentinel ("single-shot") to None so it
     # round-trips through YAML the same way YAML-loaded views do.
@@ -934,7 +992,9 @@ def create_view(
 
 @app.put("/api/views/{name}")
 def update_view(
-    name: str, body: ViewCreate, s: AppState = Depends(get_app_state),
+    name: str,
+    body: ViewCreate,
+    s: AppState = Depends(get_app_state),
 ) -> ViewResponse:
     """Update mutable fields of an existing view.
 
@@ -957,7 +1017,7 @@ def update_view(
         validate_chunk_compatibility(body.full_refresh_chunk, body.query)
         validate_maintenance_config(body.model_dump())
     except ValueError as exc:
-        raise HTTPException(422, str(exc))
+        raise HTTPException(422, str(exc)) from exc
 
     payload = body.model_dump()
     payload["name"] = name
@@ -995,10 +1055,8 @@ async def delete_view(name: str, s: AppState = Depends(get_app_state)):
     task = s.workers.pop(name, None)
     if task is not None and not task.done():
         task.cancel()
-        try:
+        with suppress(asyncio.CancelledError, Exception):
             await task
-        except (asyncio.CancelledError, Exception):
-            pass
     s.view_statuses.pop(name, None)
     s.view_runtimes.pop(name, None)
     if s.history is not None:

@@ -4,6 +4,7 @@ Validates that when the GROUP BY granularity is coarser than the source
 partition granularity, the file-stats-based detector correctly snaps the
 range to complete GROUP BY buckets.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -11,7 +12,7 @@ import pytest
 from iceberg_ivm.config import ViewConfig
 from iceberg_ivm.detector import RefreshAction, detect_changes
 from iceberg_ivm.executor import execute_refresh
-from iceberg_ivm.introspect import discover_columns, build_create_table_sql
+from iceberg_ivm.introspect import build_create_table_sql, discover_columns
 from iceberg_ivm.query_parser import parse_view_query
 
 pytestmark = [pytest.mark.integration, pytest.mark.xdist_group("integration")]
@@ -35,7 +36,8 @@ WEEKLY_VIEW = ViewConfig(
                sum(quantity) AS volume, count(*) AS trade_count
         FROM {SOURCE_TABLE} GROUP BY 1, 2
     """,
-    target_table=WEEKLY_TARGET, target_partitioning="ARRAY['day(week)']",
+    target_table=WEEKLY_TARGET,
+    target_partitioning="ARRAY['day(week)']",
 )
 WEEKLY_PARSED = parse_view_query(WEEKLY_VIEW.query)
 
@@ -48,17 +50,15 @@ MONTHLY_VIEW = ViewConfig(
                sum(quantity) AS volume, count(*) AS trade_count
         FROM {SOURCE_TABLE} GROUP BY 1, 2
     """,
-    target_table=MONTHLY_TARGET, target_partitioning="ARRAY['day(month)']",
+    target_table=MONTHLY_TARGET,
+    target_partitioning="ARRAY['day(month)']",
 )
 MONTHLY_PARSED = parse_view_query(MONTHLY_VIEW.query)
 
 
 async def insert_trades(cursor, day, trades):
     for sym, t, p, q in trades:
-        await cursor.execute(
-            f"INSERT INTO {SOURCE_TABLE} VALUES "
-            f"('{sym}', TIMESTAMP '{day} {t} UTC', {p}, {q})"
-        )
+        await cursor.execute(f"INSERT INTO {SOURCE_TABLE} VALUES ('{sym}', TIMESTAMP '{day} {t} UTC', {p}, {q})")
 
 
 async def _drain(agen):
@@ -109,13 +109,19 @@ class TestWeeklyBarsCrossPartition:
         assert result.action == RefreshAction.INCREMENTAL
         # Range should cover the full week (Mon-Sun), not just Wednesday
         start, end = result.filter_range
-        assert start.day == 6   # Monday
-        assert end.day == 13    # Next Monday (exclusive)
+        assert start.day == 6  # Monday
+        assert end.day == 13  # Next Monday (exclusive)
 
-        await _drain(execute_refresh(
-            cursor, WEEKLY_VIEW, WEEKLY_TARGET, WEEKLY_PARSED, value_cols,
-            incremental_range=result.filter_range,
-        ))
+        await _drain(
+            execute_refresh(
+                cursor,
+                WEEKLY_VIEW,
+                WEEKLY_TARGET,
+                WEEKLY_PARSED,
+                value_cols,
+                incremental_range=result.filter_range,
+            )
+        )
 
         await cursor.execute(f"SELECT volume, trade_count, high, low FROM {WEEKLY_TARGET} WHERE symbol = 'AAPL'")
         row = await cursor.fetchone()
@@ -140,18 +146,24 @@ class TestWeeklyBarsCrossPartition:
         assert result.action == RefreshAction.INCREMENTAL
         start, end = result.filter_range
         assert start.day == 13  # Monday of week 2
-        assert end.day == 20    # Next Monday
+        assert end.day == 20  # Next Monday
 
-        await _drain(execute_refresh(
-            cursor, WEEKLY_VIEW, WEEKLY_TARGET, WEEKLY_PARSED, value_cols,
-            incremental_range=result.filter_range,
-        ))
+        await _drain(
+            execute_refresh(
+                cursor,
+                WEEKLY_VIEW,
+                WEEKLY_TARGET,
+                WEEKLY_PARSED,
+                value_cols,
+                incremental_range=result.filter_range,
+            )
+        )
 
         await cursor.execute(f"SELECT week, volume FROM {WEEKLY_TARGET} WHERE symbol = 'AAPL' ORDER BY week")
         rows = await cursor.fetchall()
         assert len(rows) == 2
         assert rows[0][1] == 100.0  # Week 1 untouched
-        assert rows[1][1] == 50.0   # Week 2 new
+        assert rows[1][1] == 50.0  # Week 2 new
 
 
 class TestLateArrivingData:
@@ -186,10 +198,16 @@ class TestLateArrivingData:
         await insert_trades(cursor, "2026-04-13", [("AAPL", "10:00:00", 200.0, 50)])
         result = await detect_changes(cursor, SOURCE_TABLE, "ts", "week", last_snap)
         assert result.action == RefreshAction.INCREMENTAL
-        await _drain(execute_refresh(
-            cursor, WEEKLY_VIEW, WEEKLY_TARGET, WEEKLY_PARSED, value_cols,
-            incremental_range=result.filter_range,
-        ))
+        await _drain(
+            execute_refresh(
+                cursor,
+                WEEKLY_VIEW,
+                WEEKLY_TARGET,
+                WEEKLY_PARSED,
+                value_cols,
+                incremental_range=result.filter_range,
+            )
+        )
         last_snap = result.current_snapshot
 
         # Sanity: target now has both weekly bars
@@ -208,21 +226,29 @@ class TestLateArrivingData:
         # The detector must snap back to week 1 — Mon Apr 6 to Mon Apr 13.
         start, end = result.filter_range
         assert start.day == 6, f"late row should re-open week of Apr 6, got start={start}"
-        assert end.day == 13,  f"late row should not extend into week 2, got end={end}"
+        assert end.day == 13, f"late row should not extend into week 2, got end={end}"
 
-        await _drain(execute_refresh(
-            cursor, WEEKLY_VIEW, WEEKLY_TARGET, WEEKLY_PARSED, value_cols,
-            incremental_range=result.filter_range,
-        ))
+        await _drain(
+            execute_refresh(
+                cursor,
+                WEEKLY_VIEW,
+                WEEKLY_TARGET,
+                WEEKLY_PARSED,
+                value_cols,
+                incremental_range=result.filter_range,
+            )
+        )
 
         # Week 1 is recomputed (now 350); week 2 is untouched (still 50).
-        await cursor.execute(f"SELECT week, volume, trade_count FROM {WEEKLY_TARGET} WHERE symbol = 'AAPL' ORDER BY week")
+        await cursor.execute(
+            f"SELECT week, volume, trade_count FROM {WEEKLY_TARGET} WHERE symbol = 'AAPL' ORDER BY week"
+        )
         rows = await cursor.fetchall()
         assert len(rows) == 2, f"expected 2 weekly bars, got {len(rows)}"
         assert rows[0][1] == 350.0, f"week 1 volume should be 350 (late row included), got {rows[0][1]}"
-        assert rows[0][2] == 3,     f"week 1 trade_count should be 3, got {rows[0][2]}"
-        assert rows[1][1] == 50.0,  f"week 2 should be untouched, got {rows[1][1]}"
-        assert rows[1][2] == 1,     f"week 2 trade_count should be 1, got {rows[1][2]}"
+        assert rows[0][2] == 3, f"week 1 trade_count should be 3, got {rows[0][2]}"
+        assert rows[1][1] == 50.0, f"week 2 should be untouched, got {rows[1][1]}"
+        assert rows[1][2] == 1, f"week 2 trade_count should be 1, got {rows[1][2]}"
 
 
 class TestMonthlyBarsCrossPartition:
@@ -247,10 +273,16 @@ class TestMonthlyBarsCrossPartition:
         assert start.month == 4 and start.day == 1
         assert end.month == 5 and end.day == 1
 
-        await _drain(execute_refresh(
-            cursor, MONTHLY_VIEW, MONTHLY_TARGET, MONTHLY_PARSED, value_cols,
-            incremental_range=result.filter_range,
-        ))
+        await _drain(
+            execute_refresh(
+                cursor,
+                MONTHLY_VIEW,
+                MONTHLY_TARGET,
+                MONTHLY_PARSED,
+                value_cols,
+                incremental_range=result.filter_range,
+            )
+        )
 
         await cursor.execute(f"SELECT volume, trade_count FROM {MONTHLY_TARGET} WHERE symbol = 'AAPL'")
         row = await cursor.fetchone()

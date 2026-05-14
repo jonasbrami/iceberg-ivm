@@ -51,6 +51,11 @@ ignore = ["E501"]
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["B011"]
 
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's `Depends()` and friends are designed to be called in default
+# arguments; whitelist them so B008 doesn't flag idiomatic FastAPI code.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Header", "fastapi.Path", "fastapi.Body", "fastapi.Form", "fastapi.File", "fastapi.Cookie", "fastapi.Security"]
+
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"

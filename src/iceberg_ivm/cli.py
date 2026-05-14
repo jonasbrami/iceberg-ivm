@@ -1,4 +1,5 @@
 """CLI entry point for iceberg-ivm."""
+
 from __future__ import annotations
 
 import argparse
@@ -17,7 +18,8 @@ def main() -> None:
         description="Incremental view maintenance for Iceberg tables on Trino",
     )
     parser.add_argument(
-        "-c", "--config",
+        "-c",
+        "--config",
         default="config.yaml",
         help="path to config file (default: config.yaml)",
     )
@@ -27,7 +29,8 @@ def main() -> None:
         help="path to views file (default: views.yaml)",
     )
     parser.add_argument(
-        "-v", "--verbose",
+        "-v",
+        "--verbose",
         action="store_true",
         help="enable debug logging",
     )

@@ -11,9 +11,10 @@ refresh downstream) and asserts both views stay healthy: no errors,
 incremental refreshes after the initial full refresh, and the
 downstream's row counts roll up consistently from the upstream's.
 """
+
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -65,7 +66,7 @@ MV2 = ViewConfig(
 
 
 def _ts(date_str: str, time_str: str) -> datetime:
-    return datetime.fromisoformat(f"{date_str} {time_str}").replace(tzinfo=timezone.utc)
+    return datetime.fromisoformat(f"{date_str} {time_str}").replace(tzinfo=UTC)
 
 
 async def _expected_hourly_rollup(cursor) -> list[tuple]:
@@ -82,8 +83,7 @@ async def _expected_hourly_rollup(cursor) -> list[tuple]:
 
 async def _fetch_hourly_target(cursor) -> list[tuple]:
     await cursor.execute(
-        f"SELECT symbol, hour_bucket, volume, trade_count "
-        f"FROM {MV2_TABLE} ORDER BY symbol, hour_bucket"
+        f"SELECT symbol, hour_bucket, volume, trade_count FROM {MV2_TABLE} ORDER BY symbol, hour_bucket"
     )
     return [tuple(r) for r in await cursor.fetchall()]
 
@@ -110,32 +110,53 @@ class TestChainedMv:
         # different update patterns: same-bucket, new-hour, new-day,
         # multiple symbols.
         batches: list[tuple[str, list[Trade]]] = [
-            ("seed Apr 8 09:30 (one symbol)", [
-                Trade("AAPL", _ts("2026-04-08", "09:30:00"), 150.0, 100),
-                Trade("AAPL", _ts("2026-04-08", "09:30:30"), 151.0, 200),
-            ]),
-            ("Apr 8 09:31 (same hour)", [
-                Trade("AAPL", _ts("2026-04-08", "09:31:00"), 152.0, 50),
-            ]),
-            ("Apr 8 10:00 (new hour)", [
-                Trade("AAPL", _ts("2026-04-08", "10:00:00"), 153.0, 75),
-                Trade("AAPL", _ts("2026-04-08", "10:30:00"), 154.0, 60),
-            ]),
-            ("multi-symbol on Apr 8 10:00", [
-                Trade("MSFT", _ts("2026-04-08", "10:15:00"), 300.0, 40),
-                Trade("GOOG", _ts("2026-04-08", "10:45:00"), 130.0, 20),
-            ]),
-            ("Apr 9 09:30 (new day)", [
-                Trade("AAPL", _ts("2026-04-09", "09:30:00"), 160.0, 100),
-                Trade("MSFT", _ts("2026-04-09", "09:30:00"), 310.0, 50),
-            ]),
-            ("late Apr 8 09:30 (backdated within bucket)", [
-                Trade("AAPL", _ts("2026-04-08", "09:30:45"), 150.5, 25),
-            ]),
-            ("Apr 9 11:00 across two symbols", [
-                Trade("AAPL", _ts("2026-04-09", "11:00:00"), 161.0, 80),
-                Trade("GOOG", _ts("2026-04-09", "11:30:00"), 132.0, 30),
-            ]),
+            (
+                "seed Apr 8 09:30 (one symbol)",
+                [
+                    Trade("AAPL", _ts("2026-04-08", "09:30:00"), 150.0, 100),
+                    Trade("AAPL", _ts("2026-04-08", "09:30:30"), 151.0, 200),
+                ],
+            ),
+            (
+                "Apr 8 09:31 (same hour)",
+                [
+                    Trade("AAPL", _ts("2026-04-08", "09:31:00"), 152.0, 50),
+                ],
+            ),
+            (
+                "Apr 8 10:00 (new hour)",
+                [
+                    Trade("AAPL", _ts("2026-04-08", "10:00:00"), 153.0, 75),
+                    Trade("AAPL", _ts("2026-04-08", "10:30:00"), 154.0, 60),
+                ],
+            ),
+            (
+                "multi-symbol on Apr 8 10:00",
+                [
+                    Trade("MSFT", _ts("2026-04-08", "10:15:00"), 300.0, 40),
+                    Trade("GOOG", _ts("2026-04-08", "10:45:00"), 130.0, 20),
+                ],
+            ),
+            (
+                "Apr 9 09:30 (new day)",
+                [
+                    Trade("AAPL", _ts("2026-04-09", "09:30:00"), 160.0, 100),
+                    Trade("MSFT", _ts("2026-04-09", "09:30:00"), 310.0, 50),
+                ],
+            ),
+            (
+                "late Apr 8 09:30 (backdated within bucket)",
+                [
+                    Trade("AAPL", _ts("2026-04-08", "09:30:45"), 150.5, 25),
+                ],
+            ),
+            (
+                "Apr 9 11:00 across two symbols",
+                [
+                    Trade("AAPL", _ts("2026-04-09", "11:00:00"), 161.0, 80),
+                    Trade("GOOG", _ts("2026-04-09", "11:30:00"), 132.0, 30),
+                ],
+            ),
         ]
 
         for i, (label, rows) in enumerate(batches, start=1):
@@ -148,12 +169,8 @@ class TestChainedMv:
 
             vs1 = app_state.view_statuses[MV1.name]
             vs2 = app_state.view_statuses[MV2.name]
-            assert vs1.last_error is None, (
-                f"cycle {i} ({label}): upstream MV1 errored: {vs1.last_error!r}"
-            )
-            assert vs2.last_error is None, (
-                f"cycle {i} ({label}): downstream MV2 errored: {vs2.last_error!r}"
-            )
+            assert vs1.last_error is None, f"cycle {i} ({label}): upstream MV1 errored: {vs1.last_error!r}"
+            assert vs2.last_error is None, f"cycle {i} ({label}): downstream MV2 errored: {vs2.last_error!r}"
             # First cycle: both views do a full refresh. Every subsequent
             # cycle must be incremental — that's the regression guard for
             # issue #49 (overwrite snapshots from MV1 must drive MV2's
@@ -162,9 +179,7 @@ class TestChainedMv:
                 assert vs1.last_action == "full"
                 assert vs2.last_action == "full"
             else:
-                assert vs1.last_action == "incremental", (
-                    f"cycle {i} ({label}): MV1 last_action={vs1.last_action!r}"
-                )
+                assert vs1.last_action == "incremental", f"cycle {i} ({label}): MV1 last_action={vs1.last_action!r}"
                 assert vs2.last_action == "incremental", (
                     f"cycle {i} ({label}): MV2 last_action={vs2.last_action!r} — "
                     f"this is exactly the issue #49 regression if it's anything but 'incremental'"
@@ -174,9 +189,7 @@ class TestChainedMv:
             actual = await _fetch_hourly_target(cursor)
             expected = await _expected_hourly_rollup(cursor)
             assert actual == expected, (
-                f"cycle {i} ({label}): downstream MV diverged from oracle\n"
-                f"  expected: {expected}\n"
-                f"  actual:   {actual}"
+                f"cycle {i} ({label}): downstream MV diverged from oracle\n  expected: {expected}\n  actual:   {actual}"
             )
 
         # After all cycles, total_errors must still be 0 on both views.

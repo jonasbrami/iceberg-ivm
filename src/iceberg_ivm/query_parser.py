@@ -9,13 +9,14 @@ full parser, but the structural node types (``Function``, ``Operation``,
 ``Where``, ``IdentifierList``, ``Identifier``) are sufficient for the handful
 of decisions we need to make.
 """
+
 from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Iterator
+from datetime import UTC, datetime
 
 import sqlparse
 from sqlparse.sql import (
@@ -35,7 +36,6 @@ from sqlparse.tokens import (
     Literal,
     Name,
     Punctuation,
-    Whitespace,
 )
 
 log = logging.getLogger(__name__)
@@ -47,9 +47,7 @@ _DATE_TRUNC_RE = re.compile(
     re.IGNORECASE,
 )
 
-VALID_GRANULARITIES = frozenset(
-    ("millisecond", "second", "minute", "hour", "day", "week", "month", "quarter", "year")
-)
+VALID_GRANULARITIES = frozenset(("millisecond", "second", "minute", "hour", "day", "week", "month", "quarter", "year"))
 
 
 @dataclass(frozen=True)
@@ -92,9 +90,7 @@ _TRAILING_CLAUSES = ("GROUP BY", "HAVING", "ORDER BY", "LIMIT", "OFFSET", "FETCH
 _WHERE_BODY_RE = re.compile(r"^(\s*WHERE\s+)(.*)$", re.IGNORECASE | re.DOTALL)
 
 
-def inject_range_filter(
-    sql: str, filter_column: str, start: datetime, end: datetime
-) -> str:
+def inject_range_filter(sql: str, filter_column: str, start: datetime, end: datetime) -> str:
     """AND-append a ``col >= TIMESTAMP 'start' AND col < TIMESTAMP 'end'``
     predicate to the query's WHERE clause, inserting one if absent.
 
@@ -117,7 +113,7 @@ def inject_range_filter(
         # A-rows unfiltered by time and silently corrupting the target.
         original = str(where)
         stripped = original.rstrip()
-        trailing = original[len(stripped):] or " "
+        trailing = original[len(stripped) :] or " "
         m = _WHERE_BODY_RE.match(stripped)
         if not m:
             raise ValueError(f"could not parse WHERE clause: {stripped!r}")
@@ -127,8 +123,7 @@ def inject_range_filter(
 
     # No WHERE: insert one before the first trailing clause, else at end.
     insert_idx = next(
-        (i for i, t in enumerate(stmt.tokens)
-         if t.ttype is Keyword and t.normalized.upper() in _TRAILING_CLAUSES),
+        (i for i, t in enumerate(stmt.tokens) if t.ttype is Keyword and t.normalized.upper() in _TRAILING_CLAUSES),
         len(stmt.tokens),
     )
     stmt.tokens.insert(insert_idx, Token(None, f"WHERE {predicate} "))
@@ -145,9 +140,7 @@ def _single_statement(sql: str) -> Statement:
     if not stmts:
         raise ValueError("query is empty")
     if len(stmts) > 1:
-        raise ValueError(
-            "query must contain a single SELECT statement; multiple statements found"
-        )
+        raise ValueError("query must contain a single SELECT statement; multiple statements found")
     return stmts[0]
 
 
@@ -183,8 +176,7 @@ def _reject_unsupported_shapes(stmt: Statement) -> None:
 def _extract_source_table(stmt: Statement) -> str:
     """Return the qualified name following FROM, stripping any alias."""
     from_idx = next(
-        (i for i, t in enumerate(stmt.tokens)
-         if t.ttype is Keyword and t.normalized.upper() == "FROM"),
+        (i for i, t in enumerate(stmt.tokens) if t.ttype is Keyword and t.normalized.upper() == "FROM"),
         None,
     )
     if from_idx is None:
@@ -218,9 +210,7 @@ def _extract_source_table(stmt: Statement) -> str:
         return str(t).strip()
     if t is not None and t.ttype is Name:
         return str(t).strip()
-    raise ValueError(
-        f"could not parse table reference after FROM: {str(t)!r}"
-    )
+    raise ValueError(f"could not parse table reference after FROM: {str(t)!r}")
 
 
 def _iter_tokens(node) -> Iterator[object]:
@@ -245,13 +235,11 @@ def _extract_date_trunc(stmt: Statement) -> tuple[str, str]:
     calls = [
         tok
         for tok in _iter_tokens(stmt)
-        if isinstance(tok, Function)
-        and (tok.get_real_name() or "").lower() == "date_trunc"
+        if isinstance(tok, Function) and (tok.get_real_name() or "").lower() == "date_trunc"
     ]
     if not calls:
         raise ValueError(
-            "query must contain a date_trunc('X', col) expression; "
-            "granularity and filter column are derived from it"
+            "query must contain a date_trunc('X', col) expression; granularity and filter column are derived from it"
         )
 
     granularities: set[str] = set()
@@ -264,9 +252,7 @@ def _extract_date_trunc(stmt: Statement) -> tuple[str, str]:
             )
         g, col = _read_date_trunc_args(call)
         if g not in VALID_GRANULARITIES:
-            raise ValueError(
-                f"date_trunc granularity must be one of {sorted(VALID_GRANULARITIES)}; got {g!r}"
-            )
+            raise ValueError(f"date_trunc granularity must be one of {sorted(VALID_GRANULARITIES)}; got {g!r}")
         granularities.add(g)
         if column is None:
             column = col
@@ -277,9 +263,7 @@ def _extract_date_trunc(stmt: Statement) -> tuple[str, str]:
             )
 
     if len(granularities) > 1:
-        raise ValueError(
-            f"query has multiple distinct granularities: {sorted(granularities)}"
-        )
+        raise ValueError(f"query has multiple distinct granularities: {sorted(granularities)}")
     return granularities.pop(), column
 
 
@@ -295,10 +279,7 @@ def _read_date_trunc_args(fn: Function) -> tuple[str, str]:
     """
     m = _DATE_TRUNC_RE.fullmatch(str(fn))
     if not m:
-        raise ValueError(
-            f"malformed date_trunc call {str(fn)!r}; "
-            "expected date_trunc('<granularity>', <column>)"
-        )
+        raise ValueError(f"malformed date_trunc call {str(fn)!r}; expected date_trunc('<granularity>', <column>)")
     return m.group(1).lower(), m.group(2)
 
 
@@ -310,7 +291,7 @@ def _clause_items(tokens: list, start_idx: int, stop_keywords: frozenset[str]) -
     comma-separated items.
     """
     items = []
-    for t in tokens[start_idx + 1:]:
+    for t in tokens[start_idx + 1 :]:
         if t.is_whitespace or not str(t).strip():
             continue
         if t.ttype is Keyword and t.normalized.upper() in stop_keywords:
@@ -318,10 +299,7 @@ def _clause_items(tokens: list, start_idx: int, stop_keywords: frozenset[str]) -
         items.append(t)
     if len(items) == 1 and isinstance(items[0], IdentifierList):
         return [
-            it for it in items[0].tokens
-            if not it.is_whitespace
-            and it.ttype is not Punctuation
-            and str(it).strip()
+            it for it in items[0].tokens if not it.is_whitespace and it.ttype is not Punctuation and str(it).strip()
         ]
     return items
 
@@ -330,8 +308,7 @@ def _projection_list(stmt: Statement) -> list:
     """Return the list of projection items (between SELECT and FROM)."""
     tokens = list(stmt.tokens)
     select_idx = next(
-        (i for i, t in enumerate(tokens)
-         if t.ttype is DML and t.normalized.upper() == "SELECT"),
+        (i for i, t in enumerate(tokens) if t.ttype is DML and t.normalized.upper() == "SELECT"),
         None,
     )
     if select_idx is None:
@@ -360,8 +337,7 @@ def _projection_alias(item) -> str:
     elif not isinstance(item, Function):
         raise ValueError(f"cannot determine output name for projection item {str(item)!r}")
     raise ValueError(
-        f"projection item {str(item)!r} has no alias; "
-        "add `AS <name>` so the target table has a stable column name"
+        f"projection item {str(item)!r} has no alias; add `AS <name>` so the target table has a stable column name"
     )
 
 
@@ -372,8 +348,7 @@ def _extract_merge_keys(stmt: Statement) -> tuple[str, ...]:
     """Resolve GROUP BY items against the projection; return aliases."""
     tokens = list(stmt.tokens)
     gb_idx = next(
-        (i for i, t in enumerate(tokens)
-         if t.ttype is Keyword and t.normalized.upper() == "GROUP BY"),
+        (i for i, t in enumerate(tokens) if t.ttype is Keyword and t.normalized.upper() == "GROUP BY"),
         None,
     )
     if gb_idx is None:
@@ -389,10 +364,7 @@ def _extract_merge_keys(stmt: Statement) -> tuple[str, ...]:
         if it.ttype is Literal.Number.Integer:
             idx = int(str(it)) - 1
             if idx < 0 or idx >= len(projection):
-                raise ValueError(
-                    f"GROUP BY position {str(it)} out of range (projection has "
-                    f"{len(projection)} items)"
-                )
+                raise ValueError(f"GROUP BY position {str(it)} out of range (projection has {len(projection)} items)")
             keys.append(proj_aliases[idx])
             continue
 
@@ -405,9 +377,7 @@ def _extract_merge_keys(stmt: Statement) -> tuple[str, ...]:
         try:
             pos = proj_canonical.index(canon)
         except ValueError:
-            raise ValueError(
-                f"GROUP BY expression {str(it)!r} does not match any projection item"
-            )
+            raise ValueError(f"GROUP BY expression {str(it)!r} does not match any projection item") from None
         keys.append(proj_aliases[pos])
 
     if not keys:
@@ -415,9 +385,7 @@ def _extract_merge_keys(stmt: Statement) -> tuple[str, ...]:
     return tuple(keys)
 
 
-def _extract_bucket_alias(
-    stmt: Statement, granularity: str, filter_column: str
-) -> str | None:
+def _extract_bucket_alias(stmt: Statement, granularity: str, filter_column: str) -> str | None:
     """Return the projection alias for ``date_trunc(granularity, filter_column)``,
     or ``None`` if the expression appears only nested inside another function
     (e.g. ``foo(date_trunc('day', ts))``) and has no direct projection.
@@ -455,15 +423,10 @@ def _build_range_predicate(col: str, start: datetime, end: datetime) -> str:
     Trino (running with session timezone=UTC) reads them as the correct instant.
     """
     if start.tzinfo is not None:
-        start = start.astimezone(timezone.utc)
-        end = end.astimezone(timezone.utc)
+        start = start.astimezone(UTC)
+        end = end.astimezone(UTC)
         suffix = " UTC"
     else:
         suffix = ""
     fmt = "%Y-%m-%d %H:%M:%S.%f"
-    return (
-        f"{col} >= TIMESTAMP '{start.strftime(fmt)}{suffix}' AND "
-        f"{col} < TIMESTAMP '{end.strftime(fmt)}{suffix}'"
-    )
-
-
+    return f"{col} >= TIMESTAMP '{start.strftime(fmt)}{suffix}' AND {col} < TIMESTAMP '{end.strftime(fmt)}{suffix}'"

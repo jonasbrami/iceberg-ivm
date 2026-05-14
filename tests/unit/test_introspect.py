@@ -31,18 +31,21 @@ class MockCursor:
 
 # ── discover_columns ──
 
+
 class TestDiscoverColumns:
     async def test_basic(self):
         # DESCRIBE OUTPUT returns: (name, catalog, schema, table, type, typeSize, aliased)
-        cursor = MockCursor([
-            [],  # PREPARE
+        cursor = MockCursor(
             [
-                ("symbol", "iceberg", "analytics", "trades", "varchar", 0, False),
-                ("minute", "iceberg", "analytics", "trades", "timestamp(6)", 0, False),
-                ("open", "iceberg", "analytics", "trades", "double", 0, False),
-            ],
-            [],  # DEALLOCATE
-        ])
+                [],  # PREPARE
+                [
+                    ("symbol", "iceberg", "analytics", "trades", "varchar", 0, False),
+                    ("minute", "iceberg", "analytics", "trades", "timestamp(6)", 0, False),
+                    ("open", "iceberg", "analytics", "trades", "double", 0, False),
+                ],
+                [],  # DEALLOCATE
+            ]
+        )
         columns = await discover_columns(
             cursor,
             "SELECT symbol, minute, open FROM t GROUP BY 1, 2, 3",
@@ -56,6 +59,7 @@ class TestDiscoverColumns:
 
 
 # ── build_create_table_sql ──
+
 
 class TestBuildCreateTableSql:
     def test_with_column_info(self):

@@ -10,6 +10,7 @@ SQLite's single-writer model is fine for our write rate (a handful of
 inserts per refresh, seconds apart). ``aiosqlite`` runs each call on a
 dedicated background thread so the event loop stays unblocked.
 """
+
 from __future__ import annotations
 
 import logging
@@ -135,9 +136,14 @@ class QueryHistory:
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (
-                    view, q.query_id, q.info_uri, q.stage,
-                    q.started_at, q.elapsed_ms,
-                    q.processed_rows, q.processed_bytes,
+                    view,
+                    q.query_id,
+                    q.info_uri,
+                    q.stage,
+                    q.started_at,
+                    q.elapsed_ms,
+                    q.processed_rows,
+                    q.processed_bytes,
                 )
                 for q in queries
             ],
@@ -167,9 +173,13 @@ class QueryHistory:
             rows = await cur.fetchall()
         return [
             QueryInfo(
-                query_id=r[0], info_uri=r[1], stage=r[2],
-                started_at=r[3], elapsed_ms=r[4],
-                processed_rows=r[5], processed_bytes=r[6],
+                query_id=r[0],
+                info_uri=r[1],
+                stage=r[2],
+                started_at=r[3],
+                elapsed_ms=r[4],
+                processed_rows=r[5],
+                processed_bytes=r[6],
             )
             for r in rows
         ]
@@ -218,7 +228,11 @@ class QueryHistory:
         / ``maintenance`` themselves.
         """
         await self._upsert(
-            "view_status", ("view",), (view,), _VIEW_STATUS_COLS, fields,
+            "view_status",
+            ("view",),
+            (view,),
+            _VIEW_STATUS_COLS,
+            fields,
         )
 
     async def get_view_status(self, view: str) -> dict | None:
@@ -231,7 +245,7 @@ class QueryHistory:
             row = await cur.fetchone()
         if row is None:
             return None
-        return dict(zip(_VIEW_STATUS_COLS, row))
+        return dict(zip(_VIEW_STATUS_COLS, row, strict=False))
 
     # ── last_source_snapshot ──────────────────────────────────────────
     # Lives on the view_status row but kept out of _VIEW_STATUS_COLS so the
@@ -267,8 +281,11 @@ class QueryHistory:
         if "last_run" not in fields or fields["last_run"] is None:
             raise ValueError("upsert_maintenance requires a non-null last_run")
         await self._upsert(
-            "maintenance_state", ("view", "op"), (view, op),
-            _MAINTENANCE_COLS, fields,
+            "maintenance_state",
+            ("view", "op"),
+            (view, op),
+            _MAINTENANCE_COLS,
+            fields,
         )
 
     async def all_maintenance(self, view: str) -> dict[str, dict]:
@@ -284,4 +301,4 @@ class QueryHistory:
             (view,),
         ) as cur:
             rows = await cur.fetchall()
-        return {r[0]: dict(zip(_MAINTENANCE_COLS, r[1:])) for r in rows}
+        return {r[0]: dict(zip(_MAINTENANCE_COLS, r[1:], strict=False)) for r in rows}

@@ -1,4 +1,5 @@
 """Auto-discover query column types."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
