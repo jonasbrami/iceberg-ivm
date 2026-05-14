@@ -689,6 +689,16 @@ cd .. && uv run pytest tests/ -v
 cd tests && docker compose down -v
 ```
 
+## Contributing
+
+```bash
+uv sync
+uv run pre-commit install --install-hooks
+uv run pre-commit install --hook-type pre-push
+```
+
+Ruff lint + format runs on `git commit`; unit tests run on `git push`. CI enforces the same lint/format checks.
+
 ## Project structure
 
 ```
