@@ -4,14 +4,15 @@ Instead of diffing partitions, we read column-level min/max from new files'
 readable_metrics. This works regardless of partition scheme and correctly
 handles GROUP BY expressions that span multiple source partitions.
 """
+
 from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from enum import Enum, auto
-from typing import Callable, Iterator
 
 log = logging.getLogger(__name__)
 
@@ -111,7 +112,10 @@ ALLOWED_OPS = CHANGE_OPS | NOOP_OPS
 
 
 async def get_new_files_column_range(
-    cursor, source_table: str, snapshot_ids: list[int], filter_column: str,
+    cursor,
+    source_table: str,
+    snapshot_ids: list[int],
+    filter_column: str,
 ) -> tuple[datetime, datetime] | None:
     """Read min/max of filter_column across files added in given snapshots.
 
@@ -139,7 +143,8 @@ async def get_new_files_column_range(
 
 
 def _iter_column_bounds(
-    rows: list, column: str,
+    rows: list,
+    column: str,
 ) -> tuple[list[datetime], list[datetime], bool]:
     """Extract ``(lower_bounds, upper_bounds, saw_column)`` from a list of
     ``(readable_metrics,)`` rows. ``saw_column`` is True iff at least one
@@ -167,7 +172,9 @@ def _iter_column_bounds(
 
 
 async def get_source_column_range(
-    cursor, source_table: str, filter_column: str,
+    cursor,
+    source_table: str,
+    filter_column: str,
 ) -> tuple[datetime, datetime] | None:
     """Read ``(min, max)`` of ``filter_column`` across all live files in the
     current snapshot of ``source_table``.
@@ -177,9 +184,7 @@ async def get_source_column_range(
     Raises ``MissingFilterColumnError`` if files exist but none carry
     ``filter_column`` metrics. Returns ``None`` for empty tables.
     """
-    await cursor.execute(
-        f"SELECT readable_metrics FROM {system_table(source_table, 'files')}"
-    )
+    await cursor.execute(f"SELECT readable_metrics FROM {system_table(source_table, 'files')}")
     rows = await cursor.fetchall()
     if not rows:
         return None
@@ -195,7 +200,9 @@ async def get_source_column_range(
 
 
 async def get_target_bucket_max(
-    cursor, target_table: str, bucket_alias: str,
+    cursor,
+    target_table: str,
+    bucket_alias: str,
 ) -> datetime | None:
     """Read the max ``upper_bound`` of ``bucket_alias`` across live data
     files in ``target_table``.
@@ -209,10 +216,7 @@ async def get_target_bucket_max(
     files don't skew the max upward and cause the resume to skip live
     buckets.
     """
-    await cursor.execute(
-        f"SELECT readable_metrics FROM {system_table(target_table, 'files')} "
-        f"WHERE content = 0"
-    )
+    await cursor.execute(f"SELECT readable_metrics FROM {system_table(target_table, 'files')} WHERE content = 0")
     rows = await cursor.fetchall()
     if not rows:
         return None
@@ -267,19 +271,21 @@ def _floor_year(d: datetime) -> datetime:
 # ``walk_buckets`` iterates by repeatedly applying ``next_bucket``.
 _BUCKETS: dict[str, tuple[Callable[[datetime], datetime], Callable[[datetime], datetime]]] = {
     "millisecond": (_floor_millisecond, lambda d: _floor_millisecond(d) + timedelta(milliseconds=1)),
-    "second":  (_floor_second,  lambda d: _floor_second(d) + timedelta(seconds=1)),
-    "minute":  (_floor_minute, lambda d: _floor_minute(d) + timedelta(minutes=1)),
-    "hour":    (_floor_hour,   lambda d: _floor_hour(d) + timedelta(hours=1)),
-    "day":     (midnight,      lambda d: midnight(d) + timedelta(days=1)),
-    "week":    (_floor_week,   lambda d: _floor_week(d) + timedelta(weeks=1)),
-    "month":   (_floor_month,  lambda d: _add_months(_floor_month(d), 1)),
+    "second": (_floor_second, lambda d: _floor_second(d) + timedelta(seconds=1)),
+    "minute": (_floor_minute, lambda d: _floor_minute(d) + timedelta(minutes=1)),
+    "hour": (_floor_hour, lambda d: _floor_hour(d) + timedelta(hours=1)),
+    "day": (midnight, lambda d: midnight(d) + timedelta(days=1)),
+    "week": (_floor_week, lambda d: _floor_week(d) + timedelta(weeks=1)),
+    "month": (_floor_month, lambda d: _add_months(_floor_month(d), 1)),
     "quarter": (_floor_quarter, lambda d: _add_months(_floor_quarter(d), 3)),
-    "year":    (_floor_year,   lambda d: _floor_year(d).replace(year=d.year + 1)),
+    "year": (_floor_year, lambda d: _floor_year(d).replace(year=d.year + 1)),
 }
 
 
 def walk_buckets(
-    start: datetime, end: datetime, granularity: str,
+    start: datetime,
+    end: datetime,
+    granularity: str,
 ) -> Iterator[tuple[datetime, datetime]]:
     """Yield half-open ``[chunk_start, chunk_end)`` intervals, one bucket at a time.
 
@@ -297,7 +303,9 @@ def walk_buckets(
 
 
 def expand_to_bucket_bounds(
-    min_ts: datetime, max_ts: datetime, granularity: str,
+    min_ts: datetime,
+    max_ts: datetime,
+    granularity: str,
 ) -> tuple[datetime, datetime]:
     """Expand a timestamp range outward to full GROUP BY bucket boundaries.
 
@@ -378,7 +386,8 @@ async def detect_changes(
         # Only compactions since last_snap; advance state, don't refresh.
         log.info(
             "%s: only compaction (replace) snapshots since %d → advance state, skip",
-            source_table, last_snapshot,
+            source_table,
+            last_snapshot,
         )
         return ChangeResult(action=RefreshAction.NO_CHANGE, current_snapshot=current_snap)
 
@@ -397,7 +406,11 @@ async def detect_changes(
 
     log.info(
         "file stats: %s in [%s, %s] → snapped to [%s, %s)",
-        filter_column, min_ts, max_ts, snapped_start, snapped_end,
+        filter_column,
+        min_ts,
+        max_ts,
+        snapped_start,
+        snapped_end,
     )
 
     return ChangeResult(

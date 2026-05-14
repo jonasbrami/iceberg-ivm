@@ -4,6 +4,7 @@ Idempotent: drops and recreates `iceberg.market_data.trades` on every run.
 Inserts ~30 days of synthetic trades across 3 symbols, batched for speed.
 Exits 0 on success so the iceberg-ivm container can gate on it.
 """
+
 import datetime
 import os
 import random
@@ -11,7 +12,6 @@ import sys
 import time
 
 import trino
-
 
 HOST = os.environ.get("TRINO_HOST", "trino")
 PORT = int(os.environ.get("TRINO_PORT", "8080"))

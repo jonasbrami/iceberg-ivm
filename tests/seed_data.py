@@ -1,15 +1,14 @@
 """Seed sample trades data and create example config."""
-import random
+
 import datetime
+import random
 from pathlib import Path
 
 import trino
 
 
 def main():
-    conn = trino.dbapi.connect(
-        host="localhost", port=18080, catalog="iceberg", schema="default", user="demo"
-    )
+    conn = trino.dbapi.connect(host="localhost", port=18080, catalog="iceberg", schema="default", user="demo")
     cur = conn.cursor()
 
     # Create schemas

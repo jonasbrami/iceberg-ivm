@@ -3,6 +3,7 @@
 Query-parsing tests live in test_query_parser.py; these cover YAML loading,
 identifier validation, and save/load round-tripping.
 """
+
 import textwrap
 from pathlib import Path
 
@@ -44,6 +45,7 @@ def trino_env(monkeypatch):
     monkeypatch.setenv("TRINO_USER", "test")
     monkeypatch.setenv("TRINO_PASSWORD", "hunter2")
 
+
 VALID_VIEWS = """\
 views:
   - name: ohlcv_1m
@@ -59,6 +61,7 @@ views:
 
 
 # ── load_config (static config only) ──
+
 
 def test_load_valid(tmp_path):
     cfg = load_config(write_config(tmp_path, STATIC_CONFIG))
@@ -111,14 +114,7 @@ def test_yaml_host_port_user_are_not_accepted(tmp_path):
     """Host/port/user in YAML must not silently override the env vars;
     credentials only come from env.  Any leftover field in the YAML is
     simply ignored, but the loader does not read it."""
-    yaml = (
-        "trino:\n"
-        "  host: wrong-host\n"
-        "  port: 9999\n"
-        "  user: wrong-user\n"
-        "  catalog: iceberg\n"
-        "  schema: analytics\n"
-    )
+    yaml = "trino:\n  host: wrong-host\n  port: 9999\n  user: wrong-user\n  catalog: iceberg\n  schema: analytics\n"
     cfg = load_config(write_config(tmp_path, yaml))
     # The env var wins; YAML host/port/user are ignored
     assert cfg.trino.url == "http://localhost:8080"
@@ -126,6 +122,7 @@ def test_yaml_host_port_user_are_not_accepted(tmp_path):
 
 
 # ── load_views ──
+
 
 def test_load_views_valid(tmp_path):
     views = load_views(write_views(tmp_path, VALID_VIEWS))
@@ -152,7 +149,10 @@ def test_view_defaults(tmp_path):
 
 
 def test_missing_query(tmp_path):
-    bad = VALID_VIEWS.replace("    query: |\n      SELECT symbol,\n             date_trunc('minute', ts) AS minute,\n             sum(qty) AS volume\n      FROM iceberg.market_data.trades\n      GROUP BY 1, 2\n", "")
+    bad = VALID_VIEWS.replace(
+        "    query: |\n      SELECT symbol,\n             date_trunc('minute', ts) AS minute,\n             sum(qty) AS volume\n      FROM iceberg.market_data.trades\n      GROUP BY 1, 2\n",
+        "",
+    )
     with pytest.raises(ValueError, match="missing required fields"):
         load_views(write_views(tmp_path, bad))
 
@@ -213,13 +213,16 @@ def test_duplicate_view_names_rejected(tmp_path):
 
 # ── save_views / load_views round-trip ──
 
+
 def test_save_views_and_reload(tmp_path):
-    views = [ViewConfig(
-        name="ohlcv_1m",
-        query="SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1",
-        target_table="iceberg.analytics.ohlcv_1m",
-        refresh_interval_seconds=30,
-    )]
+    views = [
+        ViewConfig(
+            name="ohlcv_1m",
+            query="SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1",
+            target_table="iceberg.analytics.ohlcv_1m",
+            refresh_interval_seconds=30,
+        )
+    ]
     views_path = tmp_path / "views.yaml"
     save_views(views, views_path)
     loaded = load_views(views_path)
@@ -266,72 +269,83 @@ def test_full_refresh_chunk_rejects_invalid_granularity(tmp_path):
         load_views(write_views(tmp_path, _views_yaml_with_chunk("day", "fortnight")))
 
 
-@pytest.mark.parametrize("view_g, chunk_g", [
-    # chunk finer than view — would split GROUP BY buckets
-    ("day", "hour"),
-    ("hour", "minute"),
-    ("month", "day"),
-    # week does not divide month, month does not divide week
-    ("week", "month"),
-    ("month", "week"),
-    ("week", "quarter"),
-    ("quarter", "week"),
-])
+@pytest.mark.parametrize(
+    "view_g, chunk_g",
+    [
+        # chunk finer than view — would split GROUP BY buckets
+        ("day", "hour"),
+        ("hour", "minute"),
+        ("month", "day"),
+        # week does not divide month, month does not divide week
+        ("week", "month"),
+        ("month", "week"),
+        ("week", "quarter"),
+        ("quarter", "week"),
+    ],
+)
 def test_full_refresh_chunk_rejects_incompatible(tmp_path, view_g, chunk_g):
     with pytest.raises(ValueError, match="not compatible"):
         load_views(write_views(tmp_path, _views_yaml_with_chunk(view_g, chunk_g)))
 
 
-@pytest.mark.parametrize("view_g, chunk_g", [
-    # sub-second values are valid view granularities but never valid chunk
-    # granularities — chunked backfills measured in seconds or milliseconds
-    # would create absurd commit counts.
-    ("second", "second"),
-    ("second", "millisecond"),
-    ("millisecond", "millisecond"),
-    ("hour", "second"),
-    ("day", "millisecond"),
-])
+@pytest.mark.parametrize(
+    "view_g, chunk_g",
+    [
+        # sub-second values are valid view granularities but never valid chunk
+        # granularities — chunked backfills measured in seconds or milliseconds
+        # would create absurd commit counts.
+        ("second", "second"),
+        ("second", "millisecond"),
+        ("millisecond", "millisecond"),
+        ("hour", "second"),
+        ("day", "millisecond"),
+    ],
+)
 def test_full_refresh_chunk_rejects_subsecond_chunk(tmp_path, view_g, chunk_g):
     with pytest.raises(ValueError, match="not a valid chunk granularity"):
         load_views(write_views(tmp_path, _views_yaml_with_chunk(view_g, chunk_g)))
 
 
-@pytest.mark.parametrize("view_g, chunk_g", [
-    ("minute", "minute"),
-    ("minute", "hour"),
-    ("minute", "day"),
-    ("hour", "day"),
-    ("day", "day"),
-    ("day", "week"),
-    ("day", "month"),
-    ("week", "week"),
-    ("month", "month"),
-    ("month", "quarter"),
-    ("month", "year"),
-    ("quarter", "year"),
-    ("year", "year"),
-    # sub-second views can still pick coarser chunk values
-    ("second", "minute"),
-    ("second", "hour"),
-    ("second", "day"),
-    ("second", "week"),
-    ("millisecond", "minute"),
-    ("millisecond", "week"),
-    ("millisecond", "year"),
-])
+@pytest.mark.parametrize(
+    "view_g, chunk_g",
+    [
+        ("minute", "minute"),
+        ("minute", "hour"),
+        ("minute", "day"),
+        ("hour", "day"),
+        ("day", "day"),
+        ("day", "week"),
+        ("day", "month"),
+        ("week", "week"),
+        ("month", "month"),
+        ("month", "quarter"),
+        ("month", "year"),
+        ("quarter", "year"),
+        ("year", "year"),
+        # sub-second views can still pick coarser chunk values
+        ("second", "minute"),
+        ("second", "hour"),
+        ("second", "day"),
+        ("second", "week"),
+        ("millisecond", "minute"),
+        ("millisecond", "week"),
+        ("millisecond", "year"),
+    ],
+)
 def test_full_refresh_chunk_accepts_compatible(tmp_path, view_g, chunk_g):
     views = load_views(write_views(tmp_path, _views_yaml_with_chunk(view_g, chunk_g)))
     assert views[0].full_refresh_chunk == chunk_g
 
 
 def test_full_refresh_chunk_round_trip(tmp_path):
-    views = [ViewConfig(
-        name="v",
-        query="SELECT date_trunc('minute', ts) AS d FROM t GROUP BY 1",
-        target_table="iceberg.analytics.v",
-        full_refresh_chunk="day",
-    )]
+    views = [
+        ViewConfig(
+            name="v",
+            query="SELECT date_trunc('minute', ts) AS d FROM t GROUP BY 1",
+            target_table="iceberg.analytics.v",
+            full_refresh_chunk="day",
+        )
+    ]
     views_path = tmp_path / "views.yaml"
     save_views(views, views_path)
     loaded = load_views(views_path)
@@ -341,11 +355,13 @@ def test_full_refresh_chunk_round_trip(tmp_path):
 def test_save_views_omits_full_refresh_chunk_when_none(tmp_path):
     """Views without chunked refresh must not emit a spurious
     ``full_refresh_chunk`` key in the YAML."""
-    views = [ViewConfig(
-        name="v",
-        query="SELECT date_trunc('minute', ts) AS d FROM t GROUP BY 1",
-        target_table="iceberg.analytics.v",
-    )]
+    views = [
+        ViewConfig(
+            name="v",
+            query="SELECT date_trunc('minute', ts) AS d FROM t GROUP BY 1",
+            target_table="iceberg.analytics.v",
+        )
+    ]
     views_path = tmp_path / "views.yaml"
     save_views(views, views_path)
     yaml_text = views_path.read_text()
@@ -429,15 +445,17 @@ def test_maintenance_fields_loaded(tmp_path):
 
 
 def test_maintenance_round_trip(tmp_path):
-    views = [ViewConfig(
-        name="v",
-        query="SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1",
-        target_table="iceberg.analytics.v",
-        maintenance_interval_seconds=3600,
-        optimize=False,
-        optimize_file_size_threshold="128MB",
-        expire_snapshots_retention="14d",
-    )]
+    views = [
+        ViewConfig(
+            name="v",
+            query="SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1",
+            target_table="iceberg.analytics.v",
+            maintenance_interval_seconds=3600,
+            optimize=False,
+            optimize_file_size_threshold="128MB",
+            expire_snapshots_retention="14d",
+        )
+    ]
     p = tmp_path / "views.yaml"
     save_views(views, p)
     loaded = load_views(p)[0]
@@ -450,16 +468,18 @@ def test_maintenance_round_trip(tmp_path):
 def test_save_views_omits_maintenance_defaults(tmp_path):
     """Default values (interval=0, all booleans True, default retentions)
     don't appear in YAML — the common empty-maintenance view stays a short diff."""
-    views = [ViewConfig(
-        name="v",
-        query="SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1",
-        target_table="iceberg.analytics.v",
-    )]
+    views = [
+        ViewConfig(
+            name="v",
+            query="SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1",
+            target_table="iceberg.analytics.v",
+        )
+    ]
     p = tmp_path / "views.yaml"
     save_views(views, p)
     text = p.read_text()
     assert "maintenance_interval_seconds" not in text
-    assert "optimize" not in text          # default True
+    assert "optimize" not in text  # default True
     assert "expire_snapshots" not in text  # default True
     assert "remove_orphan_files" not in text
     assert "optimize_file_size_threshold" not in text
@@ -468,13 +488,15 @@ def test_save_views_omits_maintenance_defaults(tmp_path):
 def test_save_views_emits_disabled_op_toggle(tmp_path):
     """A False boolean must round-trip through YAML even though it's falsy —
     bug-prone area since the old save filter dropped any falsy value."""
-    views = [ViewConfig(
-        name="v",
-        query="SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1",
-        target_table="iceberg.analytics.v",
-        maintenance_interval_seconds=3600,
-        optimize=False,
-    )]
+    views = [
+        ViewConfig(
+            name="v",
+            query="SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1",
+            target_table="iceberg.analytics.v",
+            maintenance_interval_seconds=3600,
+            optimize=False,
+        )
+    ]
     p = tmp_path / "views.yaml"
     save_views(views, p)
     text = p.read_text()
@@ -488,12 +510,15 @@ def test_maintenance_rejects_negative_interval():
         validate_maintenance_config({"maintenance_interval_seconds": -1})
 
 
-@pytest.mark.parametrize("field,value", [
-    ("expire_snapshots_retention", "1 day"),
-    ("expire_snapshots_retention", "7"),
-    ("expire_snapshots_retention", "1w"),   # weeks not accepted by Trino
-    ("remove_orphan_files_retention", "forever"),
-])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("expire_snapshots_retention", "1 day"),
+        ("expire_snapshots_retention", "7"),
+        ("expire_snapshots_retention", "1w"),  # weeks not accepted by Trino
+        ("remove_orphan_files_retention", "forever"),
+    ],
+)
 def test_maintenance_rejects_bad_retention(field, value):
     with pytest.raises(ValueError, match="valid Trino duration"):
         validate_maintenance_config({field: value})
@@ -507,12 +532,14 @@ def test_maintenance_rejects_bad_file_size_threshold(value):
 
 def test_maintenance_accepts_valid():
     """Sanity: a fully-shaped maintenance dict passes validation."""
-    validate_maintenance_config({
-        "maintenance_interval_seconds": 3600,
-        "optimize": True,
-        "optimize_file_size_threshold": "128MB",
-        "expire_snapshots": True,
-        "expire_snapshots_retention": "7d",
-        "remove_orphan_files": True,
-        "remove_orphan_files_retention": "30d",
-    })
+    validate_maintenance_config(
+        {
+            "maintenance_interval_seconds": 3600,
+            "optimize": True,
+            "optimize_file_size_threshold": "128MB",
+            "expire_snapshots": True,
+            "expire_snapshots_retention": "7d",
+            "remove_orphan_files": True,
+            "remove_orphan_files_retention": "30d",
+        }
+    )

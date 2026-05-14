@@ -14,10 +14,11 @@ symbol, minute`` so equality compares row-for-row.
 Determinism: scenarios never share ``(symbol, ts)`` between two trades,
 so ``min_by(price, ts)`` / ``max_by(price, ts)`` have no ties to break.
 """
+
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime
 
 
 @dataclass
@@ -42,12 +43,11 @@ class OhlcvOracle:
 
     def update(self, symbol: str, ts: datetime, price: float, qty: float) -> None:
         if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
+            ts = ts.replace(tzinfo=UTC)
         key = (symbol, _floor_minute(ts))
         b = self._bars.get(key)
         if b is None:
-            b = _Bar(open=price, high=price, low=price, close=price,
-                     volume=0.0, count=0, open_ts=ts, close_ts=ts)
+            b = _Bar(open=price, high=price, low=price, close=price, volume=0.0, count=0, open_ts=ts, close_ts=ts)
             self._bars[key] = b
         if ts < b.open_ts:
             b.open = price
@@ -65,15 +65,17 @@ class OhlcvOracle:
     def expected_rows(self) -> list[dict]:
         rows = []
         for (symbol, minute), b in self._bars.items():
-            rows.append({
-                "symbol": symbol,
-                "minute": minute,
-                "open": b.open,
-                "high": b.high,
-                "low": b.low,
-                "close": b.close,
-                "volume": b.volume,
-                "trade_count": b.count,
-            })
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "minute": minute,
+                    "open": b.open,
+                    "high": b.high,
+                    "low": b.low,
+                    "close": b.close,
+                    "volume": b.volume,
+                    "trade_count": b.count,
+                }
+            )
         rows.sort(key=lambda r: (r["symbol"], r["minute"]))
         return rows
