@@ -1,9 +1,9 @@
 """Tests for the CLI entry point."""
+
 import textwrap
 from unittest.mock import patch
 
 import pytest
-
 
 CONFIG_YAML = textwrap.dedent("""\
     trino:
@@ -24,11 +24,16 @@ class TestCliMain:
         cfg_path.write_text(CONFIG_YAML)
         monkeypatch.chdir(tmp_path)
 
-        with patch("iceberg_ivm.cli.argparse.ArgumentParser.parse_args") as mock_args, \
-             patch("uvicorn.run") as mock_uvicorn:
-            mock_args.return_value = type("Args", (), {"config": str(cfg_path), "views": str(tmp_path / "views.yaml"), "verbose": False})()
+        with (
+            patch("iceberg_ivm.cli.argparse.ArgumentParser.parse_args") as mock_args,
+            patch("uvicorn.run") as mock_uvicorn,
+        ):
+            mock_args.return_value = type(
+                "Args", (), {"config": str(cfg_path), "views": str(tmp_path / "views.yaml"), "verbose": False}
+            )()
 
             from iceberg_ivm.cli import main
+
             main()
 
             mock_uvicorn.assert_called_once()
@@ -41,11 +46,16 @@ class TestCliMain:
 
         custom.write_text(CONFIG_YAML + "server:\n  port: 9999\n")
 
-        with patch("iceberg_ivm.cli.argparse.ArgumentParser.parse_args") as mock_args, \
-             patch("uvicorn.run") as mock_uvicorn:
-            mock_args.return_value = type("Args", (), {"config": str(custom), "views": str(tmp_path / "views.yaml"), "verbose": False})()
+        with (
+            patch("iceberg_ivm.cli.argparse.ArgumentParser.parse_args") as mock_args,
+            patch("uvicorn.run") as mock_uvicorn,
+        ):
+            mock_args.return_value = type(
+                "Args", (), {"config": str(custom), "views": str(tmp_path / "views.yaml"), "verbose": False}
+            )()
 
             from iceberg_ivm.cli import main
+
             main()
 
             call_kwargs = mock_uvicorn.call_args
@@ -56,14 +66,20 @@ class TestCliMain:
         cfg_path.write_text(CONFIG_YAML)
         monkeypatch.chdir(tmp_path)
 
-        with patch("iceberg_ivm.cli.argparse.ArgumentParser.parse_args") as mock_args, \
-             patch("uvicorn.run"), \
-             patch("logging.basicConfig") as mock_logging:
-            mock_args.return_value = type("Args", (), {"config": str(cfg_path), "views": str(tmp_path / "views.yaml"), "verbose": True})()
+        with (
+            patch("iceberg_ivm.cli.argparse.ArgumentParser.parse_args") as mock_args,
+            patch("uvicorn.run"),
+            patch("logging.basicConfig") as mock_logging,
+        ):
+            mock_args.return_value = type(
+                "Args", (), {"config": str(cfg_path), "views": str(tmp_path / "views.yaml"), "verbose": True}
+            )()
 
             from iceberg_ivm.cli import main
+
             main()
 
             mock_logging.assert_called_once()
             import logging
+
             assert mock_logging.call_args[1]["level"] == logging.DEBUG

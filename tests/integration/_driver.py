@@ -5,15 +5,16 @@ behind a fixture-friendly API so tests can script a deterministic
 sequence of (insert batch → refresh → assert) cycles without touching
 the iceberg-ivm CLI or HTTP surface.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
-from iceberg_ivm.config import Config, TrinoConfig, ServerConfig
+from iceberg_ivm.config import Config, ServerConfig, TrinoConfig
 from iceberg_ivm.query_history import QueryHistory
-from iceberg_ivm.server import AppState, RECENT_QUERY_LIMIT
+from iceberg_ivm.server import RECENT_QUERY_LIMIT, AppState
 
 
 @dataclass
@@ -35,6 +36,7 @@ class Cycle:
     cycle's ``refresh_view`` call: ``"full"``, ``"incremental"``, or
     ``"skip"``.
     """
+
     rows: list[Trade] = field(default_factory=list)
     expect_action: str = "incremental"
     compact: bool = False
@@ -42,7 +44,10 @@ class Cycle:
 
 
 async def make_app_state(
-    host: str, port: int, *, schema: str = "test_schema",
+    host: str,
+    port: int,
+    *,
+    schema: str = "test_schema",
     state_db_path: Path | str | None = None,
 ) -> AppState:
     """Build a minimal ``AppState`` wired to the docker-compose Trino.
@@ -75,19 +80,16 @@ async def make_app_state(
 
 def _format_ts(ts: datetime) -> str:
     if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
+        ts = ts.replace(tzinfo=UTC)
     # Trino accepts "YYYY-MM-DD HH:MM:SS UTC" as a TIMESTAMP WITH TIME ZONE literal.
-    return ts.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return ts.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 async def insert_trades_batch(cursor, source_table: str, rows: list[Trade]) -> None:
     """One multi-row INSERT → exactly one source snapshot per cycle."""
     if not rows:
         return
-    values = ", ".join(
-        f"('{r.symbol}', TIMESTAMP '{_format_ts(r.ts)}', {r.price}, {r.quantity})"
-        for r in rows
-    )
+    values = ", ".join(f"('{r.symbol}', TIMESTAMP '{_format_ts(r.ts)}', {r.price}, {r.quantity})" for r in rows)
     await cursor.execute(f"INSERT INTO {source_table} VALUES {values}")
 
 
@@ -98,4 +100,4 @@ async def fetch_target_rows(cursor, target_table: str) -> list[dict]:
         f"FROM {target_table} ORDER BY symbol, minute"
     )
     cols = ["symbol", "minute", "open", "high", "low", "close", "volume", "trade_count"]
-    return [dict(zip(cols, r)) for r in await cursor.fetchall()]
+    return [dict(zip(cols, r, strict=False)) for r in await cursor.fetchall()]

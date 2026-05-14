@@ -1,7 +1,9 @@
 """Integration test fixtures: Trino connection and table setup/teardown."""
+
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import time
 
@@ -9,7 +11,6 @@ import aiotrino
 import pytest_asyncio
 
 from ._driver import make_app_state
-
 
 TRINO_HOST = os.environ.get("TRINO_HOST", "localhost")
 TRINO_PORT = int(os.environ.get("TRINO_PORT", "18080"))
@@ -78,7 +79,9 @@ async def app_state(tmp_path):
     round-trips through ``view_status.last_source_snapshot``."""
     await wait_for_trino(TRINO_HOST, TRINO_PORT)
     s = await make_app_state(
-        TRINO_HOST, TRINO_PORT, state_db_path=tmp_path / "state.db",
+        TRINO_HOST,
+        TRINO_PORT,
+        state_db_path=tmp_path / "state.db",
     )
     try:
         yield s
@@ -100,21 +103,15 @@ async def clean_tables(trino_conn):
         "iceberg.test_schema.streaming_ohlcv",
     ]
     for t in tables:
-        try:
+        with contextlib.suppress(Exception):
             await cursor.execute(f"DROP TABLE IF EXISTS {t}")
-        except Exception:
-            pass
 
     # Ensure test schema exists
-    try:
+    with contextlib.suppress(Exception):
         await cursor.execute("CREATE SCHEMA IF NOT EXISTS iceberg.test_schema")
-    except Exception:
-        pass
 
     yield
 
     for t in tables:
-        try:
+        with contextlib.suppress(Exception):
             await cursor.execute(f"DROP TABLE IF EXISTS {t}")
-        except Exception:
-            pass

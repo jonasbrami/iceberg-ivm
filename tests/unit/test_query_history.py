@@ -1,4 +1,5 @@
 """Tests for the SQLite-backed QueryHistory ring buffer."""
+
 from __future__ import annotations
 
 import pytest
@@ -118,7 +119,8 @@ async def test_all_maintenance_isolated_per_view(history):
     a = await history.all_maintenance("a")
     b = await history.all_maintenance("b")
     assert {op: row["last_run"] for op, row in a.items()} == {
-        "optimize": 1.0, "expire_snapshots": 3.0,
+        "optimize": 1.0,
+        "expire_snapshots": 3.0,
     }
     assert {op: row["last_run"] for op, row in b.items()} == {"optimize": 2.0}
 
@@ -154,13 +156,17 @@ async def test_all_maintenance_returns_full_field_dict(history):
     Surface for issue #40 — UI / hydration need total_runs / total_errors
     / last_error / last_duration too.
     """
-    await history.upsert_maintenance("v", "optimize", {
-        "last_run": 1234.5,
-        "last_duration": 12.5,
-        "last_error": None,
-        "total_runs": 7,
-        "total_errors": 1,
-    })
+    await history.upsert_maintenance(
+        "v",
+        "optimize",
+        {
+            "last_run": 1234.5,
+            "last_duration": 12.5,
+            "last_error": None,
+            "total_runs": 7,
+            "total_errors": 1,
+        },
+    )
     persisted = await history.all_maintenance("v")
     assert persisted["optimize"] == {
         "last_run": 1234.5,
@@ -173,24 +179,32 @@ async def test_all_maintenance_returns_full_field_dict(history):
 
 async def test_upsert_maintenance_round_trip_all_fields(history):
     """Upsert + read round-trips every column, including the failure-path fields."""
-    await history.upsert_maintenance("v", "expire_snapshots", {
-        "last_run": 100.0,
-        "last_duration": 0.0,
-        "last_error": "boom",
-        "total_runs": 3,
-        "total_errors": 2,
-    })
+    await history.upsert_maintenance(
+        "v",
+        "expire_snapshots",
+        {
+            "last_run": 100.0,
+            "last_duration": 0.0,
+            "last_error": "boom",
+            "total_runs": 3,
+            "total_errors": 2,
+        },
+    )
     persisted = await history.all_maintenance("v")
     assert persisted["expire_snapshots"]["last_error"] == "boom"
     assert persisted["expire_snapshots"]["total_errors"] == 2
     # And it's actually upsert, not insert-only:
-    await history.upsert_maintenance("v", "expire_snapshots", {
-        "last_run": 200.0,
-        "last_duration": 1.5,
-        "last_error": None,
-        "total_runs": 4,
-        "total_errors": 2,
-    })
+    await history.upsert_maintenance(
+        "v",
+        "expire_snapshots",
+        {
+            "last_run": 200.0,
+            "last_duration": 1.5,
+            "last_error": None,
+            "total_runs": 4,
+            "total_errors": 2,
+        },
+    )
     persisted = await history.all_maintenance("v")
     assert persisted["expire_snapshots"]["last_run"] == 200.0
     assert persisted["expire_snapshots"]["last_error"] is None
@@ -238,12 +252,15 @@ async def test_upsert_view_status_overwrites_prior(history):
 async def test_upsert_view_status_ignores_unknown_keys(history):
     """``recent_queries`` / ``maintenance`` live in their own tables — passing
     them through dataclasses.asdict() must not break the upsert."""
-    await history.upsert_view_status("v", {
-        "total_refreshes": 5,
-        "recent_queries": [],         # not a column
-        "maintenance": {},            # not a column
-        "name": "v",                  # not a column
-    })
+    await history.upsert_view_status(
+        "v",
+        {
+            "total_refreshes": 5,
+            "recent_queries": [],  # not a column
+            "maintenance": {},  # not a column
+            "name": "v",  # not a column
+        },
+    )
     got = await history.get_view_status("v")
     assert got["total_refreshes"] == 5
 
@@ -252,9 +269,14 @@ async def test_view_status_survives_reopen(tmp_path):
     path = tmp_path / "state.db"
     h1 = QueryHistory(path, limit=5)
     await h1.open()
-    await h1.upsert_view_status("v", {
-        "total_refreshes": 99, "last_refresh": 1.0, "chunks_done": 42,
-    })
+    await h1.upsert_view_status(
+        "v",
+        {
+            "total_refreshes": 99,
+            "last_refresh": 1.0,
+            "chunks_done": 42,
+        },
+    )
     await h1.close()
 
     h2 = QueryHistory(path, limit=5)
@@ -276,6 +298,7 @@ async def test_delete_view_purges_view_status(history):
 
 
 # ── last_source_snapshot ──
+
 
 async def test_get_last_source_snapshot_unknown_view(history):
     """No row at all → None (treated as FULL_REFRESH by the caller)."""
@@ -304,11 +327,14 @@ async def test_set_last_source_snapshot_does_not_clobber_other_columns(history):
     must stay orthogonal — set_last_source_snapshot must not reset
     total_refreshes / last_action / etc. to defaults, and upsert_view_status
     must not wipe the bookmark."""
-    await history.upsert_view_status("v", {
-        "last_refresh": 100.0,
-        "last_action": "full",
-        "total_refreshes": 7,
-    })
+    await history.upsert_view_status(
+        "v",
+        {
+            "last_refresh": 100.0,
+            "last_action": "full",
+            "total_refreshes": 7,
+        },
+    )
     await history.set_last_source_snapshot("v", 99)
 
     persisted = await history.get_view_status("v")
@@ -335,7 +361,3 @@ async def test_last_source_snapshot_survives_reopen(tmp_path):
         assert await h2.get_last_source_snapshot("v") == 42
     finally:
         await h2.close()
-
-
-
-

@@ -1,5 +1,6 @@
 """Tests for the refresh executor."""
-from datetime import datetime, timezone
+
+from datetime import UTC, datetime
 
 from iceberg_ivm.config import ViewConfig
 from iceberg_ivm.executor import (
@@ -11,15 +12,15 @@ from iceberg_ivm.query_parser import parse_view_query
 
 
 def make_view(**overrides) -> ViewConfig:
-    defaults = dict(
-        name="ohlcv_1m",
-        query=(
+    defaults = {
+        "name": "ohlcv_1m",
+        "query": (
             "SELECT symbol, date_trunc('day', ts) AS day, sum(qty) AS volume "
             "FROM iceberg.market_data.trades "
             "GROUP BY 1, 2"
         ),
-        target_table="iceberg.analytics.ohlcv_1m",
-    )
+        "target_table": "iceberg.analytics.ohlcv_1m",
+    }
     defaults.update(overrides)
     return ViewConfig(**defaults)
 
@@ -36,15 +37,19 @@ class MockCursor:
         self._counter += 1
 
     @property
-    def stats(self): return self._stats
+    def stats(self):
+        return self._stats
 
     @property
-    def query_id(self) -> str: return f"20260417_000000_{self._counter:05d}_abcde"
+    def query_id(self) -> str:
+        return f"20260417_000000_{self._counter:05d}_abcde"
 
     @property
-    def info_uri(self) -> str: return f"http://trino/ui/query.html?{self.query_id}"
+    def info_uri(self) -> str:
+        return f"http://trino/ui/query.html?{self.query_id}"
 
-    async def fetchone(self): return None
+    async def fetchone(self):
+        return None
 
     async def fetchall(self):
         return self._fetchall_responses.pop(0) if self._fetchall_responses else []
@@ -55,6 +60,7 @@ def _files_row(column: str, lower: str, upper: str) -> tuple:
 
 
 # ── build_merge_sql ──
+
 
 class TestBuildMergeSql:
     def test_structure(self):
@@ -73,16 +79,22 @@ class TestBuildMergeSql:
 
 # ── execute_refresh: incremental path ──
 
+
 class TestExecuteRefreshIncremental:
     async def test_emits_one_merge_over_range(self):
         cursor = MockCursor(stats={"processedRows": 200, "processedBytes": 8192})
         view = make_view()
         parsed = parse_view_query(view.query)
-        r_start = datetime(2026, 4, 8, tzinfo=timezone.utc)
-        r_end = datetime(2026, 4, 9, tzinfo=timezone.utc)
+        r_start = datetime(2026, 4, 8, tzinfo=UTC)
+        r_end = datetime(2026, 4, 9, tzinfo=UTC)
         queries = [
-            q async for q in execute_refresh(
-                cursor, view, "iceberg.out.mv", parsed, ["volume"],
+            q
+            async for q in execute_refresh(
+                cursor,
+                view,
+                "iceberg.out.mv",
+                parsed,
+                ["volume"],
                 incremental_range=(r_start, r_end),
             )
         ]
@@ -100,6 +112,7 @@ class TestExecuteRefreshIncremental:
 
 # ── execute_refresh: single-shot full refresh (no chunk) ──
 
+
 class TestExecuteRefreshSingleShotFull:
     async def test_one_merge_over_snapped_source_range(self):
         view = make_view()  # full_refresh_chunk = None, granularity = day
@@ -112,16 +125,21 @@ class TestExecuteRefreshSingleShotFull:
             ],
         )
         queries = [
-            q async for q in execute_refresh(
-                cursor, view, "iceberg.out.mv", parsed, ["volume"],
+            q
+            async for q in execute_refresh(
+                cursor,
+                view,
+                "iceberg.out.mv",
+                parsed,
+                ["volume"],
             )
         ]
         assert len(queries) == 1
         q = queries[0]
         assert q.stage == "merge"
         # Snapped to day boundaries (view's own granularity)
-        assert q.range_start == datetime(2026, 4, 8, tzinfo=timezone.utc)
-        assert q.range_end == datetime(2026, 4, 11, tzinfo=timezone.utc)
+        assert q.range_start == datetime(2026, 4, 8, tzinfo=UTC)
+        assert q.range_end == datetime(2026, 4, 11, tzinfo=UTC)
         merge = cursor.executed[-1]
         assert "ts >= TIMESTAMP '2026-04-08 00:00:00.000000 UTC'" in merge
         assert "ts < TIMESTAMP '2026-04-11 00:00:00.000000 UTC'" in merge
@@ -131,14 +149,20 @@ class TestExecuteRefreshSingleShotFull:
         parsed = parse_view_query(view.query)
         cursor = MockCursor(fetchall_responses=[[]])  # empty $files
         queries = [
-            q async for q in execute_refresh(
-                cursor, view, "iceberg.out.mv", parsed, ["volume"],
+            q
+            async for q in execute_refresh(
+                cursor,
+                view,
+                "iceberg.out.mv",
+                parsed,
+                ["volume"],
             )
         ]
         assert queries == []
 
 
 # ── execute_refresh: chunked full refresh ──
+
 
 class TestExecuteRefreshChunked:
     async def test_emits_one_merge_per_day_chunk(self):
@@ -154,8 +178,13 @@ class TestExecuteRefreshChunked:
             ],
         )
         queries = [
-            q async for q in execute_refresh(
-                cursor, view, "iceberg.out.mv", parsed, ["volume"],
+            q
+            async for q in execute_refresh(
+                cursor,
+                view,
+                "iceberg.out.mv",
+                parsed,
+                ["volume"],
             )
         ]
         assert len(queries) == 3
@@ -164,16 +193,16 @@ class TestExecuteRefreshChunked:
         assert {q.chunks_total for q in queries} == {3}
         # Ranges are contiguous, bucket-aligned, ordered.
         for i, q in enumerate(queries):
-            assert q.range_start == datetime(2026, 4, 8 + i, tzinfo=timezone.utc)
-            assert q.range_end == datetime(2026, 4, 9 + i, tzinfo=timezone.utc)
+            assert q.range_start == datetime(2026, 4, 8 + i, tzinfo=UTC)
+            assert q.range_end == datetime(2026, 4, 9 + i, tzinfo=UTC)
         # Distinct query_ids captured.
         assert len({q.query_id for q in queries}) == 3
 
     async def test_resume_from_target_bucket_max(self):
-        view = make_view(full_refresh_chunk="day", query=(
-            "SELECT symbol, date_trunc('minute', ts) AS minute "
-            "FROM iceberg.market_data.trades GROUP BY 1, 2"
-        ))
+        view = make_view(
+            full_refresh_chunk="day",
+            query=("SELECT symbol, date_trunc('minute', ts) AS minute FROM iceberg.market_data.trades GROUP BY 1, 2"),
+        )
         parsed = parse_view_query(view.query)
         cursor = MockCursor(
             stats={"processedRows": 50},
@@ -184,13 +213,18 @@ class TestExecuteRefreshChunked:
             ],
         )
         queries = [
-            q async for q in execute_refresh(
-                cursor, view, "iceberg.out.mv", parsed, [],
+            q
+            async for q in execute_refresh(
+                cursor,
+                view,
+                "iceberg.out.mv",
+                parsed,
+                [],
             )
         ]
         assert len(queries) == 2
-        assert queries[0].range_start == datetime(2026, 4, 9, tzinfo=timezone.utc)
-        assert queries[1].range_start == datetime(2026, 4, 10, tzinfo=timezone.utc)
+        assert queries[0].range_start == datetime(2026, 4, 9, tzinfo=UTC)
+        assert queries[1].range_start == datetime(2026, 4, 10, tzinfo=UTC)
 
     async def test_caller_can_break_early(self):
         """The whole point of the async generator: caller cancels by ``break``."""
@@ -205,30 +239,39 @@ class TestExecuteRefreshChunked:
         )
         collected = []
         async for q in execute_refresh(
-            cursor, view, "iceberg.out.mv", parsed, ["volume"],
+            cursor,
+            view,
+            "iceberg.out.mv",
+            parsed,
+            ["volume"],
         ):
             collected.append(q)
             break  # stop after the first chunk commits
         assert len(collected) == 1
         assert collected[0].chunks_done == 1
-        assert collected[0].chunks_total == 3   # "still 3 planned, we did 1"
+        assert collected[0].chunks_total == 3  # "still 3 planned, we did 1"
 
     async def test_empty_source_emits_nothing(self):
         view = make_view(full_refresh_chunk="day")
         parsed = parse_view_query(view.query)
         cursor = MockCursor(fetchall_responses=[[]])
         queries = [
-            q async for q in execute_refresh(
-                cursor, view, "iceberg.out.mv", parsed, ["volume"],
+            q
+            async for q in execute_refresh(
+                cursor,
+                view,
+                "iceberg.out.mv",
+                parsed,
+                ["volume"],
             )
         ]
         assert queries == []
 
     async def test_fully_caught_up_target_emits_nothing(self):
-        view = make_view(full_refresh_chunk="day", query=(
-            "SELECT symbol, date_trunc('minute', ts) AS minute "
-            "FROM iceberg.market_data.trades GROUP BY 1, 2"
-        ))
+        view = make_view(
+            full_refresh_chunk="day",
+            query=("SELECT symbol, date_trunc('minute', ts) AS minute FROM iceberg.market_data.trades GROUP BY 1, 2"),
+        )
         parsed = parse_view_query(view.query)
         cursor = MockCursor(
             fetchall_responses=[
@@ -238,14 +281,20 @@ class TestExecuteRefreshChunked:
             ],
         )
         queries = [
-            q async for q in execute_refresh(
-                cursor, view, "iceberg.out.mv", parsed, [],
+            q
+            async for q in execute_refresh(
+                cursor,
+                view,
+                "iceberg.out.mv",
+                parsed,
+                [],
             )
         ]
         assert queries == []
 
 
 # ── execute_maintenance ──
+
 
 class TestExecuteMaintenance:
     async def test_optimize_without_params(self):
@@ -258,7 +307,10 @@ class TestExecuteMaintenance:
     async def test_optimize_with_file_size_threshold(self):
         cursor = MockCursor()
         await execute_maintenance(
-            cursor, "iceberg.out.mv", "optimize", {"file_size_threshold": "128MB"},
+            cursor,
+            "iceberg.out.mv",
+            "optimize",
+            {"file_size_threshold": "128MB"},
         )
         assert cursor.executed == [
             "ALTER TABLE iceberg.out.mv EXECUTE optimize(file_size_threshold => '128MB')",
@@ -267,7 +319,10 @@ class TestExecuteMaintenance:
     async def test_expire_snapshots_with_retention(self):
         cursor = MockCursor()
         q = await execute_maintenance(
-            cursor, "iceberg.out.mv", "expire_snapshots", {"retention_threshold": "7d"},
+            cursor,
+            "iceberg.out.mv",
+            "expire_snapshots",
+            {"retention_threshold": "7d"},
         )
         assert cursor.executed == [
             "ALTER TABLE iceberg.out.mv EXECUTE expire_snapshots(retention_threshold => '7d')",
@@ -277,7 +332,10 @@ class TestExecuteMaintenance:
     async def test_remove_orphan_files_with_retention(self):
         cursor = MockCursor()
         q = await execute_maintenance(
-            cursor, "iceberg.out.mv", "remove_orphan_files", {"retention_threshold": "30d"},
+            cursor,
+            "iceberg.out.mv",
+            "remove_orphan_files",
+            {"retention_threshold": "30d"},
         )
         assert cursor.executed == [
             "ALTER TABLE iceberg.out.mv EXECUTE remove_orphan_files(retention_threshold => '30d')",

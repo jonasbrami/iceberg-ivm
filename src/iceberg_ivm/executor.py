@@ -10,13 +10,14 @@ One refresh = one or more MERGE commits over bucket-aligned time ranges:
 ``execute_refresh`` is a single async generator that yields one ``QueryInfo``
 per committed MERGE. Callers cancel via ``break`` — no callback plumbing.
 """
+
 from __future__ import annotations
 
 import logging
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
-from typing import AsyncIterator
 
 from iceberg_ivm.config import ViewConfig
 from iceberg_ivm.detector import (
@@ -33,9 +34,10 @@ log = logging.getLogger(__name__)
 @dataclass
 class QueryInfo:
     """Metadata for one Trino query: linking + stats."""
+
     query_id: str
     info_uri: str
-    stage: str           # "merge" | "chunk_merge" | "maintenance_<op>"
+    stage: str  # "merge" | "chunk_merge" | "maintenance_<op>"
     started_at: float
     elapsed_ms: float
     processed_rows: int = 0
@@ -43,14 +45,19 @@ class QueryInfo:
     # Range this query covered, if applicable (always set for refresh stages).
     range_start: datetime | None = None
     range_end: datetime | None = None
-    chunks_done: int = 0     # 1-indexed count of committed chunks so far
-    chunks_total: int = 0    # 0 for non-chunked
+    chunks_done: int = 0  # 1-indexed count of committed chunks so far
+    chunks_total: int = 0  # 0 for non-chunked
 
 
 async def _execute_tracked(
-    cursor, sql: str, stage: str,
-    *, range_start: datetime | None = None, range_end: datetime | None = None,
-    chunks_done: int = 0, chunks_total: int = 0,
+    cursor,
+    sql: str,
+    stage: str,
+    *,
+    range_start: datetime | None = None,
+    range_end: datetime | None = None,
+    chunks_done: int = 0,
+    chunks_total: int = 0,
 ) -> QueryInfo:
     """Execute ``sql`` and return a QueryInfo with timing + stats + range."""
     started = time.time()
@@ -94,7 +101,10 @@ def build_merge_sql(
 
 
 async def execute_maintenance(
-    cursor, target_table: str, op: str, params: dict[str, str],
+    cursor,
+    target_table: str,
+    op: str,
+    params: dict[str, str],
 ) -> QueryInfo:
     """Run one Iceberg maintenance op via ``ALTER TABLE ... EXECUTE``.
 
@@ -103,14 +113,16 @@ async def execute_maintenance(
     because Trino's only legitimate values are duration/DataSize literals.
     """
     args = ", ".join(f"{k} => '{v}'" for k, v in params.items())
-    sql = f"ALTER TABLE {target_table} EXECUTE {op}({args})" if args else \
-          f"ALTER TABLE {target_table} EXECUTE {op}"
+    sql = f"ALTER TABLE {target_table} EXECUTE {op}({args})" if args else f"ALTER TABLE {target_table} EXECUTE {op}"
     log.info("%s: maintenance — %s", target_table, sql)
     return await _execute_tracked(cursor, sql, stage=f"maintenance_{op}")
 
 
 async def _backfill_ranges(
-    cursor, view: ViewConfig, target_table: str, parsed: ParsedView,
+    cursor,
+    view: ViewConfig,
+    target_table: str,
+    parsed: ParsedView,
 ) -> list[tuple[datetime, datetime]]:
     """Return the ordered (start, end) ranges for a full refresh.
 
@@ -118,7 +130,9 @@ async def _backfill_ranges(
     target's ``$files`` — no external cursor state. Empty = empty source.
     """
     source_range = await get_source_column_range(
-        cursor, parsed.source_table, parsed.filter_column,
+        cursor,
+        parsed.source_table,
+        parsed.filter_column,
     )
     if source_range is None:
         log.info("%s: source %s is empty, nothing to backfill", view.name, parsed.source_table)
@@ -135,8 +149,7 @@ async def _backfill_ranges(
     # is — fall through with an assertion so a future refactor can't
     # silently re-introduce the "" fallback that would skip the resume.
     assert parsed.bucket_alias is not None, (
-        "chunked full refresh requires bucket_alias; "
-        "validate_chunk_compatibility should have rejected this view"
+        "chunked full refresh requires bucket_alias; validate_chunk_compatibility should have rejected this view"
     )
     target_max = await get_target_bucket_max(cursor, target_table, parsed.bucket_alias)
     if target_max is not None:
@@ -177,7 +190,11 @@ async def execute_refresh(
         sql = build_merge_sql(target_table, src, parsed.merge_keys, value_columns)
         log.info("%s: %s %d/%d [%s, %s)", view.name, stage, i, total, start, end)
         yield await _execute_tracked(
-            cursor, sql, stage,
-            range_start=start, range_end=end,
-            chunks_done=i, chunks_total=total,
+            cursor,
+            sql,
+            stage,
+            range_start=start,
+            range_end=end,
+            chunks_done=i,
+            chunks_total=total,
         )

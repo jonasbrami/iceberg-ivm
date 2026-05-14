@@ -1,4 +1,5 @@
 """Configuration loading and validation."""
+
 from __future__ import annotations
 
 import logging
@@ -24,17 +25,21 @@ log = logging.getLogger(__name__)
 # never as chunk granularities — chunked backfills measured in seconds would
 # create millions of tiny commits.
 _GRAN_ORDER = (
-    "millisecond", "second", "minute", "hour", "day", "week", "month", "quarter", "year",
+    "millisecond",
+    "second",
+    "minute",
+    "hour",
+    "day",
+    "week",
+    "month",
+    "quarter",
+    "year",
 )
 _SUBDAY_OR_WEEK = ("millisecond", "second", "minute", "hour", "day", "week")
-_VALID_CHUNK_GRANULARITIES = frozenset(
-    ("minute", "hour", "day", "week", "month", "quarter", "year")
-)
+_VALID_CHUNK_GRANULARITIES = frozenset(("minute", "hour", "day", "week", "month", "quarter", "year"))
 _CHUNK_COMPATIBILITY: dict[str, frozenset[str]] = {
     g: frozenset(
-        x for x in _GRAN_ORDER[i:]
-        if x in _VALID_CHUNK_GRANULARITIES
-        and (x != "week" or g in _SUBDAY_OR_WEEK)
+        x for x in _GRAN_ORDER[i:] if x in _VALID_CHUNK_GRANULARITIES and (x != "week" or g in _SUBDAY_OR_WEEK)
     )
     for i, g in enumerate(_GRAN_ORDER)
 }
@@ -49,6 +54,7 @@ _CHUNK_COMPATIBILITY["week"] = frozenset({"week"})
 # the local dev compose stack).
 _TRINO_ENV_REQUIRED = ("TRINO_URL", "TRINO_USER")
 
+
 def validate_identifier(value: str, field_name: str) -> None:
     if not IDENTIFIER_RE.match(value):
         raise ValueError(f"{field_name}: {value!r} is not a valid SQL identifier")
@@ -56,9 +62,7 @@ def validate_identifier(value: str, field_name: str) -> None:
 
 def validate_qualified_name(value: str, field_name: str) -> None:
     if not QUALIFIED_NAME_RE.match(value):
-        raise ValueError(
-            f"{field_name}: {value!r} is not a valid qualified table name"
-        )
+        raise ValueError(f"{field_name}: {value!r} is not a valid qualified table name")
 
 
 def validate_view_name(value: str, field_name: str = "name") -> None:
@@ -71,13 +75,12 @@ def validate_view_name(value: str, field_name: str = "name") -> None:
     """
     if not QUALIFIED_NAME_RE.match(value):
         raise ValueError(
-            f"{field_name}: {value!r} is not a valid view name "
-            "(must be a SQL identifier or a dotted qualified name)"
+            f"{field_name}: {value!r} is not a valid view name (must be a SQL identifier or a dotted qualified name)"
         )
 
 
 _MAINTENANCE_OPS = ("optimize", "expire_snapshots", "remove_orphan_files")
-_DURATION_RE = re.compile(r"^\d+[smhd]$")     # Trino duration: s/m/h/d only
+_DURATION_RE = re.compile(r"^\d+[smhd]$")  # Trino duration: s/m/h/d only
 _DATASIZE_RE = re.compile(r"^\d+(B|KB|MB|GB|TB)$")
 
 
@@ -103,7 +106,7 @@ class ViewConfig:
     # bad values never reach the executor.
     maintenance_interval_seconds: int = 0
     optimize: bool = True
-    optimize_file_size_threshold: str | None = None     # None → Trino default (100MB)
+    optimize_file_size_threshold: str | None = None  # None → Trino default (100MB)
     expire_snapshots: bool = True
     expire_snapshots_retention: str = "7d"
     remove_orphan_files: bool = True
@@ -126,11 +129,11 @@ class ServerConfig:
 
 @dataclass(frozen=True)
 class TrinoConfig:
-    url: str                # full coordinator URL, e.g. "http://trino:8080" (from TRINO_URL)
-    user: str               # from TRINO_USER
-    password: str | None    # from TRINO_PASSWORD; None → connect anonymously
-    catalog: str            # from YAML (trino.catalog)
-    schema: str             # from YAML (trino.schema)
+    url: str  # full coordinator URL, e.g. "http://trino:8080" (from TRINO_URL)
+    user: str  # from TRINO_USER
+    password: str | None  # from TRINO_PASSWORD; None → connect anonymously
+    catalog: str  # from YAML (trino.catalog)
+    schema: str  # from YAML (trino.schema)
 
 
 @dataclass(frozen=True)
@@ -178,18 +181,14 @@ def validate_maintenance_config(raw: dict) -> None:
     """Validate the shared maintenance interval + per-op param strings."""
     iv = raw.get("maintenance_interval_seconds", 0) or 0
     if iv < 0:
-        raise ValueError(
-            f"maintenance_interval_seconds must be >= 0 (got {iv!r}); use 0 to disable"
-        )
+        raise ValueError(f"maintenance_interval_seconds must be >= 0 (got {iv!r}); use 0 to disable")
     for f in ("expire_snapshots_retention", "remove_orphan_files_retention"):
         v = raw.get(f)
         if v and not _DURATION_RE.match(str(v)):
             raise ValueError(f"{f}: {v!r} is not a valid Trino duration (e.g. '7d', '24h')")
     thr = raw.get("optimize_file_size_threshold")
     if thr and not _DATASIZE_RE.match(str(thr)):
-        raise ValueError(
-            f"optimize_file_size_threshold: {thr!r} is not a valid data size (e.g. '128MB')"
-        )
+        raise ValueError(f"optimize_file_size_threshold: {thr!r} is not a valid data size (e.g. '128MB')")
 
 
 def _parse_view(raw: dict) -> ViewConfig:
@@ -243,9 +242,7 @@ def load_config(path: str | Path) -> Config:
     trino_raw = raw["trino"]
     missing_yaml = {"catalog", "schema"} - trino_raw.keys()
     if missing_yaml:
-        raise ValueError(
-            f"trino config missing required YAML fields: {sorted(missing_yaml)}"
-        )
+        raise ValueError(f"trino config missing required YAML fields: {sorted(missing_yaml)}")
 
     missing_env = [v for v in _TRINO_ENV_REQUIRED if not os.environ.get(v)]
     if missing_env:
@@ -272,7 +269,11 @@ def load_config(path: str | Path) -> Config:
     cfg = Config(trino=trino, views=[], server=server)
     log.info(
         "loaded static config from %s (trino=%s as %s / %s.%s)",
-        path, trino.url, trino.user, trino.catalog, trino.schema,
+        path,
+        trino.url,
+        trino.user,
+        trino.catalog,
+        trino.schema,
     )
     return cfg
 

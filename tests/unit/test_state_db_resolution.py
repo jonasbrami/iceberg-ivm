@@ -8,6 +8,7 @@ bump. The resolver must prefer the views file's directory and only fall
 back to the config file's directory when the views directory is missing
 or not writable.
 """
+
 from __future__ import annotations
 
 import os
