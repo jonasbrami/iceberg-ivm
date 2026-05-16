@@ -368,6 +368,36 @@ def test_save_views_omits_full_refresh_chunk_when_none(tmp_path):
     assert "full_refresh_chunk" not in yaml_text
 
 
+def test_query_timeout_seconds_round_trip(tmp_path):
+    """A view with ``query_timeout_seconds`` set must survive save → load."""
+    views = [
+        ViewConfig(
+            name="v",
+            query="SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1",
+            target_table="iceberg.analytics.v",
+            query_timeout_seconds=3600,
+        )
+    ]
+    views_path = tmp_path / "views.yaml"
+    save_views(views, views_path)
+    loaded = load_views(views_path)
+    assert loaded[0].query_timeout_seconds == 3600
+
+
+@pytest.mark.parametrize("bad", [0, -1, "30s", True, False])
+def test_query_timeout_seconds_rejects_non_positive_int(tmp_path, bad):
+    """Reject 0 (``asyncio.timeout(0)`` fires immediately), negatives, strings,
+    and bools (``isinstance(True, int)`` is ``True``)."""
+    raw = (
+        "views:\n  - name: v\n"
+        "    query: \"SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1\"\n"
+        "    target_table: iceberg.analytics.v\n"
+        f"    query_timeout_seconds: {bad!r}\n"
+    )
+    with pytest.raises(ValueError, match="query_timeout_seconds"):
+        load_views(write_views(tmp_path, raw))
+
+
 def test_full_refresh_chunk_rejects_view_without_direct_bucket_projection(tmp_path):
     """``full_refresh_chunk`` requires a direct ``date_trunc(g, col) AS <alias>``
     projection so the target has a column the executor can read as the

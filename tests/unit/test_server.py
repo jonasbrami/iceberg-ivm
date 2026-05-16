@@ -102,6 +102,7 @@ def test_view_schema(client):
         "target_table",
         "target_partitioning",
         "refresh_interval_seconds",
+        "query_timeout_seconds",
         "full_refresh_chunk",
         "maintenance_interval_seconds",
         "optimize",
@@ -382,6 +383,20 @@ def test_view_schema_name_field_is_optional(client):
     name_field = next(f for f in schema if f["name"] == "name")
     assert name_field["required"] is False
     assert name_field.get("disabled_on_edit") is True
+
+
+def test_view_schema_query_timeout_seconds_is_number(client):
+    """``query_timeout_seconds`` is typed ``int | None`` — that resolves to a
+    ``types.UnionType`` (not ``int``), so ``_build_form_schema``'s default
+    inference falls back to ``"string"``. The ``_FIELD_META`` entry sets
+    ``"type": "number"`` explicitly to compensate; this test pins that so
+    the field can't silently regress to a text input."""
+    schema = client.get("/api/views/schema").json()
+    field = next(f for f in schema if f["name"] == "query_timeout_seconds")
+    assert field["type"] == "number"
+    assert field.get("min") == 1
+    # Required must be False — the field is optional (no timeout by default).
+    assert field["required"] is False
 
 
 def test_update_view_blank_name_is_accepted(client, setup_state):
@@ -1729,6 +1744,160 @@ async def test_refresh_failure_persists_last_error(setup_state, tmp_path):
         assert persisted is not None
         assert persisted["last_error"] == "trino exploded"
         assert persisted["total_errors"] == 1
+    finally:
+        await h.close()
+
+
+async def test_refresh_view_respects_query_timeout(setup_state, tmp_path):
+    """A refresh that overruns ``query_timeout_seconds`` is aborted with a
+    TimeoutError, recorded as a failure, and leaves the view in a state where
+    the next tick can proceed normally.
+
+    Without a per-query budget a wedged Trino coordinator can hang a worker
+    indefinitely — cancellation via supervisor.cancel() still works on shutdown,
+    but day-to-day a stuck refresh just sits there with no observability.
+    """
+    import dataclasses
+
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.introspect import ColumnInfo
+
+    view = dataclasses.replace(setup_state.config.views[0], query_timeout_seconds=1)
+    setup_state.config = dataclasses.replace(setup_state.config, views=[view])
+    setup_state.view_statuses[view.name] = ViewStatus(name=view.name)
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+
+    class FakeConn:
+        async def cursor(self):
+            return FakeCursor()
+
+        async def close(self):
+            pass
+
+    class FakeCursor:
+        stats = {}
+
+        async def execute(self, sql):
+            pass
+
+        async def fetchone(self):
+            return None
+
+        async def fetchall(self):
+            return []
+
+    async def fake_detect(*a, **kw):
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=1)
+
+    async def fake_discover(c, q):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+
+    async def hanging_execute_refresh(*a, **kw):
+        # Sleep well past the budget; the timeout must cut us off.
+        await asyncio.sleep(30)
+        yield  # pragma: no cover (never reached)
+
+    try:
+        with (
+            patch.object(server_mod, "get_trino_connection", lambda s: FakeConn()),
+            patch.object(server_mod, "discover_columns", fake_discover),
+            patch.object(server_mod, "detect_changes", fake_detect),
+            patch.object(server_mod, "execute_refresh", hanging_execute_refresh),
+        ):
+            t0 = asyncio.get_running_loop().time()
+            await server_mod.refresh_view(setup_state, view)
+            elapsed = asyncio.get_running_loop().time() - t0
+
+        # Budget is 1s; allow generous slack but reject "test ran the full 30s sleep".
+        assert elapsed < 5, f"refresh did not honour the 1s timeout (took {elapsed:.2f}s)"
+
+        persisted = await h.get_view_status(view.name)
+        assert persisted is not None
+        assert persisted["total_errors"] == 1
+        assert persisted["last_error"] is not None
+        assert "timeout" in persisted["last_error"].lower()
+    finally:
+        await h.close()
+
+
+async def test_refresh_external_cancel_propagates_past_timeout_handler(setup_state, tmp_path):
+    """With ``query_timeout_seconds`` set, an external ``task.cancel()`` mid-refresh
+    must still surface as ``CancelledError`` (not be swallowed by ``except TimeoutError``)
+    and the shielded ``conn.close`` must still run.
+
+    ``asyncio.timeout``'s ``__aexit__`` only converts ``CancelledError`` to
+    ``TimeoutError`` when its own deadline fired. An external cancel bypasses that —
+    but since ``CancelledError`` is ``BaseException``, the outer ``except TimeoutError``
+    can't catch it either. This test pins both invariants so a future refactor can't
+    silently break shutdown / delete_view.
+    """
+    import dataclasses
+
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.introspect import ColumnInfo
+
+    # Budget set generously so the timeout itself cannot plausibly fire.
+    view = dataclasses.replace(setup_state.config.views[0], query_timeout_seconds=3600)
+    setup_state.config = dataclasses.replace(setup_state.config, views=[view])
+    setup_state.view_statuses[view.name] = ViewStatus(name=view.name)
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+
+    close_calls = []
+
+    class FakeConn:
+        async def cursor(self):
+            return FakeCursor()
+
+        async def close(self):
+            close_calls.append(1)
+
+    class FakeCursor:
+        stats = {}
+
+        async def execute(self, sql):
+            pass
+
+        async def fetchone(self):
+            return None
+
+        async def fetchall(self):
+            return []
+
+    async def slow_detect(*a, **kw):
+        # Block long enough for the outer test to cancel us.
+        await asyncio.sleep(60)
+        return ChangeResult(action=RefreshAction.NO_CHANGE, current_snapshot=1)
+
+    async def fake_discover(c, q):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+
+    try:
+        with (
+            patch.object(server_mod, "get_trino_connection", lambda s: FakeConn()),
+            patch.object(server_mod, "discover_columns", fake_discover),
+            patch.object(server_mod, "detect_changes", slow_detect),
+        ):
+            t = asyncio.create_task(server_mod.refresh_view(setup_state, view))
+            # Let the task reach detect_changes' sleep.
+            for _ in range(5):
+                await asyncio.sleep(0)
+            t.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await t
+
+        # The shielded close must have run despite cancellation.
+        assert close_calls == [1]
+        # Crucially: no TimeoutError-shaped error was recorded — the cancel
+        # path skipped both the TimeoutError and Exception handlers.
+        persisted = await h.get_view_status(view.name)
+        if persisted is not None and persisted["last_error"]:
+            assert "exceeded" not in persisted["last_error"]
     finally:
         await h.close()
 

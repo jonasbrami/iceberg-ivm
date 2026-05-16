@@ -91,6 +91,9 @@ class ViewConfig:
     target_table: str
     target_partitioning: str | None = None
     refresh_interval_seconds: int = 60
+    # Max wall-clock seconds for one refresh tick (detection + every MERGE +
+    # maintenance). None disables the timeout.
+    query_timeout_seconds: int | None = None
     # Granularity string ("day", "month", …) controlling the size of each
     # chunk in the first-run chunked backfill. ``None`` → legacy single-shot
     # full refresh. Validated against the view's own date_trunc granularity
@@ -207,12 +210,22 @@ def _parse_view(raw: dict) -> ViewConfig:
     validate_chunk_compatibility(chunk, raw["query"])
     validate_maintenance_config(raw)
 
+    query_timeout = raw.get("query_timeout_seconds")
+    # ``isinstance(True, int)`` is ``True`` — exclude bools explicitly so a
+    # stray ``query_timeout_seconds: true`` in YAML doesn't silently parse
+    # as a 1-second timeout that nukes every refresh.
+    if query_timeout is not None and (
+        isinstance(query_timeout, bool) or not isinstance(query_timeout, int) or query_timeout <= 0
+    ):
+        raise ValueError(f"query_timeout_seconds: {query_timeout!r} must be a positive integer or omitted")
+
     return ViewConfig(
         name=raw["name"],
         query=raw["query"],
         target_table=raw["target_table"],
         target_partitioning=raw.get("target_partitioning"),
         refresh_interval_seconds=raw.get("refresh_interval_seconds", 60),
+        query_timeout_seconds=query_timeout,
         full_refresh_chunk=chunk,
         maintenance_interval_seconds=raw.get("maintenance_interval_seconds", 0),
         optimize=raw.get("optimize", True),
