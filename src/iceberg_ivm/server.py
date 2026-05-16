@@ -8,7 +8,7 @@ import logging
 import os
 import time
 import typing
-from contextlib import asynccontextmanager, suppress
+from contextlib import AsyncExitStack, asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
@@ -371,6 +371,52 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
     cursor = await conn.cursor()
     vs = s.view_statuses.setdefault(view.name, ViewStatus(name=view.name))
 
+    # ``query_timeout_seconds`` bounds the *entire* refresh tick (detection +
+    # every MERGE + maintenance). On expiry, asyncio.timeout injects a
+    # CancelledError mid-flight; the shielded conn.close in the outer finally
+    # still runs, and the __aexit__ then converts it to TimeoutError which the
+    # outer except picks up and records as a normal refresh failure.
+    timeout_cm = (
+        asyncio.timeout(view.query_timeout_seconds) if view.query_timeout_seconds is not None else nullcontext()
+    )
+
+    try:
+        async with timeout_cm:
+            await _refresh_view_body(s, view, conn, cursor, vs)
+    except TimeoutError:
+        vs.last_error = f"refresh exceeded query_timeout_seconds={view.query_timeout_seconds}"
+        vs.total_errors += 1
+        REFRESH_ERRORS.labels(view=view.name).inc()
+        log.warning(
+            "%s: refresh timed out after %ds",
+            view.name,
+            view.query_timeout_seconds,
+        )
+        await _persist_view_status(s, view.name, vs)
+    finally:
+        # Shield the close so a task cancellation mid-execute (e.g. delete_view
+        # cancelling its worker) doesn't cancel the close itself and leak the
+        # underlying Trino connection. CancelledError must propagate so the
+        # task actually finishes cancelling; only swallow non-cancellation
+        # close failures.
+        try:
+            await asyncio.shield(conn.close())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("%s: conn.close failed", view.name)
+
+
+async def _refresh_view_body(
+    s: AppState,
+    view: ViewConfig,
+    conn,
+    cursor,
+    vs: ViewStatus,
+) -> None:
+    """Refresh body extracted so :func:`refresh_view` can wrap it in an
+    ``asyncio.timeout`` + ``TimeoutError`` handler without duplicating the
+    existing ``Exception`` handler. Not part of the public surface."""
     try:
         parsed = parse_view_query(view.query)
         target_table = view.target_table
@@ -497,18 +543,6 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
         REFRESH_ERRORS.labels(view=view.name).inc()
         log.exception("%s: refresh failed", view.name)
         await _persist_view_status(s, view.name, vs)
-    finally:
-        # Shield the close so a task cancellation mid-execute (e.g. delete_view
-        # cancelling its worker) doesn't cancel the close itself and leak the
-        # underlying Trino connection. CancelledError must propagate so the
-        # task actually finishes cancelling; only swallow non-cancellation
-        # close failures.
-        try:
-            await asyncio.shield(conn.close())
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("%s: conn.close failed", view.name)
 
 
 async def view_worker(s: AppState, name: str) -> None:
@@ -555,10 +589,8 @@ async def view_worker(s: AppState, name: str) -> None:
                 rt.refresh_cond.notify_all()
 
             with suppress(TimeoutError):
-                await asyncio.wait_for(
-                    rt.wake.wait(),
-                    timeout=view.refresh_interval_seconds,
-                )
+                async with asyncio.timeout(view.refresh_interval_seconds):
+                    await rt.wake.wait()
             rt.wake.clear()
     finally:
         # Wake any trigger_refresh waiter that might still be parked on the
@@ -604,7 +636,8 @@ async def supervisor(s: AppState) -> None:
             # Wait on the stop event with a timeout — woken either by
             # shutdown (clean exit) or the timeout (config reload tick).
             with suppress(TimeoutError):
-                await asyncio.wait_for(s.stop_event.wait(), timeout=reload_interval)
+                async with asyncio.timeout(reload_interval):
+                    await s.stop_event.wait()
             if s.stop_event.is_set():
                 break
             reload_config(s)
@@ -658,41 +691,50 @@ async def lifespan(app: FastAPI):
         reload_config(s)
         app.state.s = s
 
-    if s.history is None and s.config is not None:
-        db_path = resolve_state_db_path(
-            s.views_path,
-            s.config_path,
-            s.config.server.state_db_path,
-        )
-        if str(db_path).startswith("/app/"):
-            log.warning(
-                "state_db_path resolved under /app/ (%s) — in Docker this is "
-                "the container's writable layer and will be wiped on image "
-                "bumps. Mount a host directory for views.yaml or set an "
-                "absolute server.state_db_path on a persistent volume "
-                "(see issue #39).",
-                db_path,
+    # Resource ordering is encoded by AsyncExitStack registration order:
+    # the stack unwinds LIFO, so we want history.close() *last* (after the
+    # TaskGroup has drained the supervisor) and stop_event.set() *first*
+    # (so the supervisor notices shutdown before the TaskGroup awaits it).
+    async with AsyncExitStack() as stack:
+        if s.history is None and s.config is not None:
+            db_path = resolve_state_db_path(
+                s.views_path,
+                s.config_path,
+                s.config.server.state_db_path,
             )
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        s.history = QueryHistory(db_path, RECENT_QUERY_LIMIT)
-        await s.history.open()
-        await hydrate_view_state(s)
+            if str(db_path).startswith("/app/"):
+                log.warning(
+                    "state_db_path resolved under /app/ (%s) — in Docker this is "
+                    "the container's writable layer and will be wiped on image "
+                    "bumps. Mount a host directory for views.yaml or set an "
+                    "absolute server.state_db_path on a persistent volume "
+                    "(see issue #39).",
+                    db_path,
+                )
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            s.history = QueryHistory(db_path, RECENT_QUERY_LIMIT)
+            await s.history.open()
+            # Register close immediately so a failure in hydrate_view_state
+            # (next line) still releases the SQLite connection.
+            stack.push_async_callback(s.history.close)
+            await hydrate_view_state(s)
 
-    log.info(
-        "starting supervisor — %d views configured",
-        len(s.config.views) if s.config else 0,
-    )
-    try:
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(supervisor(s))
-            try:
-                yield
-            finally:
-                log.info("shutting down supervisor")
-                s.stop_event.set()
-    finally:
-        if s.history is not None:
-            await s.history.close()
+        log.info(
+            "starting supervisor — %d views configured",
+            len(s.config.views) if s.config else 0,
+        )
+        tg = await stack.enter_async_context(asyncio.TaskGroup())
+
+        def _signal_shutdown() -> None:
+            log.info("shutting down supervisor")
+            s.stop_event.set()
+
+        # Registered after the TaskGroup so it runs *before* the group's
+        # __aexit__ on unwind — supervisor sees stop_event set before we
+        # wait on it to drain.
+        stack.callback(_signal_shutdown)
+        tg.create_task(supervisor(s))
+        yield
 
 
 app = FastAPI(title="iceberg-ivm", lifespan=lifespan)
@@ -735,6 +777,17 @@ _FIELD_META: dict[str, dict] = {
     "target_table": {"required": True, "group": "target", "placeholder": "iceberg.analytics.my_view"},
     "target_partitioning": {"group": "target", "placeholder": "ARRAY['day(minute)']", "help": "unpartitioned if blank"},
     "refresh_interval_seconds": {"min": 1, "suffix": "seconds", "label": "Refresh Interval"},
+    "query_timeout_seconds": {
+        "min": 1,
+        "suffix": "seconds",
+        "label": "Query Timeout",
+        "help": (
+            "Optional. Bounds the wall-clock duration of a single refresh "
+            "tick (detection + every MERGE + maintenance). Leave blank for "
+            "no timeout. Useful when a wedged Trino coordinator would "
+            "otherwise hang the worker indefinitely."
+        ),
+    },
     "full_refresh_chunk": {
         "type": "select",
         "group": "target",

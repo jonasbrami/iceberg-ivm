@@ -368,6 +368,52 @@ def test_save_views_omits_full_refresh_chunk_when_none(tmp_path):
     assert "full_refresh_chunk" not in yaml_text
 
 
+def test_query_timeout_seconds_round_trip(tmp_path):
+    """A view with ``query_timeout_seconds`` set must survive save → load."""
+    views = [
+        ViewConfig(
+            name="v",
+            query="SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1",
+            target_table="iceberg.analytics.v",
+            query_timeout_seconds=3600,
+        )
+    ]
+    views_path = tmp_path / "views.yaml"
+    save_views(views, views_path)
+    loaded = load_views(views_path)
+    assert loaded[0].query_timeout_seconds == 3600
+
+
+def test_query_timeout_seconds_omitted_when_none(tmp_path):
+    """The default (``None``) must not emit a spurious key in YAML, mirroring
+    how ``full_refresh_chunk`` is handled."""
+    views = [
+        ViewConfig(
+            name="v",
+            query="SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1",
+            target_table="iceberg.analytics.v",
+        )
+    ]
+    views_path = tmp_path / "views.yaml"
+    save_views(views, views_path)
+    assert "query_timeout_seconds" not in views_path.read_text()
+
+
+@pytest.mark.parametrize("bad", [0, -1, "30s"])
+def test_query_timeout_seconds_rejects_non_positive_int(tmp_path, bad):
+    """Validation: only a positive integer (or omission) is accepted. ``0`` is
+    a footgun (``asyncio.timeout(0)`` cancels immediately) so we reject it
+    rather than silently treating it as "no timeout"."""
+    raw = (
+        "views:\n  - name: v\n"
+        "    query: \"SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1\"\n"
+        "    target_table: iceberg.analytics.v\n"
+        f"    query_timeout_seconds: {bad!r}\n"
+    )
+    with pytest.raises(ValueError, match="query_timeout_seconds"):
+        load_views(write_views(tmp_path, raw))
+
+
 def test_full_refresh_chunk_rejects_view_without_direct_bucket_projection(tmp_path):
     """``full_refresh_chunk`` requires a direct ``date_trunc(g, col) AS <alias>``
     projection so the target has a column the executor can read as the

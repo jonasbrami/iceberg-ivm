@@ -91,6 +91,12 @@ class ViewConfig:
     target_table: str
     target_partitioning: str | None = None
     refresh_interval_seconds: int = 60
+    # Upper bound on a single refresh's wall-clock duration. ``None`` → no
+    # timeout (legacy behaviour); a positive int wraps the refresh body in
+    # ``asyncio.timeout(...)`` so a wedged Trino coordinator can't hang the
+    # worker indefinitely. Counted from the start of the refresh and covers
+    # detection + every MERGE + maintenance for that tick.
+    query_timeout_seconds: int | None = None
     # Granularity string ("day", "month", …) controlling the size of each
     # chunk in the first-run chunked backfill. ``None`` → legacy single-shot
     # full refresh. Validated against the view's own date_trunc granularity
@@ -207,12 +213,17 @@ def _parse_view(raw: dict) -> ViewConfig:
     validate_chunk_compatibility(chunk, raw["query"])
     validate_maintenance_config(raw)
 
+    query_timeout = raw.get("query_timeout_seconds")
+    if query_timeout is not None and (not isinstance(query_timeout, int) or query_timeout <= 0):
+        raise ValueError(f"query_timeout_seconds: {query_timeout!r} must be a positive integer or omitted")
+
     return ViewConfig(
         name=raw["name"],
         query=raw["query"],
         target_table=raw["target_table"],
         target_partitioning=raw.get("target_partitioning"),
         refresh_interval_seconds=raw.get("refresh_interval_seconds", 60),
+        query_timeout_seconds=query_timeout,
         full_refresh_chunk=chunk,
         maintenance_interval_seconds=raw.get("maintenance_interval_seconds", 0),
         optimize=raw.get("optimize", True),

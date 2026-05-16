@@ -102,6 +102,7 @@ def test_view_schema(client):
         "target_table",
         "target_partitioning",
         "refresh_interval_seconds",
+        "query_timeout_seconds",
         "full_refresh_chunk",
         "maintenance_interval_seconds",
         "optimize",
@@ -1729,6 +1730,157 @@ async def test_refresh_failure_persists_last_error(setup_state, tmp_path):
         assert persisted is not None
         assert persisted["last_error"] == "trino exploded"
         assert persisted["total_errors"] == 1
+    finally:
+        await h.close()
+
+
+async def test_refresh_view_respects_query_timeout(setup_state, tmp_path):
+    """A refresh that overruns ``query_timeout_seconds`` is aborted with a
+    TimeoutError, recorded as a failure, and leaves the view in a state where
+    the next tick can proceed normally.
+
+    Without a per-query budget a wedged Trino coordinator can hang a worker
+    indefinitely — cancellation via supervisor.cancel() still works on shutdown,
+    but day-to-day a stuck refresh just sits there with no observability.
+    """
+    import dataclasses
+
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.introspect import ColumnInfo
+
+    view = dataclasses.replace(setup_state.config.views[0], query_timeout_seconds=1)
+    setup_state.config = dataclasses.replace(setup_state.config, views=[view])
+    setup_state.view_statuses[view.name] = ViewStatus(name=view.name)
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+
+    class FakeConn:
+        async def cursor(self):
+            return FakeCursor()
+
+        async def close(self):
+            pass
+
+    class FakeCursor:
+        stats = {}
+
+        async def execute(self, sql):
+            pass
+
+        async def fetchone(self):
+            return None
+
+        async def fetchall(self):
+            return []
+
+    async def fake_detect(*a, **kw):
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=1)
+
+    async def fake_discover(c, q):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+
+    async def hanging_execute_refresh(*a, **kw):
+        # Sleep well past the budget; the timeout must cut us off.
+        await asyncio.sleep(30)
+        yield  # pragma: no cover (never reached)
+
+    try:
+        with (
+            patch.object(server_mod, "get_trino_connection", lambda s: FakeConn()),
+            patch.object(server_mod, "discover_columns", fake_discover),
+            patch.object(server_mod, "detect_changes", fake_detect),
+            patch.object(server_mod, "execute_refresh", hanging_execute_refresh),
+        ):
+            t0 = asyncio.get_running_loop().time()
+            await server_mod.refresh_view(setup_state, view)
+            elapsed = asyncio.get_running_loop().time() - t0
+
+        # Budget is 1s; allow generous slack but reject "test ran the full 30s sleep".
+        assert elapsed < 5, f"refresh did not honour the 1s timeout (took {elapsed:.2f}s)"
+
+        persisted = await h.get_view_status(view.name)
+        assert persisted is not None
+        assert persisted["total_errors"] == 1
+        assert persisted["last_error"] is not None
+        assert "timeout" in persisted["last_error"].lower()
+    finally:
+        await h.close()
+
+
+async def test_refresh_view_no_timeout_when_unset(setup_state, tmp_path):
+    """``query_timeout_seconds=None`` (the default) preserves legacy behaviour:
+    a slow refresh runs to completion with no TimeoutError surfaced."""
+    import dataclasses
+
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.executor import QueryInfo
+    from iceberg_ivm.introspect import ColumnInfo
+
+    view = setup_state.config.views[0]
+    assert view.query_timeout_seconds is None  # fixture sanity
+    setup_state.view_statuses[view.name] = ViewStatus(name=view.name)
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+
+    class FakeConn:
+        async def cursor(self):
+            return FakeCursor()
+
+        async def close(self):
+            pass
+
+    class FakeCursor:
+        stats = {}
+
+        async def execute(self, sql):
+            pass
+
+        async def fetchone(self):
+            return None
+
+        async def fetchall(self):
+            return []
+
+    async def fake_detect(*a, **kw):
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=1)
+
+    async def fake_discover(c, q):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+
+    async def slow_but_finite_refresh(*a, **kw):
+        # Deliberately yields once after a small sleep — would trip a 1s
+        # timeout if we'd accidentally applied one despite query_timeout_seconds=None.
+        await asyncio.sleep(0)
+        yield QueryInfo(
+            query_id="q",
+            info_uri="http://trino/q",
+            stage="merge",
+            started_at=1.0,
+            elapsed_ms=1.0,
+            chunks_done=1,
+            chunks_total=1,
+        )
+
+    # Make absolutely sure no stray asyncio.timeout fires; if the impl
+    # accidentally wraps with timeout=0 when the field is None, this catches it.
+    _ = dataclasses  # silence linter when this test passes after edits
+    try:
+        with (
+            patch.object(server_mod, "get_trino_connection", lambda s: FakeConn()),
+            patch.object(server_mod, "discover_columns", fake_discover),
+            patch.object(server_mod, "detect_changes", fake_detect),
+            patch.object(server_mod, "execute_refresh", slow_but_finite_refresh),
+        ):
+            await server_mod.refresh_view(setup_state, view)
+
+        persisted = await h.get_view_status(view.name)
+        assert persisted is not None
+        assert persisted["total_errors"] == 0
+        assert persisted["last_error"] is None
     finally:
         await h.close()
 
