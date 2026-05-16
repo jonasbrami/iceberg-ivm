@@ -778,6 +778,11 @@ _FIELD_META: dict[str, dict] = {
     "target_partitioning": {"group": "target", "placeholder": "ARRAY['day(minute)']", "help": "unpartitioned if blank"},
     "refresh_interval_seconds": {"min": 1, "suffix": "seconds", "label": "Refresh Interval"},
     "query_timeout_seconds": {
+        # ``type`` is set explicitly because ``_build_form_schema``'s default
+        # inference checks ``t is int`` against the resolved annotation, and
+        # ``int | None`` resolves to a ``types.UnionType`` (not ``int``), so
+        # the field would otherwise render as a text input.
+        "type": "number",
         "min": 1,
         "suffix": "seconds",
         "label": "Query Timeout",

@@ -399,11 +399,15 @@ def test_query_timeout_seconds_omitted_when_none(tmp_path):
     assert "query_timeout_seconds" not in views_path.read_text()
 
 
-@pytest.mark.parametrize("bad", [0, -1, "30s"])
+@pytest.mark.parametrize("bad", [0, -1, "30s", True, False])
 def test_query_timeout_seconds_rejects_non_positive_int(tmp_path, bad):
     """Validation: only a positive integer (or omission) is accepted. ``0`` is
     a footgun (``asyncio.timeout(0)`` cancels immediately) so we reject it
-    rather than silently treating it as "no timeout"."""
+    rather than silently treating it as "no timeout".
+
+    ``True`` / ``False`` are flagged separately because ``isinstance(True, int)``
+    is ``True`` — a YAML ``query_timeout_seconds: true`` would otherwise pass as
+    a 1-second timeout that nukes every refresh."""
     raw = (
         "views:\n  - name: v\n"
         "    query: \"SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1\"\n"

@@ -214,7 +214,12 @@ def _parse_view(raw: dict) -> ViewConfig:
     validate_maintenance_config(raw)
 
     query_timeout = raw.get("query_timeout_seconds")
-    if query_timeout is not None and (not isinstance(query_timeout, int) or query_timeout <= 0):
+    # ``isinstance(True, int)`` is ``True`` — exclude bools explicitly so a
+    # stray ``query_timeout_seconds: true`` in YAML doesn't silently parse
+    # as a 1-second timeout that nukes every refresh.
+    if query_timeout is not None and (
+        isinstance(query_timeout, bool) or not isinstance(query_timeout, int) or query_timeout <= 0
+    ):
         raise ValueError(f"query_timeout_seconds: {query_timeout!r} must be a positive integer or omitted")
 
     return ViewConfig(
