@@ -222,9 +222,87 @@ class TestExecuteRefreshChunked:
                 [],
             )
         ]
-        assert len(queries) == 2
-        assert queries[0].range_start == datetime(2026, 4, 9, tzinfo=UTC)
-        assert queries[1].range_start == datetime(2026, 4, 10, tzinfo=UTC)
+        # The day-chunk containing target_max (Apr 8) is re-MERGEd in full —
+        # this is the documented "always full chunks" cost: every restart
+        # re-aggregates the chunk overlapping target_max. Idempotent because
+        # the aggregation is deterministic over an append-only source.
+        assert len(queries) == 3
+        assert queries[0].range_start == datetime(2026, 4, 8, tzinfo=UTC)
+        assert queries[1].range_start == datetime(2026, 4, 9, tzinfo=UTC)
+        assert queries[2].range_start == datetime(2026, 4, 10, tzinfo=UTC)
+
+    async def test_chunk_size_increase_mid_backfill_remerges_partial_chunk(self):
+        # Operator changed full_refresh_chunk from "day" to "month" mid-backfill.
+        # target_max = Apr 15 (last committed day bucket). The April chunk
+        # contains uncommitted days (16-30) — under the old "snap to next
+        # chunk" math those days were silently dropped. Under floor-to-
+        # containing-chunk the entire April chunk is re-MERGEd in full at
+        # the new size, then May and June continue as full chunks.
+        view = make_view(full_refresh_chunk="month")
+        parsed = parse_view_query(view.query)
+        cursor = MockCursor(
+            stats={"processedRows": 50},
+            fetchall_responses=[
+                # source Apr 8 -> Jun 15
+                [_files_row("ts", "2026-04-08T10:00:00+00:00", "2026-06-15T15:00:00+00:00")],
+                # target day buckets through Apr 15 (was chunking by day pre-switch)
+                [_files_row("day", "2026-04-08T00:00:00+00:00", "2026-04-15T00:00:00+00:00")],
+            ],
+        )
+        queries = [
+            q
+            async for q in execute_refresh(
+                cursor,
+                view,
+                "iceberg.out.mv",
+                parsed,
+                ["volume"],
+            )
+        ]
+        assert len(queries) == 3
+        assert queries[0].range_start == datetime(2026, 4, 1, tzinfo=UTC)
+        assert queries[0].range_end == datetime(2026, 5, 1, tzinfo=UTC)
+        assert queries[1].range_start == datetime(2026, 5, 1, tzinfo=UTC)
+        assert queries[1].range_end == datetime(2026, 6, 1, tzinfo=UTC)
+        assert queries[2].range_start == datetime(2026, 6, 1, tzinfo=UTC)
+        assert queries[2].range_end == datetime(2026, 7, 1, tzinfo=UTC)
+
+    async def test_chunk_size_decrease_mid_backfill_remerges_partial_chunk(self):
+        # Operator changed full_refresh_chunk from "month" to "day" mid-backfill.
+        # target_max sits mid-day (minute buckets through Apr 30 12:00 — a
+        # monthly chunk was interrupted partway). The Apr 30 day-chunk is
+        # re-MERGEd in full, then May 1/2/3 continue as full day chunks.
+        view = make_view(
+            full_refresh_chunk="day",
+            query=("SELECT symbol, date_trunc('minute', ts) AS minute FROM iceberg.market_data.trades GROUP BY 1, 2"),
+        )
+        parsed = parse_view_query(view.query)
+        cursor = MockCursor(
+            stats={"processedRows": 50},
+            fetchall_responses=[
+                # source Apr 8 -> May 3
+                [_files_row("ts", "2026-04-08T10:00:00+00:00", "2026-05-03T15:00:00+00:00")],
+                # target minute buckets through Apr 30 12:00 (interrupted mid-month)
+                [_files_row("minute", "2026-04-08T00:00:00+00:00", "2026-04-30T12:00:00+00:00")],
+            ],
+        )
+        queries = [
+            q
+            async for q in execute_refresh(
+                cursor,
+                view,
+                "iceberg.out.mv",
+                parsed,
+                [],
+            )
+        ]
+        assert len(queries) == 4
+        assert queries[0].range_start == datetime(2026, 4, 30, tzinfo=UTC)
+        assert queries[0].range_end == datetime(2026, 5, 1, tzinfo=UTC)
+        assert queries[1].range_start == datetime(2026, 5, 1, tzinfo=UTC)
+        assert queries[2].range_start == datetime(2026, 5, 2, tzinfo=UTC)
+        assert queries[3].range_start == datetime(2026, 5, 3, tzinfo=UTC)
+        assert queries[3].range_end == datetime(2026, 5, 4, tzinfo=UTC)
 
     async def test_caller_can_break_early(self):
         """The whole point of the async generator: caller cancels by ``break``."""
@@ -267,7 +345,14 @@ class TestExecuteRefreshChunked:
         ]
         assert queries == []
 
-    async def test_fully_caught_up_target_emits_nothing(self):
+    async def test_fully_caught_up_target_remerges_last_chunk(self):
+        # Even when the target covers the whole source range, the chunk
+        # containing target_max gets re-MERGEd in full on the next tick.
+        # This is the documented "always full chunks" cost (see
+        # test_resume_from_target_bucket_max). Cheap for typical chunk
+        # sizes, and the alternative — branching on "is the containing
+        # chunk already complete?" — adds complexity without changing
+        # correctness.
         view = make_view(
             full_refresh_chunk="day",
             query=("SELECT symbol, date_trunc('minute', ts) AS minute FROM iceberg.market_data.trades GROUP BY 1, 2"),
@@ -290,7 +375,9 @@ class TestExecuteRefreshChunked:
                 [],
             )
         ]
-        assert queries == []
+        assert len(queries) == 1
+        assert queries[0].range_start == datetime(2026, 4, 10, tzinfo=UTC)
+        assert queries[0].range_end == datetime(2026, 4, 11, tzinfo=UTC)
 
 
 # ── execute_maintenance ──
