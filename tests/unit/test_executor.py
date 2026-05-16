@@ -1,6 +1,6 @@
 """Tests for the refresh executor."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from iceberg_ivm.config import ViewConfig
 from iceberg_ivm.executor import (
@@ -303,6 +303,104 @@ class TestExecuteRefreshChunked:
         assert queries[2].range_start == datetime(2026, 5, 2, tzinfo=UTC)
         assert queries[3].range_start == datetime(2026, 5, 3, tzinfo=UTC)
         assert queries[3].range_end == datetime(2026, 5, 4, tzinfo=UTC)
+
+    async def test_target_max_exactly_on_chunk_boundary_remerges_that_chunk(self):
+        # Edge case: target_max landing exactly on a chunk boundary still
+        # re-MERGEs that chunk (floor of a boundary is itself). Locks the
+        # "always full chunks" behavior at the boundary case.
+        view = make_view(full_refresh_chunk="day")
+        parsed = parse_view_query(view.query)
+        cursor = MockCursor(
+            stats={"processedRows": 1},
+            fetchall_responses=[
+                [_files_row("ts", "2026-04-08T10:00:00+00:00", "2026-04-10T15:00:00+00:00")],
+                # target has one day-bucket: Apr 8 (group-by is day). target_max
+                # = Apr 8 00:00, exactly the start of the Apr 8 chunk.
+                [_files_row("day", "2026-04-08T00:00:00+00:00", "2026-04-08T00:00:00+00:00")],
+            ],
+        )
+        queries = [
+            q
+            async for q in execute_refresh(
+                cursor,
+                view,
+                "iceberg.out.mv",
+                parsed,
+                ["volume"],
+            )
+        ]
+        assert len(queries) == 3
+        assert queries[0].range_start == datetime(2026, 4, 8, tzinfo=UTC)
+        assert queries[0].range_end == datetime(2026, 4, 9, tzinfo=UTC)
+
+    async def test_target_max_in_last_chunk_emits_that_chunk(self):
+        # target_max sits inside the last source-aligned chunk. The fix
+        # ensures we still emit that chunk; the old code would have
+        # snapped past `end` and emitted nothing, silently dropping the
+        # remaining buckets in that chunk.
+        view = make_view(
+            full_refresh_chunk="day",
+            query=("SELECT symbol, date_trunc('minute', ts) AS minute FROM iceberg.market_data.trades GROUP BY 1, 2"),
+        )
+        parsed = parse_view_query(view.query)
+        cursor = MockCursor(
+            stats={"processedRows": 1},
+            fetchall_responses=[
+                # source Apr 8 -> Apr 10 (so end = Apr 11)
+                [_files_row("ts", "2026-04-08T10:00:00+00:00", "2026-04-10T15:00:00+00:00")],
+                # target_max = Apr 10 06:00 (mid-day in the last source chunk)
+                [_files_row("minute", "2026-04-08T00:00:00+00:00", "2026-04-10T06:00:00+00:00")],
+            ],
+        )
+        queries = [
+            q
+            async for q in execute_refresh(
+                cursor,
+                view,
+                "iceberg.out.mv",
+                parsed,
+                [],
+            )
+        ]
+        assert len(queries) == 1
+        assert queries[0].range_start == datetime(2026, 4, 10, tzinfo=UTC)
+        assert queries[0].range_end == datetime(2026, 4, 11, tzinfo=UTC)
+
+    async def test_no_group_by_bucket_dropped_when_coarsening_chunk_size(self):
+        # Property: every GROUP BY bucket between target_max and source_max
+        # appears in exactly one emitted range. This is the no-silent-data-
+        # skip invariant. Asserts coverage rather than a specific chunk list
+        # so a future refactor that produces a different-but-equivalent
+        # chunk plan still passes — only a regression that drops buckets
+        # fails.
+        view = make_view(full_refresh_chunk="month")  # day -> month coarsen
+        parsed = parse_view_query(view.query)
+        cursor = MockCursor(
+            stats={"processedRows": 50},
+            fetchall_responses=[
+                [_files_row("ts", "2026-04-08T10:00:00+00:00", "2026-06-15T15:00:00+00:00")],
+                # target day-chunked through Apr 15 (so target_max = Apr 15,
+                # first uncommitted day = Apr 16)
+                [_files_row("day", "2026-04-08T00:00:00+00:00", "2026-04-15T00:00:00+00:00")],
+            ],
+        )
+        queries = [
+            q
+            async for q in execute_refresh(
+                cursor,
+                view,
+                "iceberg.out.mv",
+                parsed,
+                ["volume"],
+            )
+        ]
+        first_uncommitted_day = datetime(2026, 4, 16, tzinfo=UTC)
+        source_max_day = datetime(2026, 6, 15, tzinfo=UTC)
+        d = first_uncommitted_day
+        while d <= source_max_day:
+            covered = sum(1 for q in queries if q.range_start <= d < q.range_end)
+            assert covered == 1, f"day {d.date()} covered by {covered} ranges (expected 1)"
+            d += timedelta(days=1)
 
     async def test_caller_can_break_early(self):
         """The whole point of the async generator: caller cancels by ``break``."""
