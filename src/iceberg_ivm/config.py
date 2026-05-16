@@ -91,11 +91,8 @@ class ViewConfig:
     target_table: str
     target_partitioning: str | None = None
     refresh_interval_seconds: int = 60
-    # Upper bound on a single refresh's wall-clock duration. ``None`` → no
-    # timeout (legacy behaviour); a positive int wraps the refresh body in
-    # ``asyncio.timeout(...)`` so a wedged Trino coordinator can't hang the
-    # worker indefinitely. Counted from the start of the refresh and covers
-    # detection + every MERGE + maintenance for that tick.
+    # Max wall-clock seconds for one refresh tick (detection + every MERGE +
+    # maintenance). None disables the timeout.
     query_timeout_seconds: int | None = None
     # Granularity string ("day", "month", …) controlling the size of each
     # chunk in the first-run chunked backfill. ``None`` → legacy single-shot

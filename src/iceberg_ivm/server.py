@@ -8,7 +8,7 @@ import logging
 import os
 import time
 import typing
-from contextlib import AsyncExitStack, asynccontextmanager, nullcontext, suppress
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
@@ -371,178 +371,154 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
     cursor = await conn.cursor()
     vs = s.view_statuses.setdefault(view.name, ViewStatus(name=view.name))
 
-    # ``query_timeout_seconds`` bounds the *entire* refresh tick (detection +
-    # every MERGE + maintenance). On expiry, asyncio.timeout injects a
-    # CancelledError mid-flight; the shielded conn.close in the outer finally
-    # still runs, and the __aexit__ then converts it to TimeoutError which the
-    # outer except picks up and records as a normal refresh failure.
-    timeout_cm = (
-        asyncio.timeout(view.query_timeout_seconds) if view.query_timeout_seconds is not None else nullcontext()
-    )
-
     try:
-        async with timeout_cm:
-            await _refresh_view_body(s, view, conn, cursor, vs)
+        # asyncio.timeout(None) is a documented no-op, so no None-branch needed.
+        async with asyncio.timeout(view.query_timeout_seconds):
+            parsed = parse_view_query(view.query)
+            target_table = view.target_table
+
+            # Create target on first run (unpartitioned by default; see #22).
+            columns = await discover_columns(cursor, view.query)
+            await cursor.execute(
+                build_create_table_sql(
+                    target_table,
+                    columns,
+                    view.target_partitioning,
+                )
+            )
+            value_columns = [c.name for c in columns if c.name not in parsed.merge_keys]
+
+            last_snap = await s.history.get_last_source_snapshot(view.name) if s.history is not None else None
+
+            t0 = time.monotonic()
+            result = await detect_changes(
+                cursor,
+                parsed.source_table,
+                parsed.filter_column,
+                parsed.granularity,
+                last_snap,
+            )
+            DETECTION_DURATION.labels(view=view.name).observe(time.monotonic() - t0)
+            log.info("%s: detection → %s (%.3fs)", view.name, result.action.name, time.monotonic() - t0)
+            if result.current_snapshot is not None:
+                SOURCE_SNAPSHOT.labels(view=view.name).set(result.current_snapshot)
+
+            if result.action == RefreshAction.NO_CHANGE:
+                vs.last_action = "skip"
+                # Clear any lingering in-flight chunked-backfill progress that may
+                # have been hydrated from view_status after a mid-backfill restart.
+                # If the source has caught up while iceberg-ivm was down, the
+                # next tick is NO_CHANGE — but the persisted chunks_total would
+                # still claim a backfill is in flight. The committed bookmark
+                # (last_source_snapshot) is the source of truth here.
+                vs.chunks_total = None
+                vs.chunks_done = 0
+                REFRESH_TOTAL.labels(view=view.name, type="skip").inc()
+                # Advance state past empty-append / compaction-only snapshots so
+                # we don't re-detect them every cycle.
+                if (
+                    result.current_snapshot is not None
+                    and result.current_snapshot != last_snap
+                    and s.history is not None
+                ):
+                    await s.history.set_last_source_snapshot(view.name, result.current_snapshot)
+                await _persist_view_status(s, view.name, vs)
+                await maintain_view(s, view, conn, target_table)
+                return
+
+            # Set vs.last_action up-front so /api/views reflects what's running,
+            # not what last finished — matters for multi-hour chunked backfills.
+            chunked = result.action == RefreshAction.FULL_REFRESH and view.full_refresh_chunk
+            if result.action == RefreshAction.FULL_REFRESH:
+                vs.last_action = "chunked_full" if chunked else "full"
+                vs.chunks_done = 0
+                vs.chunks_total = None
+            else:
+                vs.last_action = "incremental"
+
+            incremental_range = result.filter_range if result.action == RefreshAction.INCREMENTAL else None
+            total_elapsed = 0.0
+            total_rows = 0
+            total_bytes = 0
+            total_queries = 0
+
+            async for q in execute_refresh(
+                cursor,
+                view,
+                target_table,
+                parsed,
+                value_columns,
+                incremental_range=incremental_range,
+            ):
+                total_elapsed += q.elapsed_ms / 1000.0
+                total_rows += q.processed_rows
+                total_bytes += q.processed_bytes
+                total_queries += 1
+                vs.last_refresh = time.time()
+                vs.last_duration = q.elapsed_ms / 1000.0
+                vs.last_error = None
+                vs.last_range = f"[{q.range_start}, {q.range_end})"
+                # Keep chunks_done aligned with chunks_total: a non-chunked
+                # single-shot still arrives with q.chunks_done=1, q.chunks_total=1,
+                # and persisting "1/None" creates phantom progress in the UI.
+                if q.chunks_total > 1:
+                    vs.chunks_done = q.chunks_done
+                    vs.chunks_total = q.chunks_total
+                else:
+                    vs.chunks_done = 0
+                    vs.chunks_total = None
+                await _record_query(s, view.name, vs, q)
+                await _persist_view_status(s, view.name, vs)
+                if q.chunks_total > 1:
+                    CHUNKS_COMPLETED.labels(view=view.name).inc()
+                    CHUNK_DURATION.labels(view=view.name).observe(q.elapsed_ms / 1000.0)
+                    CHUNK_ROWS.labels(view=view.name).inc(q.processed_rows)
+                if s.stop_event.is_set():
+                    # Graceful shutdown mid-backfill — leave last_source_snapshot
+                    # unset so the next tick resumes from target metadata.
+                    log.info("%s: refresh interrupted after chunk %d/%d", view.name, q.chunks_done, q.chunks_total)
+                    return
+
+            # Non-chunked paths (full or incremental) and completed chunked backfills
+            # commit the source snapshot bookmark. Empty chunked runs (source empty,
+            # or fully caught up) also advance state — total_queries == 0 is fine.
+            REFRESH_TOTAL.labels(view=view.name, type="incremental" if incremental_range else "full").inc()
+            if s.history is not None:
+                await s.history.set_last_source_snapshot(view.name, result.current_snapshot)
+            vs.total_refreshes += 1
+            # Clear the "in-flight" marker on clean completion. Leave chunks_done
+            # at its last value so the UI can show "12/12 done" alongside total
+            # counters until the next tick overwrites it.
+            vs.chunks_total = None
+            REFRESH_DURATION.labels(view=view.name).observe(total_elapsed)
+            REFRESH_LAST_SUCCESS.labels(view=view.name).set(vs.last_refresh or time.time())
+            REFRESH_BYTES.labels(view=view.name).inc(total_bytes)
+            REFRESH_ROWS.labels(view=view.name).inc(total_rows)
+            await _persist_view_status(s, view.name, vs)
+            await maintain_view(s, view, conn, target_table)
+
     except TimeoutError:
         vs.last_error = f"refresh exceeded query_timeout_seconds={view.query_timeout_seconds}"
         vs.total_errors += 1
         REFRESH_ERRORS.labels(view=view.name).inc()
-        log.warning(
-            "%s: refresh timed out after %ds",
-            view.name,
-            view.query_timeout_seconds,
-        )
+        log.warning("%s: refresh timed out after %ds", view.name, view.query_timeout_seconds)
         await _persist_view_status(s, view.name, vs)
-    finally:
-        # Shield the close so a task cancellation mid-execute (e.g. delete_view
-        # cancelling its worker) doesn't cancel the close itself and leak the
-        # underlying Trino connection. CancelledError must propagate so the
-        # task actually finishes cancelling; only swallow non-cancellation
-        # close failures.
-        try:
-            await asyncio.shield(conn.close())
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("%s: conn.close failed", view.name)
-
-
-async def _refresh_view_body(
-    s: AppState,
-    view: ViewConfig,
-    conn,
-    cursor,
-    vs: ViewStatus,
-) -> None:
-    """Refresh body extracted so :func:`refresh_view` can wrap it in an
-    ``asyncio.timeout`` + ``TimeoutError`` handler without duplicating the
-    existing ``Exception`` handler. Not part of the public surface."""
-    try:
-        parsed = parse_view_query(view.query)
-        target_table = view.target_table
-
-        # Create target on first run (unpartitioned by default; see #22).
-        columns = await discover_columns(cursor, view.query)
-        await cursor.execute(
-            build_create_table_sql(
-                target_table,
-                columns,
-                view.target_partitioning,
-            )
-        )
-        value_columns = [c.name for c in columns if c.name not in parsed.merge_keys]
-
-        last_snap = await s.history.get_last_source_snapshot(view.name) if s.history is not None else None
-
-        t0 = time.monotonic()
-        result = await detect_changes(
-            cursor,
-            parsed.source_table,
-            parsed.filter_column,
-            parsed.granularity,
-            last_snap,
-        )
-        DETECTION_DURATION.labels(view=view.name).observe(time.monotonic() - t0)
-        log.info("%s: detection → %s (%.3fs)", view.name, result.action.name, time.monotonic() - t0)
-        if result.current_snapshot is not None:
-            SOURCE_SNAPSHOT.labels(view=view.name).set(result.current_snapshot)
-
-        if result.action == RefreshAction.NO_CHANGE:
-            vs.last_action = "skip"
-            # Clear any lingering in-flight chunked-backfill progress that may
-            # have been hydrated from view_status after a mid-backfill restart.
-            # If the source has caught up while iceberg-ivm was down, the
-            # next tick is NO_CHANGE — but the persisted chunks_total would
-            # still claim a backfill is in flight. The committed bookmark
-            # (last_source_snapshot) is the source of truth here.
-            vs.chunks_total = None
-            vs.chunks_done = 0
-            REFRESH_TOTAL.labels(view=view.name, type="skip").inc()
-            # Advance state past empty-append / compaction-only snapshots so
-            # we don't re-detect them every cycle.
-            if result.current_snapshot is not None and result.current_snapshot != last_snap and s.history is not None:
-                await s.history.set_last_source_snapshot(view.name, result.current_snapshot)
-            await _persist_view_status(s, view.name, vs)
-            await maintain_view(s, view, conn, target_table)
-            return
-
-        # Set vs.last_action up-front so /api/views reflects what's running,
-        # not what last finished — matters for multi-hour chunked backfills.
-        chunked = result.action == RefreshAction.FULL_REFRESH and view.full_refresh_chunk
-        if result.action == RefreshAction.FULL_REFRESH:
-            vs.last_action = "chunked_full" if chunked else "full"
-            vs.chunks_done = 0
-            vs.chunks_total = None
-        else:
-            vs.last_action = "incremental"
-
-        incremental_range = result.filter_range if result.action == RefreshAction.INCREMENTAL else None
-        total_elapsed = 0.0
-        total_rows = 0
-        total_bytes = 0
-        total_queries = 0
-
-        async for q in execute_refresh(
-            cursor,
-            view,
-            target_table,
-            parsed,
-            value_columns,
-            incremental_range=incremental_range,
-        ):
-            total_elapsed += q.elapsed_ms / 1000.0
-            total_rows += q.processed_rows
-            total_bytes += q.processed_bytes
-            total_queries += 1
-            vs.last_refresh = time.time()
-            vs.last_duration = q.elapsed_ms / 1000.0
-            vs.last_error = None
-            vs.last_range = f"[{q.range_start}, {q.range_end})"
-            # Keep chunks_done aligned with chunks_total: a non-chunked
-            # single-shot still arrives with q.chunks_done=1, q.chunks_total=1,
-            # and persisting "1/None" creates phantom progress in the UI.
-            if q.chunks_total > 1:
-                vs.chunks_done = q.chunks_done
-                vs.chunks_total = q.chunks_total
-            else:
-                vs.chunks_done = 0
-                vs.chunks_total = None
-            await _record_query(s, view.name, vs, q)
-            await _persist_view_status(s, view.name, vs)
-            if q.chunks_total > 1:
-                CHUNKS_COMPLETED.labels(view=view.name).inc()
-                CHUNK_DURATION.labels(view=view.name).observe(q.elapsed_ms / 1000.0)
-                CHUNK_ROWS.labels(view=view.name).inc(q.processed_rows)
-            if s.stop_event.is_set():
-                # Graceful shutdown mid-backfill — leave last_source_snapshot
-                # unset so the next tick resumes from target metadata.
-                log.info("%s: refresh interrupted after chunk %d/%d", view.name, q.chunks_done, q.chunks_total)
-                return
-
-        # Non-chunked paths (full or incremental) and completed chunked backfills
-        # commit the source snapshot bookmark. Empty chunked runs (source empty,
-        # or fully caught up) also advance state — total_queries == 0 is fine.
-        REFRESH_TOTAL.labels(view=view.name, type="incremental" if incremental_range else "full").inc()
-        if s.history is not None:
-            await s.history.set_last_source_snapshot(view.name, result.current_snapshot)
-        vs.total_refreshes += 1
-        # Clear the "in-flight" marker on clean completion. Leave chunks_done
-        # at its last value so the UI can show "12/12 done" alongside total
-        # counters until the next tick overwrites it.
-        vs.chunks_total = None
-        REFRESH_DURATION.labels(view=view.name).observe(total_elapsed)
-        REFRESH_LAST_SUCCESS.labels(view=view.name).set(vs.last_refresh or time.time())
-        REFRESH_BYTES.labels(view=view.name).inc(total_bytes)
-        REFRESH_ROWS.labels(view=view.name).inc(total_rows)
-        await _persist_view_status(s, view.name, vs)
-        await maintain_view(s, view, conn, target_table)
-
     except Exception as e:
         vs.last_error = str(e)
         vs.total_errors += 1
         REFRESH_ERRORS.labels(view=view.name).inc()
         log.exception("%s: refresh failed", view.name)
         await _persist_view_status(s, view.name, vs)
+    finally:
+        # Shield the close so a task cancellation mid-execute doesn't cancel
+        # the close itself and leak the Trino connection. Re-raise CancelledError
+        # so the task actually finishes cancelling.
+        try:
+            await asyncio.shield(conn.close())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("%s: conn.close failed", view.name)
 
 
 async def view_worker(s: AppState, name: str) -> None:
@@ -691,10 +667,9 @@ async def lifespan(app: FastAPI):
         reload_config(s)
         app.state.s = s
 
-    # Resource ordering is encoded by AsyncExitStack registration order:
-    # the stack unwinds LIFO, so we want history.close() *last* (after the
-    # TaskGroup has drained the supervisor) and stop_event.set() *first*
-    # (so the supervisor notices shutdown before the TaskGroup awaits it).
+    # Unwind order matters: stop_event.set must run before the TaskGroup
+    # drains so the supervisor exits cleanly. Stack registration is LIFO,
+    # hence: history.close first, TaskGroup second, stop_event last.
     async with AsyncExitStack() as stack:
         if s.history is None and s.config is not None:
             db_path = resolve_state_db_path(
@@ -778,20 +753,14 @@ _FIELD_META: dict[str, dict] = {
     "target_partitioning": {"group": "target", "placeholder": "ARRAY['day(minute)']", "help": "unpartitioned if blank"},
     "refresh_interval_seconds": {"min": 1, "suffix": "seconds", "label": "Refresh Interval"},
     "query_timeout_seconds": {
-        # ``type`` is set explicitly because ``_build_form_schema``'s default
-        # inference checks ``t is int`` against the resolved annotation, and
-        # ``int | None`` resolves to a ``types.UnionType`` (not ``int``), so
-        # the field would otherwise render as a text input.
+        # Set explicitly: ``_build_form_schema``'s inference resolves
+        # ``int | None`` to ``types.UnionType``, not ``int``, and would
+        # otherwise render this as a text input.
         "type": "number",
         "min": 1,
         "suffix": "seconds",
         "label": "Query Timeout",
-        "help": (
-            "Optional. Bounds the wall-clock duration of a single refresh "
-            "tick (detection + every MERGE + maintenance). Leave blank for "
-            "no timeout. Useful when a wedged Trino coordinator would "
-            "otherwise hang the worker indefinitely."
-        ),
+        "help": "Optional. Max wall-clock seconds for a single refresh tick. Leave blank for no timeout.",
     },
     "full_refresh_chunk": {
         "type": "select",

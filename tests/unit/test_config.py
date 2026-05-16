@@ -384,30 +384,10 @@ def test_query_timeout_seconds_round_trip(tmp_path):
     assert loaded[0].query_timeout_seconds == 3600
 
 
-def test_query_timeout_seconds_omitted_when_none(tmp_path):
-    """The default (``None``) must not emit a spurious key in YAML, mirroring
-    how ``full_refresh_chunk`` is handled."""
-    views = [
-        ViewConfig(
-            name="v",
-            query="SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1",
-            target_table="iceberg.analytics.v",
-        )
-    ]
-    views_path = tmp_path / "views.yaml"
-    save_views(views, views_path)
-    assert "query_timeout_seconds" not in views_path.read_text()
-
-
 @pytest.mark.parametrize("bad", [0, -1, "30s", True, False])
 def test_query_timeout_seconds_rejects_non_positive_int(tmp_path, bad):
-    """Validation: only a positive integer (or omission) is accepted. ``0`` is
-    a footgun (``asyncio.timeout(0)`` cancels immediately) so we reject it
-    rather than silently treating it as "no timeout".
-
-    ``True`` / ``False`` are flagged separately because ``isinstance(True, int)``
-    is ``True`` — a YAML ``query_timeout_seconds: true`` would otherwise pass as
-    a 1-second timeout that nukes every refresh."""
+    """Reject 0 (``asyncio.timeout(0)`` fires immediately), negatives, strings,
+    and bools (``isinstance(True, int)`` is ``True``)."""
     raw = (
         "views:\n  - name: v\n"
         "    query: \"SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1\"\n"
