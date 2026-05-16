@@ -157,7 +157,9 @@ async def _backfill_ranges(
         # emitted range is a full chunk. The containing chunk is re-MERGEd
         # in full — idempotent over an append-only source — which makes
         # mid-flight changes to full_refresh_chunk gap-free without a
-        # special path. Cost: one redundant chunk per restart.
+        # special path. Cost: when an interrupted chunked backfill resumes,
+        # the chunk containing target_max is re-MERGEd even if previously
+        # completed — one wasted chunk per resumption, idempotent so safe.
         start = expand_to_bucket_bounds(target_max, target_max, view.full_refresh_chunk)[0]
     return list(walk_buckets(start, end, view.full_refresh_chunk))
 
