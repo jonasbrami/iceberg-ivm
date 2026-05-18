@@ -917,7 +917,11 @@ def rewrite_info_uri(info_uri: str, internal_url: str, public_url: str) -> str:
         return info_uri
     internal = internal_url.rstrip("/")
     public = public_url.rstrip("/")
-    if info_uri.startswith(internal):
+    # Require a path boundary so an internal URL of `http://trino:8080`
+    # doesn't accidentally match `http://trino:8080xyz/…`. Trino's real
+    # info_uris always carry a path, but the helper is part of the module
+    # API and a stricter check is cheap insurance.
+    if info_uri == internal or info_uri.startswith(internal + "/"):
         return public + info_uri[len(internal) :]
     return info_uri
 
