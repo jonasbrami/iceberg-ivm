@@ -69,6 +69,13 @@ services:
         condition: service_completed_successfully
     environment:
       TRINO_URL: http://trino:8080
+      # The orchestrator stores the info_uri Trino returns for each query and
+      # exposes it as a deep-link in the UI. Trino derives info_uri from the
+      # client's request URL, so without this override the deep-link points
+      # at the docker-internal hostname `trino:8080`, which doesn't resolve
+      # from the user's browser. Pointing public_url at the published port
+      # makes the link reachable from the host.
+      TRINO_PUBLIC_URL: http://localhost:28080
       TRINO_USER: iceberg-ivm
     volumes:
       - ./config.yaml:/data/config.yaml

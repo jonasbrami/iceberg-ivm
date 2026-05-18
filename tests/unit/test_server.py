@@ -10,8 +10,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 from iceberg_ivm.config import Config, load_config, load_views
+from iceberg_ivm.executor import QueryInfo
 from iceberg_ivm.query_history import QueryHistory
-from iceberg_ivm.server import RECENT_QUERY_LIMIT, AppState, ViewStatus, app
+from iceberg_ivm.server import (
+    RECENT_QUERY_LIMIT,
+    AppState,
+    ViewStatus,
+    app,
+    rewrite_info_uri,
+)
 
 STATIC_CONFIG_YAML = textwrap.dedent("""\
     trino:
@@ -83,6 +90,98 @@ def test_health(client):
 
 def test_metrics(client):
     assert "mv_views_configured" in client.get("/metrics").text
+
+
+# ── rewrite_info_uri ──
+
+
+@pytest.mark.parametrize(
+    "info_uri,internal,public,expected",
+    [
+        # Happy path: docker-internal hostname rewritten to host-facing one
+        (
+            "http://trino:8080/ui/query.html?20260518_085528_00970_atxqy",
+            "http://trino:8080",
+            "http://localhost:28080",
+            "http://localhost:28080/ui/query.html?20260518_085528_00970_atxqy",
+        ),
+        # Trailing slash on configured URLs should not duplicate the slash
+        (
+            "http://trino:8080/ui/query.html?q",
+            "http://trino:8080/",
+            "http://localhost:28080/",
+            "http://localhost:28080/ui/query.html?q",
+        ),
+        # Scheme upgrade: orchestrator talks plain HTTP, browser uses HTTPS
+        (
+            "http://trino:8080/ui/query.html?q",
+            "http://trino:8080",
+            "https://trino.public.example.com",
+            "https://trino.public.example.com/ui/query.html?q",
+        ),
+    ],
+)
+def test_rewrite_info_uri_swaps_internal_prefix(info_uri, internal, public, expected):
+    """Rewrite swaps the configured internal Trino prefix with the public one."""
+    assert rewrite_info_uri(info_uri, internal, public) == expected
+
+
+def test_rewrite_info_uri_is_noop_when_urls_match():
+    """If internal == public there is nothing to rewrite."""
+    same = "http://localhost:8080"
+    uri = "http://localhost:8080/ui/query.html?q"
+    assert rewrite_info_uri(uri, same, same) == uri
+
+
+def test_rewrite_info_uri_passes_through_unrelated_urls():
+    """Don't munge info_uris that don't share the internal prefix — the
+    orchestrator must not pretend to fix arbitrary URLs."""
+    assert (
+        rewrite_info_uri(
+            "http://something-else:9999/ui/query.html?q",
+            "http://trino:8080",
+            "http://localhost:28080",
+        )
+        == "http://something-else:9999/ui/query.html?q"
+    )
+
+
+def test_rewrite_info_uri_empty_in_empty_out():
+    """An empty info_uri (older Trino client / failed query) is returned as-is
+    so the UI's existing "non-clickable when blank" rendering still works."""
+    assert rewrite_info_uri("", "http://trino:8080", "http://localhost:28080") == ""
+
+
+# ── /api/views info_uri rewrite integration ──
+
+
+def test_list_views_rewrites_recent_query_info_uri(setup_state, client, monkeypatch):
+    """When TRINO_PUBLIC_URL differs from TRINO_URL, /api/views must rewrite
+    recent_queries[*].info_uri to the public URL so the UI's Trino-deep-link is
+    reachable from the user's browser."""
+    monkeypatch.setenv("TRINO_PUBLIC_URL", "http://localhost:28080")
+    # Reload static cfg with the new env so AppState picks it up
+    static_cfg = load_config(setup_state.config_path)
+    setup_state.config = Config(
+        trino=static_cfg.trino,
+        views=setup_state.config.views,
+        server=static_cfg.server,
+    )
+
+    vs = setup_state.view_statuses["test_view"]
+    vs.recent_queries = [
+        QueryInfo(
+            query_id="20260518_085528_00970_atxqy",
+            info_uri="http://localhost:8080/ui/query.html?20260518_085528_00970_atxqy",
+            stage="merge",
+            started_at=1.0,
+            elapsed_ms=12.0,
+        ),
+    ]
+
+    body = client.get("/api/views").json()
+    queries = body[0]["status"]["recent_queries"]
+    assert queries[0]["info_uri"] == "http://localhost:28080/ui/query.html?20260518_085528_00970_atxqy"
 
 
 def test_view_schema(client):

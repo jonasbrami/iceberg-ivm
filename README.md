@@ -252,9 +252,10 @@ per-environment deployments only need to set a few env vars.
 
 | Variable | Required | Notes |
 |---|---|---|
-| `TRINO_URL` | yes | Coordinator URL, e.g. `http://trino:8080` or `https://trino.prod:8443`. Scheme determines `http` vs `https`. |
+| `TRINO_URL` | yes | Coordinator URL the orchestrator uses to reach Trino, e.g. `http://trino:8080` or `https://trino.prod:8443`. Scheme determines `http` vs `https`. |
 | `TRINO_USER` | yes | Trino username. |
 | `TRINO_PASSWORD` | no | BasicAuth password. Omit (or leave empty) for anonymous access — e.g. the local dev compose stack. |
+| `TRINO_PUBLIC_URL` | no | Browser-reachable Trino URL used to rewrite the per-query `info_uri` deep-links in the UI. Defaults to `TRINO_URL`. Set when the orchestrator and the user's browser reach Trino over different hostnames (e.g. `http://trino:8080` inside docker vs `http://localhost:28080` from the host). |
 
 The service refuses to start if `TRINO_URL` or `TRINO_USER` is missing.
 

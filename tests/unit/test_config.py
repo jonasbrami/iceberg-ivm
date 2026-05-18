@@ -121,6 +121,40 @@ def test_yaml_host_port_user_are_not_accepted(tmp_path):
     assert cfg.trino.user == "test"
 
 
+def test_trino_public_url_defaults_to_trino_url(tmp_path, monkeypatch):
+    """When TRINO_PUBLIC_URL is not set, public_url falls back to url.
+
+    Most deployments connect the orchestrator and the user's browser to the
+    same Trino endpoint; only docker-compose-style topologies need a split.
+    """
+    monkeypatch.delenv("TRINO_PUBLIC_URL", raising=False)
+    cfg = load_config(write_config(tmp_path, STATIC_CONFIG))
+    assert cfg.trino.url == "http://localhost:8080"
+    assert cfg.trino.public_url == "http://localhost:8080"
+
+
+def test_trino_public_url_overrides_when_set(tmp_path, monkeypatch):
+    """TRINO_PUBLIC_URL, when set, lands on public_url.  url is untouched.
+
+    Trino derives query info_uris from the *client's* request URL — so when
+    the orchestrator reaches Trino over a docker-internal hostname, the
+    info_uri points at that internal hostname.  Splitting public_url from
+    url lets the orchestrator rewrite info_uris to a browser-reachable URL
+    when serving /api/views.
+    """
+    monkeypatch.setenv("TRINO_PUBLIC_URL", "http://localhost:28080")
+    cfg = load_config(write_config(tmp_path, STATIC_CONFIG))
+    assert cfg.trino.url == "http://localhost:8080"
+    assert cfg.trino.public_url == "http://localhost:28080"
+
+
+def test_trino_public_url_empty_treated_as_missing(tmp_path, monkeypatch):
+    """TRINO_PUBLIC_URL='' (empty string) collapses to the TRINO_URL fallback."""
+    monkeypatch.setenv("TRINO_PUBLIC_URL", "")
+    cfg = load_config(write_config(tmp_path, STATIC_CONFIG))
+    assert cfg.trino.public_url == "http://localhost:8080"
+
+
 # ── load_views ──
 
 

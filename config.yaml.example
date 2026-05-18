@@ -12,9 +12,13 @@ server:
 # variables — *never* from this file. No defaults; iceberg-ivm
 # refuses to start without them.
 #
-#   TRINO_URL       e.g. "http://trino:8080" (required)
-#   TRINO_USER      e.g. "iceberg-ivm"       (required)
-#   TRINO_PASSWORD  BasicAuth password        (optional — omit for anonymous)
+#   TRINO_URL         e.g. "http://trino:8080" (required)
+#   TRINO_USER        e.g. "iceberg-ivm"       (required)
+#   TRINO_PASSWORD    BasicAuth password        (optional — omit for anonymous)
+#   TRINO_PUBLIC_URL  Browser-reachable Trino URL used to rewrite per-query
+#                     info_uri deep-links in the UI (optional — defaults to
+#                     TRINO_URL). Set when the orchestrator and the user's
+#                     browser reach Trino over different hostnames.
 #
 # Only `catalog` and `schema` (the per-deployment Trino catalog + target
 # schema — not secrets) live in this file.

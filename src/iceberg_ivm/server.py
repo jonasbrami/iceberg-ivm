@@ -22,6 +22,7 @@ from pydantic import BaseModel, create_model, field_validator
 
 from iceberg_ivm.config import (
     Config,
+    TrinoConfig,
     ViewConfig,
     load_config,
     load_views,
@@ -897,14 +898,42 @@ class ViewResponse(BaseModel):
     status: dict | None = None
 
 
-def _view_to_response(v: ViewConfig, vs: ViewStatus | None) -> ViewResponse:
+def rewrite_info_uri(info_uri: str, internal_url: str, public_url: str) -> str:
+    """Return ``info_uri`` with its ``internal_url`` prefix replaced by ``public_url``.
+
+    Trino derives the per-query ``infoUri`` it returns from the *client's*
+    request URL, so when the orchestrator and the user's browser talk to
+    Trino over different hostnames (e.g. ``trino:8080`` inside a docker
+    network vs ``localhost:28080`` from the host), the deep-link in the UI's
+    recent-queries panel is unreachable. Rewriting at the response boundary
+    fixes the link without coupling the orchestrator's egress URL to its
+    user-facing URL.
+
+    No-ops when ``info_uri`` is empty, when the URLs match (single-host
+    deployments), or when ``info_uri`` does not start with ``internal_url``
+    (don't munge arbitrary URLs).
+    """
+    if not info_uri or internal_url == public_url:
+        return info_uri
+    internal = internal_url.rstrip("/")
+    public = public_url.rstrip("/")
+    if info_uri.startswith(internal):
+        return public + info_uri[len(internal) :]
+    return info_uri
+
+
+def _view_to_response(v: ViewConfig, vs: ViewStatus | None, trino: TrinoConfig | None = None) -> ViewResponse:
     parsed = parse_view_query(v.query)
     data = {f.name: getattr(v, f.name) for f in dataclasses.fields(ViewConfig)}
+    status_dict: dict | None = dataclasses.asdict(vs) if vs else None
+    if status_dict and trino is not None and trino.public_url and trino.public_url != trino.url:
+        for q in status_dict.get("recent_queries") or ():
+            q["info_uri"] = rewrite_info_uri(q.get("info_uri") or "", trino.url, trino.public_url)
     return ViewResponse(
         source_table=parsed.source_table,
         filter_column=parsed.filter_column,
         merge_keys=parsed.merge_keys,
-        status=dataclasses.asdict(vs) if vs else None,
+        status=status_dict,
         **data,
     )
 
@@ -935,7 +964,8 @@ def metrics():
 def list_views(s: AppState = Depends(get_app_state)) -> list[ViewResponse]:
     if not s.config:
         return []
-    return [_view_to_response(v, s.view_statuses.get(v.name)) for v in s.config.views]
+    trino = s.config.trino
+    return [_view_to_response(v, s.view_statuses.get(v.name), trino) for v in s.config.views]
 
 
 class ParseRequest(BaseModel):
@@ -1014,7 +1044,7 @@ def create_view(
     VIEWS_CONFIGURED.set(len(new_views))
     log.info("created view %r via API", name)
 
-    return _view_to_response(new_view, s.view_statuses[name])
+    return _view_to_response(new_view, s.view_statuses[name], s.config.trino)
 
 
 @app.put("/api/views/{name}")
@@ -1060,7 +1090,7 @@ def update_view(
     s.views_mtime = s.views_path.stat().st_mtime
     log.info("updated view %r via API", name)
 
-    return _view_to_response(updated, s.view_statuses.get(name))
+    return _view_to_response(updated, s.view_statuses.get(name), s.config.trino)
 
 
 @app.delete("/api/views/{name}", status_code=204)
