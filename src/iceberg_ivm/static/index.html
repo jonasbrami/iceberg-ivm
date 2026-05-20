@@ -521,11 +521,13 @@
                     @input="field.name === 'query' && scheduleParse()"
                     :rows="field.rows || 6"
                     :placeholder="field.placeholder"
+                    :disabled="field.disabled_on_edit && editingView !== null"
                     class="w-full bg-white border border-[rgba(15,15,30,0.12)] rounded-[10px]
                            px-3 py-[10px] text-[12px] font-mono text-[#1a1a28] placeholder-[#b8b8c8]
                            leading-[1.75] resize-y
                            focus:outline-none focus:border-indigo-500/55
                            focus:ring-2 focus:ring-indigo-500/[0.14]
+                           disabled:opacity-40 disabled:cursor-not-allowed
                            transition-[border-color,box-shadow] duration-150"></textarea>
 
                   <!-- Live parse panel — only shown for the query field -->
