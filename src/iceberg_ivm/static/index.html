@@ -829,6 +829,12 @@ function app() {
         if (f.type === 'boolean') {
           body[f.name] = !!raw;
         } else if (f.type === 'number') {
+          // Alpine's `x-model.number` turns empty inputs into `null`, which
+          // Pydantic rejects with a 422 on int fields like
+          // `maintenance_interval_seconds: int = 0`. Omit the field entirely
+          // so the server-side default kicks in. Required numeric fields are
+          // already guarded by validateForm() before we get here.
+          if (raw === null || raw === undefined || raw === '') continue;
           body[f.name] = raw;
         } else if (f.required) {
           body[f.name] = raw;
@@ -864,12 +870,32 @@ function app() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
-        if (!res.ok) { const e = await res.json(); throw new Error(e.detail); }
+        if (!res.ok) {
+          const e = await res.json().catch(() => ({}));
+          throw new Error(this._formatErrorDetail(e.detail, res.statusText));
+        }
         this.showForm = false;
         await this.loadViews();
       } catch (e) {
         this.formError = e.message;
       }
+    },
+
+    _formatErrorDetail(detail, fallback) {
+      // FastAPI returns either a plain string (HTTPException) or an array of
+      // {loc, msg, type, ctx} (Pydantic validation). new Error([obj]) would
+      // render as "[object Object]" — flatten to a human-readable string.
+      if (!detail) return fallback || 'request failed';
+      if (typeof detail === 'string') return detail;
+      if (Array.isArray(detail)) {
+        return detail
+          .map(d => {
+            const loc = Array.isArray(d.loc) ? d.loc.slice(1).join('.') : '';
+            return loc ? `${loc}: ${d.msg}` : (d.msg || JSON.stringify(d));
+          })
+          .join('; ');
+      }
+      return JSON.stringify(detail);
     },
 
     async deleteView(name) {
