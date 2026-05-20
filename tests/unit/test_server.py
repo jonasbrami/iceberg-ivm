@@ -10,8 +10,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 from iceberg_ivm.config import Config, load_config, load_views
+from iceberg_ivm.executor import QueryInfo
 from iceberg_ivm.query_history import QueryHistory
-from iceberg_ivm.server import RECENT_QUERY_LIMIT, AppState, ViewStatus, app
+from iceberg_ivm.server import (
+    RECENT_QUERY_LIMIT,
+    AppState,
+    ViewStatus,
+    app,
+    rewrite_info_uri,
+)
 
 STATIC_CONFIG_YAML = textwrap.dedent("""\
     trino:
@@ -83,6 +90,172 @@ def test_health(client):
 
 def test_metrics(client):
     assert "mv_views_configured" in client.get("/metrics").text
+
+
+# ── rewrite_info_uri ──
+
+
+@pytest.mark.parametrize(
+    "info_uri,internal,public,expected",
+    [
+        # Happy path: docker-internal hostname rewritten to host-facing one
+        (
+            "http://trino:8080/ui/query.html?20260518_085528_00970_atxqy",
+            "http://trino:8080",
+            "http://localhost:28080",
+            "http://localhost:28080/ui/query.html?20260518_085528_00970_atxqy",
+        ),
+        # Trailing slash on configured URLs should not duplicate the slash
+        (
+            "http://trino:8080/ui/query.html?q",
+            "http://trino:8080/",
+            "http://localhost:28080/",
+            "http://localhost:28080/ui/query.html?q",
+        ),
+        # Scheme upgrade: orchestrator talks plain HTTP, browser uses HTTPS
+        (
+            "http://trino:8080/ui/query.html?q",
+            "http://trino:8080",
+            "https://trino.public.example.com",
+            "https://trino.public.example.com/ui/query.html?q",
+        ),
+    ],
+)
+def test_rewrite_info_uri_swaps_internal_prefix(info_uri, internal, public, expected):
+    """Rewrite swaps the configured internal Trino prefix with the public one."""
+    assert rewrite_info_uri(info_uri, internal, public) == expected
+
+
+def test_rewrite_info_uri_is_noop_when_urls_match():
+    """If internal == public there is nothing to rewrite."""
+    same = "http://localhost:8080"
+    uri = "http://localhost:8080/ui/query.html?q"
+    assert rewrite_info_uri(uri, same, same) == uri
+
+
+def test_rewrite_info_uri_passes_through_unrelated_urls():
+    """Don't munge info_uris that don't share the internal prefix — the
+    orchestrator must not pretend to fix arbitrary URLs."""
+    assert (
+        rewrite_info_uri(
+            "http://something-else:9999/ui/query.html?q",
+            "http://trino:8080",
+            "http://localhost:28080",
+        )
+        == "http://something-else:9999/ui/query.html?q"
+    )
+
+
+def test_rewrite_info_uri_requires_path_boundary():
+    """A hostname that *starts* with the internal URL but isn't actually
+    the internal URL (e.g. `trino:8080xyz`) must NOT match — otherwise the
+    helper would corrupt unrelated hosts that happen to share a prefix.
+
+    Trino's real info_uris always have a `/...` path, so requiring a `/`
+    boundary is safe and tightens the contract.
+    """
+    assert (
+        rewrite_info_uri(
+            "http://trino:8080xyz/ui/query.html?q",
+            "http://trino:8080",
+            "http://localhost:28080",
+        )
+        == "http://trino:8080xyz/ui/query.html?q"
+    )
+
+
+def test_rewrite_info_uri_empty_in_empty_out():
+    """An empty info_uri (older Trino client / failed query) is returned as-is
+    so the UI's existing "non-clickable when blank" rendering still works."""
+    assert rewrite_info_uri("", "http://trino:8080", "http://localhost:28080") == ""
+
+
+# ── /api/views info_uri rewrite integration ──
+
+
+def test_list_views_rewrites_recent_query_info_uri(setup_state, client, monkeypatch):
+    """When TRINO_PUBLIC_URL differs from TRINO_URL, /api/views must rewrite
+    recent_queries[*].info_uri to the public URL so the UI's Trino-deep-link is
+    reachable from the user's browser."""
+    monkeypatch.setenv("TRINO_PUBLIC_URL", "http://localhost:28080")
+    # Reload static cfg with the new env so AppState picks it up
+    static_cfg = load_config(setup_state.config_path)
+    setup_state.config = Config(
+        trino=static_cfg.trino,
+        views=setup_state.config.views,
+        server=static_cfg.server,
+    )
+
+    vs = setup_state.view_statuses["test_view"]
+    vs.recent_queries = [
+        QueryInfo(
+            query_id="20260518_085528_00970_atxqy",
+            info_uri="http://localhost:8080/ui/query.html?20260518_085528_00970_atxqy",
+            stage="merge",
+            started_at=1.0,
+            elapsed_ms=12.0,
+        ),
+    ]
+
+    body = client.get("/api/views").json()
+    queries = body[0]["status"]["recent_queries"]
+    assert queries[0]["info_uri"] == "http://localhost:28080/ui/query.html?20260518_085528_00970_atxqy"
+
+
+def test_list_views_does_not_mutate_underlying_view_status(setup_state, client, monkeypatch):
+    """The rewrite must operate on the response dict, not on the live
+    ViewStatus.recent_queries.  If it leaked, a subsequent reload that
+    persisted the rewritten URL to SQLite would corrupt the canonical
+    info_uri — making the deep-link broken again after, say, the next
+    public-URL change.
+    """
+    monkeypatch.setenv("TRINO_PUBLIC_URL", "http://localhost:28080")
+    static_cfg = load_config(setup_state.config_path)
+    setup_state.config = Config(
+        trino=static_cfg.trino,
+        views=setup_state.config.views,
+        server=static_cfg.server,
+    )
+
+    internal_uri = "http://localhost:8080/ui/query.html?20260518_085528_00970_atxqy"
+    vs = setup_state.view_statuses["test_view"]
+    vs.recent_queries = [
+        QueryInfo(
+            query_id="20260518_085528_00970_atxqy",
+            info_uri=internal_uri,
+            stage="merge",
+            started_at=1.0,
+            elapsed_ms=12.0,
+        ),
+    ]
+
+    client.get("/api/views")  # response is rewritten — discard it
+
+    # The in-memory QueryInfo MUST still hold the internal URI so a later
+    # persist round-trip writes the canonical (egress) URL, not the public one.
+    assert setup_state.view_statuses["test_view"].recent_queries[0].info_uri == internal_uri
+
+
+def test_view_to_response_is_a_noop_when_trino_arg_is_none(setup_state):
+    """``_view_to_response`` carries a default ``trino=None`` for callers
+    that don't have a TrinoConfig in scope (e.g. potential future internal
+    callers).  In that mode the function must skip the rewrite cleanly
+    rather than crash on a None attribute access.
+    """
+    from iceberg_ivm.server import _view_to_response
+
+    vs = setup_state.view_statuses["test_view"]
+    vs.recent_queries = [
+        QueryInfo(
+            query_id="qid",
+            info_uri="http://trino:8080/ui/query.html?qid",
+            stage="merge",
+            started_at=1.0,
+            elapsed_ms=1.0,
+        ),
+    ]
+    resp = _view_to_response(setup_state.config.views[0], vs)  # no trino arg
+    assert resp.status["recent_queries"][0]["info_uri"] == "http://trino:8080/ui/query.html?qid"
 
 
 def test_view_schema(client):

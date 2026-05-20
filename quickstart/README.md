@@ -62,3 +62,22 @@ Edit `views.yaml` while the stack is running — iceberg-ivm hot-reloads it
 within `config_reload_interval_seconds` (30s). Or use the **New View**
 button in the UI to add views interactively; the API will write back to
 `views.yaml` for you.
+
+## Running against local source
+
+The default compose pulls the latest published image. To run the quickstart
+against your **local working tree** instead — useful when iterating on the
+orchestrator and you want the demo to exercise your in-progress code —
+layer the `docker-compose.local.yml` overlay:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+```
+
+The overlay only redirects the `iceberg-ivm` service to build from
+`../Dockerfile`; the rest of the stack (Trino, Postgres, MinIO, seed) keeps
+using its pinned image, so a rebuild only touches the orchestrator.
+
+> Requires Docker Compose **v2.24+** — the overlay uses the `!reset` YAML
+> tag to drop the inherited `image:` field, which was introduced in that
+> release. Older versions will fail with a YAML parse error.

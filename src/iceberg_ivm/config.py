@@ -137,6 +137,11 @@ class TrinoConfig:
     password: str | None  # from TRINO_PASSWORD; None → connect anonymously
     catalog: str  # from YAML (trino.catalog)
     schema: str  # from YAML (trino.schema)
+    # Browser-reachable Trino URL, used to rewrite info_uris before they reach
+    # the UI. Defaults to `url`; only differs when the orchestrator and the
+    # user's browser talk to Trino over different hostnames (e.g. docker
+    # service hostname inside the network vs `localhost:<published port>`).
+    public_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -264,12 +269,14 @@ def load_config(path: str | Path) -> Config:
             f"Set {', '.join(_TRINO_ENV_REQUIRED)} before starting iceberg-ivm."
         )
 
+    trino_url = os.environ["TRINO_URL"]
     trino = TrinoConfig(
-        url=os.environ["TRINO_URL"],
+        url=trino_url,
         user=os.environ["TRINO_USER"],
         password=os.environ.get("TRINO_PASSWORD") or None,
         catalog=trino_raw["catalog"],
         schema=trino_raw["schema"],
+        public_url=os.environ.get("TRINO_PUBLIC_URL") or trino_url,
     )
 
     server_raw = raw.get("server", {})

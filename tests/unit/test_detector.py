@@ -591,6 +591,32 @@ class TestDetectChanges:
         assert start.day == 6
         assert end.day == 13
 
+    async def test_expired_last_snapshot_falls_back_to_full_refresh(self):
+        """If ``last_snapshot`` is no longer present in the source's
+        ``$snapshots`` (because the source was re-created or its history
+        was expired), the orchestrator's bookmark is stale and incremental
+        detection is impossible — but the situation is *recoverable*: a
+        FULL_REFRESH from the new source recomputes everything we need.
+
+        Before this fix, ``get_snapshots_since`` raised ``ExpiredSnapshotError``
+        and that propagated up through ``detect_changes``, leaving the view
+        wedged in an error loop (Finding #1 of the 2026-05-18 UI battle-test).
+        The fix catches the error inside ``detect_changes`` and converts it
+        to a FULL_REFRESH against the *current* snapshot.
+        """
+        cursor = MockCursor(
+            [
+                [(200,)],  # get_current_snapshot → 200 (new)
+                [],  # committed_at lookup for last_snap=100 → empty (expired)
+            ]
+        )
+        r = await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
+        assert r.action == RefreshAction.FULL_REFRESH
+        assert r.current_snapshot == 200
+        # No further queries should be issued — we can't read $all_entries
+        # against an expired bookmark, and we don't need to.
+        assert len(cursor.executed_sql) == 2, cursor.executed_sql
+
     async def test_no_data_files_in_new_snapshots(self):
         cursor = MockCursor(
             [

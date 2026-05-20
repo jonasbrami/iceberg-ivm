@@ -359,9 +359,22 @@ async def detect_changes(
         log.info("%s: first run (no last_snapshot) → full refresh", source_table)
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=current_snap)
 
-    # Get intermediate snapshots (raises ExpiredSnapshotError if last_snap
-    # has been expired from the source).
-    snapshots = await get_snapshots_since(cursor, source_table, last_snapshot)
+    # Get intermediate snapshots. If ``last_snapshot`` has been expired from
+    # ``$snapshots`` (most commonly: the source table was dropped and recreated,
+    # or its history aged out), we can't compute an incremental range — but
+    # we *can* recover by re-materializing everything from the current source.
+    # Treat the expired bookmark as a fresh first run.
+    try:
+        snapshots = await get_snapshots_since(cursor, source_table, last_snapshot)
+    except ExpiredSnapshotError as exc:
+        log.warning(
+            "%s: bookmark snapshot %d expired (%s) → falling back to FULL_REFRESH",
+            source_table,
+            last_snapshot,
+            exc,
+        )
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=current_snap)
+
     if not snapshots:
         log.debug("%s: no new snapshots since %d", source_table, last_snapshot)
         return ChangeResult(action=RefreshAction.NO_CHANGE, current_snapshot=current_snap)
