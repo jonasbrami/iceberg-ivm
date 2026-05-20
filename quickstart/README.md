@@ -77,3 +77,7 @@ docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
 The overlay only redirects the `iceberg-ivm` service to build from
 `../Dockerfile`; the rest of the stack (Trino, Postgres, MinIO, seed) keeps
 using its pinned image, so a rebuild only touches the orchestrator.
+
+> Requires Docker Compose **v2.24+** — the overlay uses the `!reset` YAML
+> tag to drop the inherited `image:` field, which was introduced in that
+> release. Older versions will fail with a YAML parse error.

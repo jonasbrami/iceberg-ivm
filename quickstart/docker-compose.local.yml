@@ -17,7 +17,10 @@ services:
       context: ..
       dockerfile: Dockerfile
       args:
-        # `hatch-vcs` derives the package version from git tags, but the
-        # build context excludes `.git`, so pass a sentinel value that
-        # makes the build deterministic regardless of local tag state.
+        # `hatch-vcs` would otherwise derive the package version from git
+        # tags, which gives noisy "dev"-suffixed versions on un-tagged
+        # checkouts and depends on the contributor's local tag state.
+        # `SETUPTOOLS_SCM_PRETEND_VERSION` (set in Dockerfile from this ARG)
+        # takes precedence over the git-tag lookup, so passing a sentinel
+        # here keeps the local build deterministic.
         VERSION: "0.0.0+local"
