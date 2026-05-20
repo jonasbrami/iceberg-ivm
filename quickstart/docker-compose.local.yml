@@ -1,0 +1,23 @@
+# Compose overlay: build the iceberg-ivm image from the local source tree
+# instead of pulling the published `ghcr.io/jonasbrami/iceberg-ivm` tag.
+#
+# Use when iterating on the orchestrator and you want the quickstart stack
+# to exercise your in-progress code, e.g.:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+#
+# Everything else in the stack (Trino, Postgres, MinIO, seed) keeps using
+# its pinned image — no need to redo the slow bits when only orchestrator
+# code changed.
+
+services:
+  iceberg-ivm:
+    image: !reset null
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        # `hatch-vcs` derives the package version from git tags, but the
+        # build context excludes `.git`, so pass a sentinel value that
+        # makes the build deterministic regardless of local tag state.
+        VERSION: "0.0.0+local"
