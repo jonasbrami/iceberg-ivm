@@ -6,7 +6,10 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
-      - "19001:9001"
+      # Bind to loopback only — the quickstart is a local demo with admin/admin
+      # credentials, no auth on the console; exposing it on every interface
+      # would put the warehouse bucket on the host's LAN.
+      - "127.0.0.1:19001:9001"
     healthcheck:
       test: mc ready local
       interval: 2s
@@ -43,7 +46,9 @@ services:
     volumes:
       - ./trino-config/iceberg.properties:/etc/trino/catalog/iceberg.properties
     ports:
-      - "28080:8080"
+      # Loopback-only: Trino has no auth in the quickstart and the host port
+      # must stay in sync with TRINO_PUBLIC_URL below (28080).
+      - "127.0.0.1:28080:8080"
     healthcheck:
       test: trino --execute "SELECT 1"
       interval: 5s
@@ -83,7 +88,8 @@ services:
       - ivm-state:/data/state
     command: ["-c", "/data/config.yaml", "--views", "/data/views.yaml"]
     ports:
-      - "8001:8000"
+      # Loopback-only: the orchestrator UI has no auth in the quickstart.
+      - "127.0.0.1:8001:8000"
 
 volumes:
   ivm-state:
