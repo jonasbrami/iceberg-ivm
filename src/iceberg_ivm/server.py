@@ -438,6 +438,14 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
                 vs.last_action = "incremental"
 
             incremental_range = result.filter_range if result.action == RefreshAction.INCREMENTAL else None
+            # Resume point for an interrupted chunked full refresh comes ONLY
+            # from the committed-progress marker this from-beginning run wrote
+            # (issue #62) — never from the target's data. Absent (None) → the
+            # backfill recomputes from the source's beginning, so a source that
+            # overwrote historical buckets is fully re-merged, not skipped.
+            resume_from = (
+                await s.history.get_backfill_progress(view.name) if (chunked and s.history is not None) else None
+            )
             total_elapsed = 0.0
             total_rows = 0
             total_bytes = 0
@@ -450,6 +458,7 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
                 parsed,
                 value_columns,
                 incremental_range=incremental_range,
+                resume_from=resume_from,
             ):
                 total_elapsed += q.elapsed_ms / 1000.0
                 total_rows += q.processed_rows
@@ -471,12 +480,20 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
                 await _record_query(s, view.name, vs, q)
                 await _persist_view_status(s, view.name, vs)
                 if q.chunks_total > 1:
+                    # Record committed-progress AFTER the chunk's MERGE has
+                    # landed: the marker is the upper bound of the last chunk
+                    # *this* from-beginning run committed. The next tick resumes
+                    # from it (skipping redone work) without ever consulting the
+                    # target's data — the core of issue #62.
+                    if s.history is not None and q.range_end is not None:
+                        await s.history.set_backfill_progress(view.name, q.range_end)
                     CHUNKS_COMPLETED.labels(view=view.name).inc()
                     CHUNK_DURATION.labels(view=view.name).observe(q.elapsed_ms / 1000.0)
                     CHUNK_ROWS.labels(view=view.name).inc(q.processed_rows)
                 if s.stop_event.is_set():
                     # Graceful shutdown mid-backfill — leave last_source_snapshot
-                    # unset so the next tick resumes from target metadata.
+                    # unset so the next tick re-detects FULL_REFRESH and resumes
+                    # from the committed-progress marker written just above.
                     log.info("%s: refresh interrupted after chunk %d/%d", view.name, q.chunks_done, q.chunks_total)
                     return
 
@@ -486,6 +503,11 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
             REFRESH_TOTAL.labels(view=view.name, type="incremental" if incremental_range else "full").inc()
             if s.history is not None:
                 await s.history.set_last_source_snapshot(view.name, result.current_snapshot)
+                # Clear the committed-progress marker: this backfill finished,
+                # so the next full refresh (if the bookmark is ever lost again)
+                # must start from the source's beginning, not resume from a
+                # marker left by a completed run.
+                await s.history.clear_backfill_progress(view.name)
             vs.total_refreshes += 1
             # Clear the "in-flight" marker on clean completion. Leave chunks_done
             # at its last value so the UI can show "12/12 done" alongside total

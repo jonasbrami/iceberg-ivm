@@ -361,3 +361,89 @@ async def test_last_source_snapshot_survives_reopen(tmp_path):
         assert await h2.get_last_source_snapshot("v") == 42
     finally:
         await h2.close()
+
+
+# ── backfill_progress (chunked full-refresh resume marker) ──
+
+
+async def test_get_backfill_progress_unknown_view(history):
+    """No row at all → None (a from-beginning backfill starts at the source's start)."""
+    assert await history.get_backfill_progress("never-seen") is None
+
+
+async def test_get_backfill_progress_row_without_marker(history):
+    """Row exists from upsert_view_status but the marker column is NULL."""
+    await history.upsert_view_status("v", {"total_refreshes": 3})
+    assert await history.get_backfill_progress("v") is None
+
+
+async def test_set_then_get_backfill_progress(history):
+    from datetime import UTC, datetime
+
+    end = datetime(2026, 4, 9, tzinfo=UTC)
+    await history.set_backfill_progress("v", end)
+    assert await history.get_backfill_progress("v") == end
+
+
+async def test_set_backfill_progress_updates(history):
+    from datetime import UTC, datetime
+
+    await history.set_backfill_progress("v", datetime(2026, 4, 9, tzinfo=UTC))
+    await history.set_backfill_progress("v", datetime(2026, 4, 10, tzinfo=UTC))
+    assert await history.get_backfill_progress("v") == datetime(2026, 4, 10, tzinfo=UTC)
+
+
+async def test_clear_backfill_progress(history):
+    from datetime import UTC, datetime
+
+    await history.set_backfill_progress("v", datetime(2026, 4, 9, tzinfo=UTC))
+    await history.clear_backfill_progress("v")
+    assert await history.get_backfill_progress("v") is None
+
+
+async def test_backfill_progress_orthogonal_to_other_columns(history):
+    """The marker and the ViewStatus mirror / bookmark share a row but must
+    stay orthogonal — neither write may clobber the other."""
+    from datetime import UTC, datetime
+
+    end = datetime(2026, 4, 9, tzinfo=UTC)
+    await history.upsert_view_status("v", {"total_refreshes": 7, "last_action": "chunked_full"})
+    await history.set_last_source_snapshot("v", 99)
+    await history.set_backfill_progress("v", end)
+
+    persisted = await history.get_view_status("v")
+    assert persisted["total_refreshes"] == 7
+    assert persisted["last_action"] == "chunked_full"
+    assert await history.get_last_source_snapshot("v") == 99
+    assert await history.get_backfill_progress("v") == end
+
+    # A later ViewStatus mirror write must leave the marker (and bookmark) alone.
+    await history.upsert_view_status("v", {"total_refreshes": 8})
+    assert await history.get_backfill_progress("v") == end
+    assert await history.get_last_source_snapshot("v") == 99
+
+
+async def test_backfill_progress_survives_reopen(tmp_path):
+    from datetime import UTC, datetime
+
+    end = datetime(2026, 4, 9, tzinfo=UTC)
+    path = tmp_path / "state.db"
+    h1 = QueryHistory(path, limit=5)
+    await h1.open()
+    await h1.set_backfill_progress("v", end)
+    await h1.close()
+
+    h2 = QueryHistory(path, limit=5)
+    await h2.open()
+    try:
+        assert await h2.get_backfill_progress("v") == end
+    finally:
+        await h2.close()
+
+
+async def test_delete_view_purges_backfill_progress(history):
+    from datetime import UTC, datetime
+
+    await history.set_backfill_progress("v", datetime(2026, 4, 9, tzinfo=UTC))
+    await history.delete_view("v")
+    assert await history.get_backfill_progress("v") is None

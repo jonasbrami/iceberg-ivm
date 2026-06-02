@@ -14,6 +14,7 @@ dedicated background thread so the event loop stays unblocked.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from pathlib import Path
 
 import aiosqlite
@@ -69,7 +70,16 @@ CREATE TABLE IF NOT EXISTS view_status (
     total_errors          INTEGER NOT NULL DEFAULT 0,
     chunks_done           INTEGER NOT NULL DEFAULT 0,
     chunks_total          INTEGER,
-    last_source_snapshot  INTEGER
+    last_source_snapshot  INTEGER,
+    -- Committed-progress marker for an in-flight chunked full refresh: the
+    -- upper bound (ISO-8601 string) of the last chunk this from-beginning
+    -- backfill committed. Distinct from last_source_snapshot, which is only
+    -- written on full completion. Lets an interrupted backfill resume without
+    -- redoing committed chunks, while guaranteeing every skipped chunk was
+    -- (re)computed by the *current* run — so it can't reintroduce the
+    -- "resume from target_max" correctness hole (issue #62). NULL means no
+    -- in-flight backfill → start from the source's beginning.
+    backfill_progress     TEXT
 );
 """
 
@@ -117,8 +127,21 @@ class QueryHistory:
     async def open(self) -> None:
         self._db = await aiosqlite.connect(self.db_path)
         await self._db.executescript(_SCHEMA)
+        await self._migrate()
         await self._db.commit()
         log.info("query history opened at %s (limit=%d per view)", self.db_path, self.limit)
+
+    async def _migrate(self) -> None:
+        """Add columns introduced after a DB was first created.
+
+        ``CREATE TABLE IF NOT EXISTS`` is a no-op on an existing table, so new
+        columns must be added explicitly. ``ADD COLUMN`` is idempotent here via
+        the column-presence check (SQLite has no ``ADD COLUMN IF NOT EXISTS``).
+        """
+        async with self._db.execute("PRAGMA table_info(view_status)") as cur:
+            cols = {row[1] for row in await cur.fetchall()}
+        if "backfill_progress" not in cols:
+            await self._db.execute("ALTER TABLE view_status ADD COLUMN backfill_progress TEXT")
 
     async def close(self) -> None:
         if self._db is not None:
@@ -267,6 +290,39 @@ class QueryHistory:
             "ON CONFLICT(view) DO UPDATE SET "
             "last_source_snapshot = excluded.last_source_snapshot",
             (view, snapshot_id),
+        )
+        await self._db.commit()
+
+    # ── backfill_progress ─────────────────────────────────────────────
+    # Committed-progress marker for an in-flight chunked full refresh. Like
+    # last_source_snapshot it lives on the view_status row but is kept out of
+    # _VIEW_STATUS_COLS so the ViewStatus mirror can't clobber it. Written
+    # after each chunk commits, cleared on clean completion (alongside the
+    # bookmark write). See issue #62.
+
+    async def get_backfill_progress(self, view: str) -> datetime | None:
+        async with self._db.execute(
+            "SELECT backfill_progress FROM view_status WHERE view = ?",
+            (view,),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row or row[0] is None:
+            return None
+        return datetime.fromisoformat(row[0])
+
+    async def set_backfill_progress(self, view: str, end: datetime) -> None:
+        await self._db.execute(
+            "INSERT INTO view_status (view, backfill_progress) VALUES (?, ?) "
+            "ON CONFLICT(view) DO UPDATE SET "
+            "backfill_progress = excluded.backfill_progress",
+            (view, end.isoformat()),
+        )
+        await self._db.commit()
+
+    async def clear_backfill_progress(self, view: str) -> None:
+        await self._db.execute(
+            "UPDATE view_status SET backfill_progress = NULL WHERE view = ?",
+            (view,),
         )
         await self._db.commit()
 

@@ -207,14 +207,17 @@ async def get_target_bucket_max(
     """Read the max ``upper_bound`` of ``bucket_alias`` across live data
     files in ``target_table``.
 
-    The chunked full-refresh uses this as its resume point: the target's
-    own Iceberg metadata, rather than a separate cursor key, records what
-    has been committed. Returns ``None`` for an empty target or one whose
-    files carry no bounds on ``bucket_alias`` yet.
+    NOT used as a chunked-refresh resume point any more (issue #62): resuming
+    from the target's newest bucket conflated "data present up to T" with
+    "data correct up to T", silently skipping older buckets that a
+    non-append-only source had overwritten. The full-refresh resume point now
+    comes solely from the committed-progress marker / bookmark in the state DB
+    (see ``executor._backfill_ranges`` and ``QueryHistory.backfill_progress``).
+    Kept as a standalone metadata helper. Returns ``None`` for an empty target
+    or one whose files carry no bounds on ``bucket_alias`` yet.
 
     Filters ``content = 0`` (data files) so V2 position/equality delete
-    files don't skew the max upward and cause the resume to skip live
-    buckets.
+    files don't skew the max upward.
     """
     await cursor.execute(f"SELECT readable_metrics FROM {system_table(target_table, 'files')} WHERE content = 0")
     rows = await cursor.fetchall()

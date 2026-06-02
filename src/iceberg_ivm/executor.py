@@ -23,7 +23,6 @@ from iceberg_ivm.config import ViewConfig
 from iceberg_ivm.detector import (
     expand_to_bucket_bounds,
     get_source_column_range,
-    get_target_bucket_max,
     walk_buckets,
 )
 from iceberg_ivm.query_parser import ParsedView, inject_range_filter
@@ -121,13 +120,21 @@ async def execute_maintenance(
 async def _backfill_ranges(
     cursor,
     view: ViewConfig,
-    target_table: str,
     parsed: ParsedView,
+    *,
+    resume_from: datetime | None = None,
 ) -> list[tuple[datetime, datetime]]:
     """Return the ordered (start, end) ranges for a full refresh.
 
-    One element = single-shot; N elements = chunked. Resume point comes from
-    target's ``$files`` — no external cursor state. Empty = empty source.
+    One element = single-shot; N elements = chunked. Empty = empty source.
+
+    A full refresh always recomputes from the **source's beginning** so a
+    source that overwrote historical buckets is fully re-merged — never
+    skipped (issue #62). The sole way to skip a chunk is ``resume_from``: a
+    committed-progress marker produced by *this* from-beginning run, used to
+    resume an interrupted backfill without redoing committed chunks. It is
+    NOT derived from the target's data (which may be stale historical rows
+    from an earlier incremental cursor) — that conflation was the bug.
     """
     source_range = await get_source_column_range(
         cursor,
@@ -144,23 +151,21 @@ async def _backfill_ranges(
     if view.full_refresh_chunk is None:
         return [(start, end)]  # single-shot full refresh
 
-    # Chunked: resume from max(bucket_alias) in target (if any). Config
-    # validation guarantees bucket_alias is set whenever full_refresh_chunk
-    # is — fall through with an assertion so a future refactor can't
-    # silently re-introduce the "" fallback that would skip the resume.
+    # Chunked. Config validation guarantees bucket_alias is set whenever
+    # full_refresh_chunk is — assert so a future refactor can't silently
+    # re-introduce a fallback that breaks chunking.
     assert parsed.bucket_alias is not None, (
         "chunked full refresh requires bucket_alias; validate_chunk_compatibility should have rejected this view"
     )
-    target_max = await get_target_bucket_max(cursor, target_table, parsed.bucket_alias)
-    if target_max is not None:
-        # Floor to the start of the chunk containing target_max so every
-        # emitted range is a full chunk. The containing chunk is re-MERGEd
-        # in full — idempotent over an append-only source — which makes
-        # mid-flight changes to full_refresh_chunk gap-free without a
-        # special path. Cost: when an interrupted chunked backfill resumes,
-        # the chunk containing target_max is re-MERGEd even if previously
-        # completed — one wasted chunk per resumption, idempotent so safe.
-        start = expand_to_bucket_bounds(target_max, target_max, view.full_refresh_chunk)[0]
+    if resume_from is not None:
+        # Floor the committed-progress marker to the start of the chunk it
+        # lands in so every emitted range is a full chunk. The containing
+        # chunk is re-MERGEd in full — idempotent, and gap-free even if
+        # full_refresh_chunk changed mid-backfill. ``max`` guards against a
+        # marker that predates the current source start (e.g. source data
+        # aged out): never resume before the source's beginning.
+        resume_start = expand_to_bucket_bounds(resume_from, resume_from, view.full_refresh_chunk)[0]
+        start = max(start, resume_start)
     return list(walk_buckets(start, end, view.full_refresh_chunk))
 
 
@@ -172,23 +177,26 @@ async def execute_refresh(
     value_columns: list[str],
     *,
     incremental_range: tuple[datetime, datetime] | None = None,
+    resume_from: datetime | None = None,
 ) -> AsyncIterator[QueryInfo]:
     """Execute a refresh as a sequence of per-range MERGE commits.
 
     - ``incremental_range`` given → one MERGE over it.
-    - ``view.full_refresh_chunk`` set → N MERGEs, one per chunk, resuming
-      from target metadata.
+    - ``view.full_refresh_chunk`` set → N MERGEs, one per chunk, from the
+      source's beginning (or from ``resume_from`` — a committed-progress
+      marker for an interrupted backfill, see ``_backfill_ranges``).
     - otherwise → one MERGE over the full source range (single-shot full).
 
     Yields one ``QueryInfo`` per committed MERGE. Caller cancels by ``break``;
-    each MERGE is one Iceberg commit, so a partial run leaves the target in
-    a valid state and the next tick resumes from ``$files`` metadata.
+    each MERGE is one Iceberg commit, so a partial run leaves the target in a
+    valid state and the caller persists the committed-progress marker so the
+    next tick resumes from it.
     """
     if incremental_range is not None:
         ranges: list[tuple[datetime, datetime]] = [incremental_range]
         stage = "merge"
     else:
-        ranges = await _backfill_ranges(cursor, view, target_table, parsed)
+        ranges = await _backfill_ranges(cursor, view, parsed, resume_from=resume_from)
         stage = "chunk_merge" if view.full_refresh_chunk else "merge"
 
     total = len(ranges)

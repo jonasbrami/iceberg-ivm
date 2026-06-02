@@ -2503,6 +2503,184 @@ async def test_refresh_view_interrupt_skips_last_snapshot_write(setup_state, tmp
         await h.close()
 
 
+async def test_refresh_view_chunked_writes_and_clears_progress_marker(setup_state, tmp_path):
+    """Each committed chunk writes the committed-progress marker (range_end);
+    on clean completion the marker is cleared and the bookmark is set (#62)."""
+    from datetime import datetime
+
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.executor import QueryInfo
+    from iceberg_ivm.introspect import ColumnInfo
+
+    view = _install_chunked_view(setup_state)
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
+    setup_state.stop_event.clear()
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+
+    async def fake_detect(*a, **kw):
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=42)
+
+    async def fake_discover(cursor, query):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+
+    async def fake_execute_refresh(*a, **kw):
+        for i in range(1, 4):
+            yield QueryInfo(
+                query_id=f"q{i}",
+                info_uri=f"http://trino/q{i}",
+                stage="chunk_merge",
+                started_at=float(i),
+                elapsed_ms=100.0,
+                range_start=datetime(2026, 4, 7 + i, tzinfo=UTC),
+                range_end=datetime(2026, 4, 8 + i, tzinfo=UTC),
+                chunks_done=i,
+                chunks_total=3,
+            )
+
+    try:
+        with (
+            patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+            patch.object(server_mod, "discover_columns", fake_discover),
+            patch.object(server_mod, "detect_changes", fake_detect),
+            patch.object(server_mod, "execute_refresh", fake_execute_refresh),
+        ):
+            await server_mod.refresh_view(setup_state, view)
+
+        # Completed cleanly: bookmark set, progress marker cleared.
+        assert await h.get_last_source_snapshot(view.name) == 42
+        assert await h.get_backfill_progress(view.name) is None
+    finally:
+        await h.close()
+
+
+async def test_refresh_view_chunked_resumes_from_progress_marker(setup_state, tmp_path):
+    """A pre-existing committed-progress marker (interrupted from-beginning
+    run) is read and threaded to the executor as ``resume_from`` — NOT the
+    target's data. This is the interruption-resume guarantee under #62."""
+    from datetime import datetime
+
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.executor import QueryInfo
+    from iceberg_ivm.introspect import ColumnInfo
+
+    view = _install_chunked_view(setup_state)
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
+    setup_state.stop_event.clear()
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+    # Marker left by an earlier interrupted backfill of THIS run.
+    marker = datetime(2026, 4, 9, tzinfo=UTC)
+    await h.set_backfill_progress(view.name, marker)
+
+    seen_resume_from = {}
+
+    async def fake_detect(*a, **kw):
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=42)
+
+    async def fake_discover(cursor, query):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+
+    async def fake_execute_refresh(*a, **kw):
+        seen_resume_from["value"] = kw.get("resume_from")
+        yield QueryInfo(
+            query_id="q1",
+            info_uri="http://trino/q1",
+            stage="chunk_merge",
+            started_at=1.0,
+            elapsed_ms=100.0,
+            range_start=datetime(2026, 4, 9, tzinfo=UTC),
+            range_end=datetime(2026, 4, 10, tzinfo=UTC),
+            chunks_done=1,
+            chunks_total=1,
+        )
+
+    try:
+        with (
+            patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+            patch.object(server_mod, "discover_columns", fake_discover),
+            patch.object(server_mod, "detect_changes", fake_detect),
+            patch.object(server_mod, "execute_refresh", fake_execute_refresh),
+        ):
+            await server_mod.refresh_view(setup_state, view)
+
+        assert seen_resume_from["value"] == marker
+    finally:
+        await h.close()
+
+
+async def test_refresh_view_interrupt_preserves_progress_marker(setup_state, tmp_path):
+    """On interruption mid-backfill the committed-progress marker for the last
+    committed chunk survives (bookmark stays unset) so the next tick resumes
+    from it instead of redoing committed chunks (#62 interruption-resume)."""
+    from datetime import datetime
+
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.executor import QueryInfo
+    from iceberg_ivm.introspect import ColumnInfo
+
+    view = _install_chunked_view(setup_state)
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+
+    async def fake_detect(*a, **kw):
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=99)
+
+    async def fake_discover(cursor, query):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+
+    async def fake_execute_refresh(*a, **kw):
+        yield QueryInfo(
+            query_id="q1",
+            info_uri="http://trino/q1",
+            stage="chunk_merge",
+            started_at=1.0,
+            elapsed_ms=100.0,
+            range_start=datetime(2026, 4, 8, tzinfo=UTC),
+            range_end=datetime(2026, 4, 9, tzinfo=UTC),
+            chunks_done=1,
+            chunks_total=3,
+        )
+        setup_state.stop_event.set()
+        yield QueryInfo(
+            query_id="q2",
+            info_uri="http://trino/q2",
+            stage="chunk_merge",
+            started_at=2.0,
+            elapsed_ms=100.0,
+            range_start=datetime(2026, 4, 9, tzinfo=UTC),
+            range_end=datetime(2026, 4, 10, tzinfo=UTC),
+            chunks_done=2,
+            chunks_total=3,
+        )
+
+    try:
+        with (
+            patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+            patch.object(server_mod, "discover_columns", fake_discover),
+            patch.object(server_mod, "detect_changes", fake_detect),
+            patch.object(server_mod, "execute_refresh", fake_execute_refresh),
+        ):
+            await server_mod.refresh_view(setup_state, view)
+
+        # Bookmark not written (interrupted) but the marker for the one chunk
+        # that committed before the stop flag is persisted at its range_end.
+        assert await h.get_last_source_snapshot(view.name) is None
+        assert await h.get_backfill_progress(view.name) == datetime(2026, 4, 9, tzinfo=UTC)
+    finally:
+        await h.close()
+
+
 def test_chunk_metrics_defined():
     """Per-chunk Prometheus metrics are registered so operators can build
     chunked-backfill dashboards without scraping stdout."""
