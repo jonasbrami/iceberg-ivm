@@ -171,6 +171,83 @@ correctness model can't reconstruct a removed bucket from `$all_entries`.
 The old behavior — treating every non-append as a full refresh — was wrong
 because compactions triggered needless full rewrites.
 
+### Chunked, resumable refresh: bookmark-only resume, and one progress marker per path
+
+This is a **generic** orchestrator: it makes no assumption about how much
+data a refresh touches. A single source snapshot may add a terabyte; a view
+that has fallen far behind has a correspondingly large catch-up window. So
+every refresh — full *or* incremental — must satisfy two guarantees for
+**any** allowed source, independent of one specific workload:
+
+1. **Memory safety.** A large `[start, end)` window cannot run as one
+   `MERGE`: the join build side (`HashBuilderOperator`) scales with the
+   window and exceeds any fixed per-node memory limit. So when
+   `full_refresh_chunk` is set, **both paths** split the window into
+   bucket-aligned chunks (`walk_buckets` / `expand_to_bucket_bounds`), each
+   chunk a single idempotent Iceberg `MERGE` commit. (Originally only the
+   full path chunked; a large incremental catch-up OOM'd as one MERGE and
+   looped forever — that asymmetry was a bug.)
+
+2. **Convergence under interruption.** A chunked run can be cut off
+   mid-way (deploy, crash, timeout). It must resume from the work it has
+   already committed — **not** redo the window from the start — otherwise a
+   sufficiently large window that keeps getting interrupted before it
+   finishes never makes net progress and never converges. This is the same
+   requirement on both paths, again because either window may be arbitrarily
+   large.
+
+**The resume point comes from the bookmark / committed progress only —
+never from the target table.** The target tells you what data is *present*,
+not what is *correct*. The old full-refresh path resumed from
+`max(bucket_alias)` in the target and walked forward only; for a source that
+overwrites a *historical* bucket (allowed — see *No-data-loss* above) that
+silently skipped the corrected older bucket and left the view stale with no
+error. `get_target_bucket_max` is retained only as a metadata helper, wired
+into no refresh path.
+
+**Why a marker is needed at all (per path).** The source-snapshot bookmark
+(`view_status.last_source_snapshot`) advances **only on full completion** of
+a run — an interrupted run leaves it unchanged so the next tick re-derives
+the same window. The bookmark therefore cannot record *intra-run* progress.
+A separate committed-progress marker does: it is written per committed chunk
+and floored to the containing chunk on resume (`_floor_resume_to_chunk`),
+so resume always restarts on a chunk boundary and re-MERGEs at most the one
+in-flight chunk.
+
+**Why two markers, one per path — and why they cannot be merged.** Each
+path's marker means a *different* thing, so they must be stored and read
+separately:
+
+| marker | written by | read by | certifies |
+|---|---|---|---|
+| `backfill_progress` | full path, per chunk (`chunked`) | full path only (`resume_from`) | "every bucket from the **source's beginning** up to T was recomputed from the current source by this run" |
+| `incremental_progress` | incremental path, per chunk (`chunked_incremental`) | incremental path only (`incremental_resume_from`) | "the **diff-window** chunks up to T were merged" |
+
+A full marker certifies *everything below T*; an incremental marker
+certifies only a recent slice and says nothing about buckets below the diff
+window's start. If a full refresh ever resumed from an incremental marker it
+would skip historical buckets nothing ever recomputed — reintroducing the
+staleness bug above. That cross-path leak is reachable: an interrupted
+incremental leaves its marker set (bookmark not advanced); if Iceberg then
+expires the bookmarked source snapshot, the next tick is forced into a full
+refresh. A single shared column cannot resolve this — when a full run finds a
+leftover marker it must know *which path wrote it* (resume if full, discard
+if incremental), and an unconditional "clear on full entry" would also wipe
+the full path's own legitimate resume point. Provenance is irreducible; two
+path-isolated columns are simply its least-logic encoding (a single column
+plus a path tag is equivalent).
+
+So the markers are kept **strictly path-isolated**: each path reads and
+writes only its own; each is **cleared on its path's clean completion**
+(alongside advancing the bookmark); and **entering the full path also clears
+`incremental_progress`** as the barrier against the leak above.
+
+**Why skipping committed chunks on resume is safe.** Each chunk is an
+idempotent `MERGE` keyed on the merge keys, and the window is re-derived from
+the *unchanged* bookmark — so re-running is always correct; the marker only
+avoids *redundant* work. Any source change below the resume point lands in a
+newer snapshot that the still-unadvanced bookmark picks up on a later cycle.
+
 ### Why not dbt?
 
 Discussed during the conversation. dbt's `incremental_strategy='merge'`
