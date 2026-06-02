@@ -384,6 +384,11 @@ async def _skip_tick(
     """Skip-this-tick bookkeeping: mark skip, advance the bookmark to
     ``advance_to`` (``None`` → leave unchanged), clear current_work, persist."""
     vs.last_action = "skip"
+    # A successful detection that resolves to skip clears any sticky error from a
+    # prior transient failure (e.g. a connection reset on PREPARE). When the source
+    # has no new data, every tick is NO_CHANGE and no refresh runs to overwrite the
+    # frozen error — so the skip path is the only place it gets reset (issue #54).
+    vs.last_error = None
     vs.chunks_total = None
     vs.chunks_done = 0
     REFRESH_TOTAL.labels(view=view.name, type="skip").inc()

@@ -1,0 +1,11 @@
+# PAUSED 2026-06-02 — futures_um_ohlcv_s1 removed from orchestration until
+# iceberg-ivm#61 (chunk incremental refreshes) ships. The 17-day catch-up
+# incremental window OOMs the single un-chunked MERGE.
+# Restore with: POST /api/views (or re-add to views.yaml) once #61 is released.
+# Data + bookmark (mv.last_source_snapshot) are intact; refresh will resume.
+- name: iceberg.binance_vision.futures_um_ohlcv_s1
+  query: "SELECT\n      symbol,\n      date_trunc('second', time)               AS ts,\n      min_by(price, id)                        AS open,\n      max(price)                               AS high,\n      min(price)                               AS low,\n      max_by(price, id)                        AS close,\n      SUM(qty)                                 AS volume,\n      SUM(IF(is_buyer_maker = false, qty, 0))  AS buy_volume\n  FROM iceberg.binance_vision.futures_um_trades\n  GROUP BY symbol, date_trunc('second', time)\n"
+  target_table: iceberg.binance_vision.futures_um_ohlcv_s1
+  target_partitioning: ARRAY['day(ts)']
+  refresh_interval_seconds: 60
+  full_refresh_chunk: day
