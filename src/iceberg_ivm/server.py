@@ -430,10 +430,22 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
             # Set vs.last_action up-front so /api/views reflects what's running,
             # not what last finished — matters for multi-hour chunked backfills.
             chunked = result.action == RefreshAction.FULL_REFRESH and view.full_refresh_chunk
+            # A chunked *incremental* catch-up (#61) is also multi-chunk but
+            # carries its OWN resume marker (incremental_progress), strictly
+            # path-isolated from the FULL path's backfill_progress (#62).
+            chunked_incremental = result.action == RefreshAction.INCREMENTAL and view.full_refresh_chunk
             if result.action == RefreshAction.FULL_REFRESH:
                 vs.last_action = "chunked_full" if chunked else "full"
                 vs.chunks_done = 0
                 vs.chunks_total = None
+                # Leak-prevention: a FULL refresh must never see (or coexist
+                # with) a stale incremental_progress marker left by an
+                # interrupted chunked-incremental run whose source snapshot then
+                # expired (forcing this FULL path). Clearing it here — symmetric
+                # to the backfill_progress clear below — keeps the two markers
+                # strictly path-isolated: FULL reads only backfill_progress.
+                if s.history is not None:
+                    await s.history.clear_incremental_progress(view.name)
             else:
                 vs.last_action = "incremental"
 
@@ -445,6 +457,16 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
             # overwrote historical buckets is fully re-merged, not skipped.
             resume_from = (
                 await s.history.get_backfill_progress(view.name) if (chunked and s.history is not None) else None
+            )
+            # Resume point for an interrupted chunked *incremental* run comes
+            # ONLY from incremental_progress — never from backfill_progress (the
+            # FULL marker). Keeping the two reads disjoint by path is what
+            # prevents an incremental marker from ever skipping historical
+            # buckets in a full refresh (and vice versa).
+            incremental_resume_from = (
+                await s.history.get_incremental_progress(view.name)
+                if (chunked_incremental and s.history is not None)
+                else None
             )
             total_elapsed = 0.0
             total_rows = 0
@@ -459,6 +481,7 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
                 value_columns,
                 incremental_range=incremental_range,
                 resume_from=resume_from,
+                incremental_resume_from=incremental_resume_from,
             ):
                 total_elapsed += q.elapsed_ms / 1000.0
                 total_rows += q.processed_rows
@@ -486,16 +509,24 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
                     # from it (skipping redone work) without ever consulting the
                     # target's data — the core of issue #62.
                     #
-                    # FULL-path only (``chunked``). A chunked *incremental*
-                    # catch-up (issue #61) is also multi-chunk, but its resume
-                    # point is the source bookmark, not this marker: persisting
-                    # here would (a) be ignored on the next incremental tick
-                    # (resume_from is read only on the FULL path) and (b) leak a
-                    # stale marker into a later FULL refresh, wrongly skipping
-                    # chunks. An interrupted incremental simply recomputes the
-                    # same window next tick and re-runs idempotent chunks.
+                    # FULL-path only (``chunked``). The backfill_progress marker
+                    # is the FULL path's resume point (#62), keyed off the
+                    # source's beginning; it must NEVER be written on the
+                    # incremental path (it would leak into a later FULL refresh
+                    # and wrongly skip historical buckets).
                     if chunked and s.history is not None and q.range_end is not None:
                         await s.history.set_backfill_progress(view.name, q.range_end)
+                    # INCREMENTAL-path only (``chunked_incremental``, #61). Its
+                    # own durable resume marker, distinct from backfill_progress.
+                    # Without it an interrupted large catch-up never advances the
+                    # bookmark and redoes the window prefix forever (livelock).
+                    # Skipping committed chunks on restart is safe: the window is
+                    # recomputed from the unchanged bookmark (same window), the
+                    # chunks are idempotent keyed MERGEs, and any source change
+                    # below the resume point lands in a newer snapshot the
+                    # still-unadvanced bookmark picks up on a later cycle.
+                    if chunked_incremental and s.history is not None and q.range_end is not None:
+                        await s.history.set_incremental_progress(view.name, q.range_end)
                     CHUNKS_COMPLETED.labels(view=view.name).inc()
                     CHUNK_DURATION.labels(view=view.name).observe(q.elapsed_ms / 1000.0)
                     CHUNK_ROWS.labels(view=view.name).inc(q.processed_rows)
@@ -517,6 +548,11 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
                 # must start from the source's beginning, not resume from a
                 # marker left by a completed run.
                 await s.history.clear_backfill_progress(view.name)
+                # Symmetric clear for the incremental marker: this incremental
+                # run finished and advanced the bookmark, so any persisted
+                # incremental_progress is now spent — the next tick computes a
+                # fresh window from the advanced bookmark.
+                await s.history.clear_incremental_progress(view.name)
             vs.total_refreshes += 1
             # Clear the "in-flight" marker on clean completion. Leave chunks_done
             # at its last value so the UI can show "12/12 done" alongside total

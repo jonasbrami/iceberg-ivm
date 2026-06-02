@@ -117,6 +117,24 @@ async def execute_maintenance(
     return await _execute_tracked(cursor, sql, stage=f"maintenance_{op}")
 
 
+def _floor_resume_to_chunk(
+    start: datetime,
+    resume_from: datetime,
+    chunk: str,
+) -> datetime:
+    """Floor a committed-progress marker to the start of its containing chunk,
+    clamped to never precede ``start`` (the window/source beginning).
+
+    Shared by the full path (``_backfill_ranges``) and the incremental path so
+    both resume identically: the containing chunk is re-MERGEd in full —
+    idempotent, gap-free even if ``full_refresh_chunk`` changed mid-run — and
+    the ``max`` guard prevents resuming before the run's own start (e.g. a
+    marker that predates the current window/source beginning).
+    """
+    resume_start = expand_to_bucket_bounds(resume_from, resume_from, chunk)[0]
+    return max(start, resume_start)
+
+
 async def _backfill_ranges(
     cursor,
     view: ViewConfig,
@@ -158,14 +176,7 @@ async def _backfill_ranges(
         "chunked full refresh requires bucket_alias; validate_chunk_compatibility should have rejected this view"
     )
     if resume_from is not None:
-        # Floor the committed-progress marker to the start of the chunk it
-        # lands in so every emitted range is a full chunk. The containing
-        # chunk is re-MERGEd in full — idempotent, and gap-free even if
-        # full_refresh_chunk changed mid-backfill. ``max`` guards against a
-        # marker that predates the current source start (e.g. source data
-        # aged out): never resume before the source's beginning.
-        resume_start = expand_to_bucket_bounds(resume_from, resume_from, view.full_refresh_chunk)[0]
-        start = max(start, resume_start)
+        start = _floor_resume_to_chunk(start, resume_from, view.full_refresh_chunk)
     return list(walk_buckets(start, end, view.full_refresh_chunk))
 
 
@@ -178,13 +189,16 @@ async def execute_refresh(
     *,
     incremental_range: tuple[datetime, datetime] | None = None,
     resume_from: datetime | None = None,
+    incremental_resume_from: datetime | None = None,
 ) -> AsyncIterator[QueryInfo]:
     """Execute a refresh as a sequence of per-range MERGE commits.
 
     - ``incremental_range`` given → one MERGE over it, unless
       ``view.full_refresh_chunk`` is set, in which case the window is split
       into N bucket-aligned per-chunk MERGEs (issue #61) — a large catch-up
-      window would otherwise OOM as a single MERGE.
+      window would otherwise OOM as a single MERGE. ``incremental_resume_from``
+      (the incremental committed-progress marker, distinct from ``resume_from``)
+      lets an interrupted chunked-incremental run skip already-committed chunks.
     - ``view.full_refresh_chunk`` set (no incremental_range) → N MERGEs, one per chunk, from the
       source's beginning (or from ``resume_from`` — a committed-progress
       marker for an interrupted backfill, see ``_backfill_ranges``).
@@ -211,6 +225,17 @@ async def execute_refresh(
             # chunk-aligned end is NOT over-expanded by a whole empty chunk.
             r_start, r_end = incremental_range
             start, end = expand_to_bucket_bounds(r_start, r_end - timedelta(microseconds=1), view.full_refresh_chunk)
+            if incremental_resume_from is not None:
+                # Resume an interrupted chunked-incremental run: floor the
+                # committed-progress marker to its containing chunk and skip
+                # earlier (already-committed) chunks. Safe because the window is
+                # recomputed from the unchanged source bookmark (same window),
+                # the chunks are idempotent keyed MERGEs, and any source change
+                # below the resume point lands in a newer snapshot the
+                # still-unadvanced bookmark picks up on a later cycle. The
+                # ``max`` guard (via _floor_resume_to_chunk) never resumes
+                # before the window's start.
+                start = _floor_resume_to_chunk(start, incremental_resume_from, view.full_refresh_chunk)
             ranges: list[tuple[datetime, datetime]] = list(walk_buckets(start, end, view.full_refresh_chunk))
             stage = "chunk_merge"
         else:

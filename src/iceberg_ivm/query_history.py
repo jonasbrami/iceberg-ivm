@@ -79,7 +79,15 @@ CREATE TABLE IF NOT EXISTS view_status (
     -- (re)computed by the *current* run — so it can't reintroduce the
     -- "resume from target_max" correctness hole (issue #62). NULL means no
     -- in-flight backfill → start from the source's beginning.
-    backfill_progress     TEXT
+    backfill_progress     TEXT,
+    -- Committed-progress marker for an in-flight chunked *incremental* catch-up
+    -- (issue #61): the upper bound (ISO-8601) of the last diff-window chunk
+    -- merged. Distinct from backfill_progress — it says nothing about buckets
+    -- below the incremental window's start, so it must NEVER be read by the
+    -- FULL path (that would re-introduce the #62 staleness hole). Written after
+    -- each incremental chunk commits, cleared on clean completion and on entry
+    -- to any full refresh. NULL means no in-flight chunked incremental.
+    incremental_progress  TEXT
 );
 """
 
@@ -142,6 +150,8 @@ class QueryHistory:
             cols = {row[1] for row in await cur.fetchall()}
         if "backfill_progress" not in cols:
             await self._db.execute("ALTER TABLE view_status ADD COLUMN backfill_progress TEXT")
+        if "incremental_progress" not in cols:
+            await self._db.execute("ALTER TABLE view_status ADD COLUMN incremental_progress TEXT")
 
     async def close(self) -> None:
         if self._db is not None:
@@ -322,6 +332,41 @@ class QueryHistory:
     async def clear_backfill_progress(self, view: str) -> None:
         await self._db.execute(
             "UPDATE view_status SET backfill_progress = NULL WHERE view = ?",
+            (view,),
+        )
+        await self._db.commit()
+
+    # ── incremental_progress ──────────────────────────────────────────
+    # Committed-progress marker for an in-flight chunked *incremental* catch-up
+    # (issue #61). Mirrors backfill_progress exactly (lives on the view_status
+    # row, kept out of _VIEW_STATUS_COLS so the ViewStatus mirror can't clobber
+    # it) but is strictly path-isolated: read/written only on the INCREMENTAL
+    # path, never the FULL path. Written after each incremental chunk commits,
+    # cleared on clean completion (alongside the bookmark write) and on entry to
+    # any full refresh so a stale incremental marker can't leak into a full run.
+
+    async def get_incremental_progress(self, view: str) -> datetime | None:
+        async with self._db.execute(
+            "SELECT incremental_progress FROM view_status WHERE view = ?",
+            (view,),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row or row[0] is None:
+            return None
+        return datetime.fromisoformat(row[0])
+
+    async def set_incremental_progress(self, view: str, end: datetime) -> None:
+        await self._db.execute(
+            "INSERT INTO view_status (view, incremental_progress) VALUES (?, ?) "
+            "ON CONFLICT(view) DO UPDATE SET "
+            "incremental_progress = excluded.incremental_progress",
+            (view, end.isoformat()),
+        )
+        await self._db.commit()
+
+    async def clear_incremental_progress(self, view: str) -> None:
+        await self._db.execute(
+            "UPDATE view_status SET incremental_progress = NULL WHERE view = ?",
             (view,),
         )
         await self._db.commit()

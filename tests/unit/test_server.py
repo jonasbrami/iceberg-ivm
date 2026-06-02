@@ -2765,6 +2765,226 @@ async def test_refresh_view_chunked_incremental_does_not_write_progress_marker(s
         await h.close()
 
 
+async def test_refresh_view_chunked_incremental_persists_incremental_progress(setup_state, tmp_path):
+    """An interrupted multi-chunk INCREMENTAL run (#61) persists
+    ``incremental_progress`` per committed chunk and does NOT advance the
+    bookmark, so the next tick can resume from it (skipping committed chunks)
+    instead of livelocking on the window prefix forever (#61/#62)."""
+    from datetime import datetime
+
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.executor import QueryInfo
+    from iceberg_ivm.introspect import ColumnInfo
+
+    view = _install_chunked_view(setup_state)
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
+    # Fixture leaves stop_event set → break after the first committed chunk.
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+
+    async def fake_detect(*a, **kw):
+        return ChangeResult(
+            action=RefreshAction.INCREMENTAL,
+            current_snapshot=42,
+            filter_range=(datetime(2026, 5, 16, tzinfo=UTC), datetime(2026, 5, 19, tzinfo=UTC)),
+        )
+
+    async def fake_discover(cursor, query):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+
+    async def fake_execute_refresh(*a, **kw):
+        # No resume marker present yet → incremental_resume_from must be None.
+        assert kw.get("incremental_resume_from") is None
+        yield QueryInfo(
+            query_id="q1",
+            info_uri="http://trino/q1",
+            stage="chunk_merge",
+            started_at=1.0,
+            elapsed_ms=100.0,
+            range_start=datetime(2026, 5, 16, tzinfo=UTC),
+            range_end=datetime(2026, 5, 17, tzinfo=UTC),
+            chunks_done=1,
+            chunks_total=3,
+        )
+        yield QueryInfo(
+            query_id="q2",
+            info_uri="http://trino/q2",
+            stage="chunk_merge",
+            started_at=2.0,
+            elapsed_ms=100.0,
+            range_start=datetime(2026, 5, 17, tzinfo=UTC),
+            range_end=datetime(2026, 5, 18, tzinfo=UTC),
+            chunks_done=2,
+            chunks_total=3,
+        )
+
+    try:
+        with (
+            patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+            patch.object(server_mod, "discover_columns", fake_discover),
+            patch.object(server_mod, "detect_changes", fake_detect),
+            patch.object(server_mod, "execute_refresh", fake_execute_refresh),
+        ):
+            await server_mod.refresh_view(setup_state, view)
+
+        # Interrupted: bookmark NOT advanced (next tick recomputes same window).
+        assert await h.get_last_source_snapshot(view.name) is None
+        # Incremental resume marker persisted at the committed chunk's range_end.
+        assert await h.get_incremental_progress(view.name) == datetime(2026, 5, 17, tzinfo=UTC)
+        # FULL-path marker must NOT have been touched on the incremental path.
+        assert await h.get_backfill_progress(view.name) is None
+    finally:
+        await h.close()
+
+
+async def test_refresh_view_chunked_incremental_resumes_from_incremental_progress(setup_state, tmp_path):
+    """A pre-existing ``incremental_progress`` marker is read and threaded to
+    the executor as ``incremental_resume_from`` (NOT ``resume_from``, which is
+    the FULL path's input)."""
+    from datetime import datetime
+
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.executor import QueryInfo
+    from iceberg_ivm.introspect import ColumnInfo
+
+    view = _install_chunked_view(setup_state)
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
+    setup_state.stop_event.clear()
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+    marker = datetime(2026, 5, 17, tzinfo=UTC)
+    await h.set_incremental_progress(view.name, marker)
+
+    seen = {}
+
+    async def fake_detect(*a, **kw):
+        return ChangeResult(
+            action=RefreshAction.INCREMENTAL,
+            current_snapshot=42,
+            filter_range=(datetime(2026, 5, 16, tzinfo=UTC), datetime(2026, 5, 19, tzinfo=UTC)),
+        )
+
+    async def fake_discover(cursor, query):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+
+    async def fake_execute_refresh(*a, **kw):
+        seen["incremental_resume_from"] = kw.get("incremental_resume_from")
+        seen["resume_from"] = kw.get("resume_from")
+        yield QueryInfo(
+            query_id="q1",
+            info_uri="http://trino/q1",
+            stage="chunk_merge",
+            started_at=1.0,
+            elapsed_ms=100.0,
+            range_start=datetime(2026, 5, 17, tzinfo=UTC),
+            range_end=datetime(2026, 5, 18, tzinfo=UTC),
+            chunks_done=1,
+            chunks_total=2,
+        )
+        yield QueryInfo(
+            query_id="q2",
+            info_uri="http://trino/q2",
+            stage="chunk_merge",
+            started_at=2.0,
+            elapsed_ms=100.0,
+            range_start=datetime(2026, 5, 18, tzinfo=UTC),
+            range_end=datetime(2026, 5, 19, tzinfo=UTC),
+            chunks_done=2,
+            chunks_total=2,
+        )
+
+    try:
+        with (
+            patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+            patch.object(server_mod, "discover_columns", fake_discover),
+            patch.object(server_mod, "detect_changes", fake_detect),
+            patch.object(server_mod, "execute_refresh", fake_execute_refresh),
+        ):
+            await server_mod.refresh_view(setup_state, view)
+
+        # Resume value came from incremental_progress, not from the FULL input.
+        assert seen["incremental_resume_from"] == marker
+        assert seen["resume_from"] is None
+        # Clean completion: bookmark advanced AND the marker cleared.
+        assert await h.get_last_source_snapshot(view.name) == 42
+        assert await h.get_incremental_progress(view.name) is None
+    finally:
+        await h.close()
+
+
+async def test_refresh_view_full_refresh_clears_lingering_incremental_progress(setup_state, tmp_path):
+    """Leak-prevention: a FULL_REFRESH must clear any lingering
+    ``incremental_progress`` (left by an interrupted incremental whose source
+    snapshot then expired) and must NEVER read it as a resume point — the FULL
+    path's resume comes ONLY from ``backfill_progress``."""
+    from datetime import datetime
+
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.executor import QueryInfo
+    from iceberg_ivm.introspect import ColumnInfo
+
+    view = _install_chunked_view(setup_state)
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
+    setup_state.stop_event.clear()
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+    # A stale incremental marker survives from an interrupted incremental run.
+    await h.set_incremental_progress(view.name, datetime(2026, 5, 17, tzinfo=UTC))
+    # And a legitimate FULL-path resume marker.
+    backfill_marker = datetime(2026, 4, 9, tzinfo=UTC)
+    await h.set_backfill_progress(view.name, backfill_marker)
+
+    seen = {}
+
+    async def fake_detect(*a, **kw):
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=42)
+
+    async def fake_discover(cursor, query):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+
+    async def fake_execute_refresh(*a, **kw):
+        seen["resume_from"] = kw.get("resume_from")
+        seen["incremental_resume_from"] = kw.get("incremental_resume_from")
+        yield QueryInfo(
+            query_id="q1",
+            info_uri="http://trino/q1",
+            stage="chunk_merge",
+            started_at=1.0,
+            elapsed_ms=100.0,
+            range_start=datetime(2026, 4, 9, tzinfo=UTC),
+            range_end=datetime(2026, 4, 10, tzinfo=UTC),
+            chunks_done=1,
+            chunks_total=1,
+        )
+
+    try:
+        with (
+            patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+            patch.object(server_mod, "discover_columns", fake_discover),
+            patch.object(server_mod, "detect_changes", fake_detect),
+            patch.object(server_mod, "execute_refresh", fake_execute_refresh),
+        ):
+            await server_mod.refresh_view(setup_state, view)
+
+        # FULL path resume comes ONLY from backfill_progress.
+        assert seen["resume_from"] == backfill_marker
+        # The stale incremental marker was never consumed as a resume point...
+        assert seen["incremental_resume_from"] is None
+        # ...and is cleared so it can never coexist with / leak into a full run.
+        assert await h.get_incremental_progress(view.name) is None
+    finally:
+        await h.close()
+
+
 def test_chunk_metrics_defined():
     """Per-chunk Prometheus metrics are registered so operators can build
     chunked-backfill dashboards without scraping stdout."""

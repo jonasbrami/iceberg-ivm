@@ -447,3 +447,153 @@ async def test_delete_view_purges_backfill_progress(history):
     await history.set_backfill_progress("v", datetime(2026, 4, 9, tzinfo=UTC))
     await history.delete_view("v")
     assert await history.get_backfill_progress("v") is None
+
+
+# ── incremental_progress (chunked incremental resume marker, issue #61/#62) ──
+
+
+async def test_get_incremental_progress_unknown_view(history):
+    """No row at all → None (no in-flight chunked incremental)."""
+    assert await history.get_incremental_progress("never-seen") is None
+
+
+async def test_get_incremental_progress_row_without_marker(history):
+    """Row exists from upsert_view_status but the marker column is NULL."""
+    await history.upsert_view_status("v", {"total_refreshes": 3})
+    assert await history.get_incremental_progress("v") is None
+
+
+async def test_set_then_get_incremental_progress(history):
+    from datetime import UTC, datetime
+
+    end = datetime(2026, 5, 17, tzinfo=UTC)
+    await history.set_incremental_progress("v", end)
+    assert await history.get_incremental_progress("v") == end
+
+
+async def test_set_incremental_progress_updates(history):
+    from datetime import UTC, datetime
+
+    await history.set_incremental_progress("v", datetime(2026, 5, 17, tzinfo=UTC))
+    await history.set_incremental_progress("v", datetime(2026, 5, 18, tzinfo=UTC))
+    assert await history.get_incremental_progress("v") == datetime(2026, 5, 18, tzinfo=UTC)
+
+
+async def test_clear_incremental_progress(history):
+    from datetime import UTC, datetime
+
+    await history.set_incremental_progress("v", datetime(2026, 5, 17, tzinfo=UTC))
+    await history.clear_incremental_progress("v")
+    assert await history.get_incremental_progress("v") is None
+
+
+async def test_incremental_progress_orthogonal_to_other_markers(history):
+    """incremental_progress shares the view_status row with backfill_progress,
+    the bookmark and the ViewStatus mirror — all four must stay orthogonal."""
+    from datetime import UTC, datetime
+
+    inc = datetime(2026, 5, 17, tzinfo=UTC)
+    full = datetime(2026, 4, 9, tzinfo=UTC)
+    await history.upsert_view_status("v", {"total_refreshes": 7, "last_action": "incremental"})
+    await history.set_last_source_snapshot("v", 99)
+    await history.set_backfill_progress("v", full)
+    await history.set_incremental_progress("v", inc)
+
+    persisted = await history.get_view_status("v")
+    assert persisted["total_refreshes"] == 7
+    assert await history.get_last_source_snapshot("v") == 99
+    assert await history.get_backfill_progress("v") == full
+    assert await history.get_incremental_progress("v") == inc
+
+    # A later ViewStatus mirror write must leave every marker alone.
+    await history.upsert_view_status("v", {"total_refreshes": 8})
+    assert await history.get_backfill_progress("v") == full
+    assert await history.get_incremental_progress("v") == inc
+    assert await history.get_last_source_snapshot("v") == 99
+
+
+async def test_incremental_progress_survives_reopen(tmp_path):
+    from datetime import UTC, datetime
+
+    end = datetime(2026, 5, 17, tzinfo=UTC)
+    path = tmp_path / "state.db"
+    h1 = QueryHistory(path, limit=5)
+    await h1.open()
+    await h1.set_incremental_progress("v", end)
+    await h1.close()
+
+    h2 = QueryHistory(path, limit=5)
+    await h2.open()
+    try:
+        assert await h2.get_incremental_progress("v") == end
+    finally:
+        await h2.close()
+
+
+async def test_delete_view_purges_incremental_progress(history):
+    from datetime import UTC, datetime
+
+    await history.set_incremental_progress("v", datetime(2026, 5, 17, tzinfo=UTC))
+    await history.delete_view("v")
+    assert await history.get_incremental_progress("v") is None
+
+
+async def test_incremental_progress_migration_idempotent(tmp_path):
+    """A DB created without ``incremental_progress`` (pre-#65 schema) gains the
+    column on open, opening twice is a no-op, and pre-existing rows keep their
+    bookmark + backfill_progress + counters intact through the migration."""
+    from datetime import UTC, datetime
+
+    import aiosqlite
+
+    path = tmp_path / "state.db"
+    # Build an old-schema view_status table WITHOUT incremental_progress, with
+    # a populated row carrying every other marker / counter.
+    async with aiosqlite.connect(str(path)) as db:
+        # Pre-#65 view_status schema: every column EXCEPT incremental_progress.
+        await db.execute(
+            "CREATE TABLE view_status ("
+            "  view TEXT PRIMARY KEY,"
+            "  last_refresh REAL,"
+            "  last_duration REAL,"
+            "  last_action TEXT NOT NULL DEFAULT 'pending',"
+            "  last_range TEXT,"
+            "  last_error TEXT,"
+            "  total_refreshes INTEGER NOT NULL DEFAULT 0,"
+            "  total_errors INTEGER NOT NULL DEFAULT 0,"
+            "  chunks_done INTEGER NOT NULL DEFAULT 0,"
+            "  chunks_total INTEGER,"
+            "  last_source_snapshot INTEGER,"
+            "  backfill_progress TEXT"
+            ")"
+        )
+        await db.execute(
+            "INSERT INTO view_status (view, total_refreshes, last_source_snapshot, backfill_progress) "
+            "VALUES ('v', 5, 77, ?)",
+            (datetime(2026, 4, 9, tzinfo=UTC).isoformat(),),
+        )
+        await db.commit()
+
+    # First open migrates the column in.
+    h1 = QueryHistory(path, limit=5)
+    await h1.open()
+    try:
+        assert await h1.get_incremental_progress("v") is None  # new column NULL
+        # Pre-existing markers / counters survived.
+        assert await h1.get_last_source_snapshot("v") == 77
+        assert await h1.get_backfill_progress("v") == datetime(2026, 4, 9, tzinfo=UTC)
+        assert (await h1.get_view_status("v"))["total_refreshes"] == 5
+        await h1.set_incremental_progress("v", datetime(2026, 5, 17, tzinfo=UTC))
+    finally:
+        await h1.close()
+
+    # Opening again must not error (ADD COLUMN is guarded) and must preserve.
+    h2 = QueryHistory(path, limit=5)
+    await h2.open()
+    try:
+        assert await h2.get_incremental_progress("v") == datetime(2026, 5, 17, tzinfo=UTC)
+        assert await h2.get_backfill_progress("v") == datetime(2026, 4, 9, tzinfo=UTC)
+        assert await h2.get_last_source_snapshot("v") == 77
+        assert (await h2.get_view_status("v"))["total_refreshes"] == 5
+    finally:
+        await h2.close()

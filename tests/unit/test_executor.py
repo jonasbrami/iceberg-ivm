@@ -140,6 +140,85 @@ class TestExecuteRefreshIncremental:
             assert q.range_end == datetime(2026, 5, 17 + i, tzinfo=UTC)
         assert len({q.query_id for q in queries}) == 3
 
+    async def test_incremental_resume_marker_floors_to_containing_chunk(self):
+        # Issue #61/#62 (incremental resume): an interrupted chunked-incremental
+        # run leaves an incremental_progress marker. On restart the SAME window
+        # is recomputed from the unchanged bookmark; the marker (end of the last
+        # committed chunk) is floored to the start of its containing chunk and
+        # earlier, already-committed chunks are skipped. Idempotent re-MERGE of
+        # the boundary chunk keeps it gap-free.
+        cursor = MockCursor(stats={"processedRows": 100, "processedBytes": 4096})
+        view = make_view(full_refresh_chunk="day")
+        parsed = parse_view_query(view.query)
+        # 3-day window; marker says the May 16 chunk committed (ended May 17).
+        r_start = datetime(2026, 5, 16, tzinfo=UTC)
+        r_end = datetime(2026, 5, 19, tzinfo=UTC)
+        queries = [
+            q
+            async for q in execute_refresh(
+                cursor,
+                view,
+                "iceberg.out.mv",
+                parsed,
+                ["volume"],
+                incremental_range=(r_start, r_end),
+                incremental_resume_from=datetime(2026, 5, 17, tzinfo=UTC),
+            )
+        ]
+        assert len(queries) == 2
+        assert all(q.stage == "chunk_merge" for q in queries)
+        assert queries[0].range_start == datetime(2026, 5, 17, tzinfo=UTC)
+        assert queries[1].range_start == datetime(2026, 5, 18, tzinfo=UTC)
+
+    async def test_incremental_resume_marker_mid_chunk_remerges_containing_chunk(self):
+        # Marker lands mid-chunk (interrupted run committed a coarser chunk,
+        # then chunk size shrank). Floor to the containing chunk start so the
+        # partial chunk is re-MERGEd in full — gap-free.
+        cursor = MockCursor(stats={"processedRows": 100})
+        view = make_view(full_refresh_chunk="day")
+        parsed = parse_view_query(view.query)
+        r_start = datetime(2026, 5, 16, tzinfo=UTC)
+        r_end = datetime(2026, 5, 19, tzinfo=UTC)
+        queries = [
+            q
+            async for q in execute_refresh(
+                cursor,
+                view,
+                "iceberg.out.mv",
+                parsed,
+                ["volume"],
+                incremental_range=(r_start, r_end),
+                incremental_resume_from=datetime(2026, 5, 18, 6, tzinfo=UTC),
+            )
+        ]
+        assert len(queries) == 1
+        assert queries[0].range_start == datetime(2026, 5, 18, tzinfo=UTC)
+        assert queries[0].range_end == datetime(2026, 5, 19, tzinfo=UTC)
+
+    async def test_incremental_resume_marker_before_window_start_is_clamped(self):
+        # A marker that predates the window's start (e.g. left from a coarser
+        # earlier window) must never resume before the window begins — ``max``
+        # guards against it, so all chunks run.
+        cursor = MockCursor(stats={"processedRows": 100})
+        view = make_view(full_refresh_chunk="day")
+        parsed = parse_view_query(view.query)
+        r_start = datetime(2026, 5, 16, tzinfo=UTC)
+        r_end = datetime(2026, 5, 19, tzinfo=UTC)
+        queries = [
+            q
+            async for q in execute_refresh(
+                cursor,
+                view,
+                "iceberg.out.mv",
+                parsed,
+                ["volume"],
+                incremental_range=(r_start, r_end),
+                incremental_resume_from=datetime(2026, 5, 10, tzinfo=UTC),
+            )
+        ]
+        assert len(queries) == 3
+        assert queries[0].range_start == datetime(2026, 5, 16, tzinfo=UTC)
+
     async def test_small_window_with_chunk_stays_single_merge(self):
         # Steady-state incremental: a window that fits in one chunk emits
         # exactly one chunk_merge — no behavior change beyond the stage label.
