@@ -485,7 +485,16 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
                     # *this* from-beginning run committed. The next tick resumes
                     # from it (skipping redone work) without ever consulting the
                     # target's data — the core of issue #62.
-                    if s.history is not None and q.range_end is not None:
+                    #
+                    # FULL-path only (``chunked``). A chunked *incremental*
+                    # catch-up (issue #61) is also multi-chunk, but its resume
+                    # point is the source bookmark, not this marker: persisting
+                    # here would (a) be ignored on the next incremental tick
+                    # (resume_from is read only on the FULL path) and (b) leak a
+                    # stale marker into a later FULL refresh, wrongly skipping
+                    # chunks. An interrupted incremental simply recomputes the
+                    # same window next tick and re-runs idempotent chunks.
+                    if chunked and s.history is not None and q.range_end is not None:
                         await s.history.set_backfill_progress(view.name, q.range_end)
                     CHUNKS_COMPLETED.labels(view=view.name).inc()
                     CHUNK_DURATION.labels(view=view.name).observe(q.elapsed_ms / 1000.0)

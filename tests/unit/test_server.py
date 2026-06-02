@@ -2681,6 +2681,90 @@ async def test_refresh_view_interrupt_preserves_progress_marker(setup_state, tmp
         await h.close()
 
 
+async def test_refresh_view_chunked_incremental_does_not_write_progress_marker(setup_state, tmp_path):
+    """A multi-chunk INCREMENTAL catch-up (#61) tracks chunks_done/total like a
+    chunked full refresh, but must NOT persist the backfill_progress marker:
+    that marker is the FULL-path resume point (#62), keyed off the source's
+    beginning. Writing it on the incremental path would (a) be ignored on the
+    next incremental tick (resume_from is read only for FULL) and (b) leak a
+    stale marker into a later FULL refresh, wrongly skipping chunks. An
+    interrupted incremental recomputes the same window next tick instead."""
+    from datetime import datetime
+
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.executor import QueryInfo
+    from iceberg_ivm.introspect import ColumnInfo
+
+    view = _install_chunked_view(setup_state)
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
+    # The fixture leaves ``stop_event`` set, so refresh_view breaks after the
+    # first committed chunk — this is the mid-catch-up interruption that,
+    # without the FULL-only gate, would leak a stale backfill_progress marker
+    # into a later FULL refresh.
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+
+    async def fake_detect(*a, **kw):
+        return ChangeResult(
+            action=RefreshAction.INCREMENTAL,
+            current_snapshot=42,
+            filter_range=(datetime(2026, 5, 16, tzinfo=UTC), datetime(2026, 5, 19, tzinfo=UTC)),
+        )
+
+    async def fake_discover(cursor, query):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+
+    async def fake_execute_refresh(*a, **kw):
+        # The incremental path must NOT pass a resume_from to the executor.
+        assert kw.get("resume_from") is None
+        yield QueryInfo(
+            query_id="q1",
+            info_uri="http://trino/q1",
+            stage="chunk_merge",
+            started_at=1.0,
+            elapsed_ms=100.0,
+            range_start=datetime(2026, 5, 16, tzinfo=UTC),
+            range_end=datetime(2026, 5, 17, tzinfo=UTC),
+            chunks_done=1,
+            chunks_total=3,
+        )
+        yield QueryInfo(
+            query_id="q2",
+            info_uri="http://trino/q2",
+            stage="chunk_merge",
+            started_at=2.0,
+            elapsed_ms=100.0,
+            chunks_done=2,
+            chunks_total=3,
+        )
+
+    try:
+        with (
+            patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+            patch.object(server_mod, "discover_columns", fake_discover),
+            patch.object(server_mod, "detect_changes", fake_detect),
+            patch.object(server_mod, "execute_refresh", fake_execute_refresh),
+        ):
+            await server_mod.refresh_view(setup_state, view)
+
+        vs = setup_state.view_statuses[view.name]
+        assert vs.last_action == "incremental"
+        # Per-chunk progress still tracked while in flight.
+        assert vs.chunks_done == 1
+        assert vs.chunks_total == 3
+        # Interrupted: bookmark not advanced (next tick recomputes the same
+        # incremental window and re-runs idempotent chunks)...
+        assert await h.get_last_source_snapshot(view.name) is None
+        # ...and crucially the FULL-path resume marker is NEVER written on the
+        # incremental path, so it can't leak into a later FULL refresh.
+        assert await h.get_backfill_progress(view.name) is None
+    finally:
+        await h.close()
+
+
 def test_chunk_metrics_defined():
     """Per-chunk Prometheus metrics are registered so operators can build
     chunked-backfill dashboards without scraping stdout."""

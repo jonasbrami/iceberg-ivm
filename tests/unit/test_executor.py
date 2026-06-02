@@ -109,6 +109,60 @@ class TestExecuteRefreshIncremental:
         assert "ts < TIMESTAMP '2026-04-09 00:00:00.000000 UTC'" in merge
         assert "MERGE INTO iceberg.out.mv" in merge
 
+    async def test_large_window_with_chunk_emits_one_merge_per_chunk(self):
+        # Issue #61: a large catch-up incremental window must be chunked the
+        # same way the full path is when full_refresh_chunk is set, so the
+        # single giant MERGE that OOMs the join build side is split into N
+        # bounded per-chunk MERGEs.
+        cursor = MockCursor(stats={"processedRows": 100, "processedBytes": 4096})
+        view = make_view(full_refresh_chunk="day")
+        parsed = parse_view_query(view.query)
+        # 3-day catch-up window, already bucket-aligned by the detector.
+        r_start = datetime(2026, 5, 16, tzinfo=UTC)
+        r_end = datetime(2026, 5, 19, tzinfo=UTC)
+        queries = [
+            q
+            async for q in execute_refresh(
+                cursor,
+                view,
+                "iceberg.out.mv",
+                parsed,
+                ["volume"],
+                incremental_range=(r_start, r_end),
+            )
+        ]
+        assert len(queries) == 3
+        assert all(q.stage == "chunk_merge" for q in queries)
+        assert [q.chunks_done for q in queries] == [1, 2, 3]
+        assert {q.chunks_total for q in queries} == {3}
+        for i, q in enumerate(queries):
+            assert q.range_start == datetime(2026, 5, 16 + i, tzinfo=UTC)
+            assert q.range_end == datetime(2026, 5, 17 + i, tzinfo=UTC)
+        assert len({q.query_id for q in queries}) == 3
+
+    async def test_small_window_with_chunk_stays_single_merge(self):
+        # Steady-state incremental: a window that fits in one chunk emits
+        # exactly one chunk_merge — no behavior change beyond the stage label.
+        cursor = MockCursor(stats={"processedRows": 10})
+        view = make_view(full_refresh_chunk="day")
+        parsed = parse_view_query(view.query)
+        r_start = datetime(2026, 5, 16, tzinfo=UTC)
+        r_end = datetime(2026, 5, 17, tzinfo=UTC)
+        queries = [
+            q
+            async for q in execute_refresh(
+                cursor,
+                view,
+                "iceberg.out.mv",
+                parsed,
+                ["volume"],
+                incremental_range=(r_start, r_end),
+            )
+        ]
+        assert len(queries) == 1
+        assert queries[0].stage == "chunk_merge"
+        assert queries[0].range_start == r_start and queries[0].range_end == r_end
+
 
 # ── execute_refresh: single-shot full refresh (no chunk) ──
 

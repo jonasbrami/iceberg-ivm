@@ -17,7 +17,7 @@ import logging
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from iceberg_ivm.config import ViewConfig
 from iceberg_ivm.detector import (
@@ -181,8 +181,11 @@ async def execute_refresh(
 ) -> AsyncIterator[QueryInfo]:
     """Execute a refresh as a sequence of per-range MERGE commits.
 
-    - ``incremental_range`` given → one MERGE over it.
-    - ``view.full_refresh_chunk`` set → N MERGEs, one per chunk, from the
+    - ``incremental_range`` given → one MERGE over it, unless
+      ``view.full_refresh_chunk`` is set, in which case the window is split
+      into N bucket-aligned per-chunk MERGEs (issue #61) — a large catch-up
+      window would otherwise OOM as a single MERGE.
+    - ``view.full_refresh_chunk`` set (no incremental_range) → N MERGEs, one per chunk, from the
       source's beginning (or from ``resume_from`` — a committed-progress
       marker for an interrupted backfill, see ``_backfill_ranges``).
     - otherwise → one MERGE over the full source range (single-shot full).
@@ -193,8 +196,26 @@ async def execute_refresh(
     next tick resumes from it.
     """
     if incremental_range is not None:
-        ranges: list[tuple[datetime, datetime]] = [incremental_range]
-        stage = "merge"
+        # A large catch-up incremental window (view fell far behind) would
+        # otherwise run as ONE giant MERGE whose join build side OOMs the node
+        # (issue #61). When chunking is configured, split it the same way the
+        # full path does so the window closes as N bounded per-chunk MERGEs;
+        # a steady-state tiny window collapses to a single chunk — no real
+        # behavior change beyond the stage label.
+        if view.full_refresh_chunk:
+            # The detector already snapped ``incremental_range`` to the view's
+            # own (finer-or-equal) granularity as a HALF-OPEN ``[start, end)``.
+            # Re-align it outward to the (coarser-or-equal) chunk grid: floor
+            # the start, and expand the *last instant* of the window
+            # (``end`` exclusive → ``end - 1µs`` inclusive) so an already
+            # chunk-aligned end is NOT over-expanded by a whole empty chunk.
+            r_start, r_end = incremental_range
+            start, end = expand_to_bucket_bounds(r_start, r_end - timedelta(microseconds=1), view.full_refresh_chunk)
+            ranges: list[tuple[datetime, datetime]] = list(walk_buckets(start, end, view.full_refresh_chunk))
+            stage = "chunk_merge"
+        else:
+            ranges = [incremental_range]
+            stage = "merge"
     else:
         ranges = await _backfill_ranges(cursor, view, parsed, resume_from=resume_from)
         stage = "chunk_merge" if view.full_refresh_chunk else "merge"
