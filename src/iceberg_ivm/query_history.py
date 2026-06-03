@@ -315,17 +315,9 @@ class QueryHistory:
         await self._db.commit()
 
     # ── current_work ──────────────────────────────────────────────────
-    # The unified in-flight run record (issue #61/#62), replacing the old
-    # two-marker design. Like last_source_snapshot these columns live on the
-    # view_status row but are kept out of _VIEW_STATUS_COLS so the ViewStatus
-    # mirror can't clobber them. Set together when a run starts (max_snapshot
-    # pinned, last_merged_chunk NULL), the chunk updated after each commit, and
-    # both cleared on clean completion (alongside advancing the bookmark).
-    #
-    # work_max_snapshot is the PINNED upper bound: on resume it is reused
-    # verbatim, never recomputed from the live source — that pin is what gives
-    # a deterministic (bookmark, M] window across resumes (fixes Bug 1) and
-    # lets every chunk read the identical immutable snapshot (fixes Bug 2).
+    # The unified in-flight run record (#61/#62); see _SCHEMA for the pin
+    # rationale and invariant. Kept out of _VIEW_STATUS_COLS so the ViewStatus
+    # mirror can't clobber it; set/cleared together with the bookmark write.
 
     async def get_current_work(self, view: str) -> tuple[int | None, datetime | None]:
         """Return ``(work_max_snapshot, work_last_merged_chunk)`` for ``view``.

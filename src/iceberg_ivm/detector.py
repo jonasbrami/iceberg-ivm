@@ -350,16 +350,12 @@ async def incremental_range_since(
 ) -> tuple[datetime, datetime] | None:
     """Snapped ``[start, end)`` of buckets touched by append/overwrite files in
     snapshots ``(last_snapshot, max_snapshot]`` (``max_snapshot=None`` → up to
-    the latest snapshot, used by the live-detection path).
+    the latest, used by live detection; a pinned bound freezes the window across
+    resumes — see DESIGN.md "No window drift", #61/#62).
 
-    Returns ``None`` when that window has no data to merge (no new snapshots, or
+    Returns ``None`` when the window has no data to merge (no new snapshots, or
     only compaction). Raises ``ExpiredSnapshotError`` if a bound snapshot is
     gone, ``UnexpectedOperationError`` on a delete/unknown op.
-
-    Bounding by ``max_snapshot`` is what makes the window deterministic across
-    resumes: the snapshots in ``(last_snapshot, max_snapshot]`` are immutable,
-    so a later overwrite of an older bucket (a newer snapshot) cannot drift the
-    window start mid-run (issues #61/#62).
     """
     snapshots = await get_snapshots_since(cursor, source_table, last_snapshot, max_snapshot=max_snapshot)
     if not snapshots:

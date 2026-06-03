@@ -197,31 +197,22 @@ async def execute_refresh(
 ) -> AsyncIterator[QueryInfo]:
     """Execute a refresh as a sequence of per-range MERGE commits.
 
-    ``max_snapshot`` is the PINNED source snapshot this run reads as of: every
-    chunk's MERGE source is rewritten to ``FROM <source> FOR VERSION AS OF
-    max_snapshot`` (``inject_version_pin``) so all chunks read the identical
-    immutable source state. The materialized view therefore transitions
-    atomically from consistent-as-of-bookmark to consistent-as-of-max_snapshot
-    and never mixes data from different commits, even across a multi-hour run
-    while the source is being written (issue #62, "snapshot mixing").
+    ``max_snapshot`` pins the source read: every chunk's MERGE source gets
+    ``FROM <source> FOR VERSION AS OF max_snapshot`` (``inject_version_pin``) so
+    all chunks see one immutable source state — no snapshot mixing (#62).
 
-    - ``incremental_range`` given → one MERGE over it, unless
-      ``view.full_refresh_chunk`` is set, in which case the window is split into
-      N bucket-aligned per-chunk MERGEs (issue #61) — a large catch-up window
-      would otherwise OOM as a single MERGE.
+    - ``incremental_range`` given → one MERGE over it, or N bucket-aligned
+      per-chunk MERGEs when ``view.full_refresh_chunk`` is set (#61: a large
+      catch-up window would otherwise OOM as a single MERGE).
     - ``view.full_refresh_chunk`` set (no incremental_range) → N MERGEs from the
       source's beginning.
     - otherwise → one MERGE over the full source range (single-shot full).
 
-    ``resume_from`` is the committed-progress point of an interrupted run
-    (``current_work.work_last_merged_chunk``); chunks at/below its containing
-    chunk are skipped. It applies uniformly to both the chunked-incremental and
-    chunked-full paths — the resume mechanism no longer differs by path because
-    the window itself is pinned by ``max_snapshot`` (see ``server.refresh_view``).
+    ``resume_from`` (``current_work.work_last_merged_chunk``) skips chunks
+    at/below its containing chunk — one resume path for both full and
+    incremental, since the window itself is pinned by ``max_snapshot``.
 
-    Yields one ``QueryInfo`` per committed MERGE. Caller cancels by ``break``;
-    each MERGE is one Iceberg commit, so a partial run leaves the target valid
-    and the caller persists ``current_work`` so the next tick resumes from it.
+    Yields one ``QueryInfo`` per committed MERGE; caller cancels by ``break``.
     """
     if incremental_range is not None:
         if view.full_refresh_chunk:

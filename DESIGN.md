@@ -209,37 +209,28 @@ is set the bookmark cannot move. A tick is therefore either *resuming*
 
 This single mechanism delivers four guarantees:
 
-- **Memory safety.** A large window never runs as one `MERGE` (whose join
-  build side `HashBuilderOperator` scales with the window and OOMs any fixed
-  per-node limit) — it is N bounded chunks. Both full and incremental chunk;
-  the earlier asymmetry (only full chunked, a large incremental catch-up OOM'd
-  and looped) was a bug.
-- **Convergence under interruption.** Progress is durable in `current_work`,
-  so a run that is repeatedly cut off (deploy, crash, timeout) resumes from its
-  last committed chunk instead of redoing the window from the start — a
-  sufficiently large window still converges.
-- **No window drift (incremental).** Because `M` is *pinned* and reused
-  verbatim on resume (never re-read from the live source), the snapshot set
-  `(bookmark, M]` — and therefore the incremental bucket window it derives — is
-  identical across resumes. A *newer* snapshot that overwrites an *older*
-  bucket cannot move the window's start mid-run; it is simply out of scope
-  (`> M`) and is picked up on the next run over `(M, M']`. (With a bare
-  timestamp marker re-derived against the live source, that newer snapshot
-  would drift the window start earlier and a forward-only resume would skip the
-  correction — silent staleness.) A *full* backfill re-derives its `[start,
-  end)` from the live `$files` range each resume rather than from the pinned
-  snapshot set, so its window is not frozen the same way — but it stays correct
-  and monotonic: `_floor_resume_to_chunk`'s `max(start, resume)` clamp never
-  redoes a committed chunk, and a grown `max_ts` only appends *trailing* chunks
-  that read empty as of `M` (any data ≤ `M` was already live at detection).
-- **No snapshot mixing.** Every chunk reads `FOR VERSION AS OF M`, so a
-  multi-hour run sees one immutable source state throughout. The MV advances
-  **atomically per run** from consistent-as-of-`bookmark` to
-  consistent-as-of-`M`; it never blends commit *t* with *t−2* without *t−1*,
-  even while the source is being written. (Untouched buckets are unchanged
-  between `bookmark` and `M`, so the whole MV — not just the rewritten part —
-  is consistent as of `M`.) Single-source is a hard precondition for this
-  (joins/subqueries are rejected at parse time), so one pin per chunk suffices.
+- **Memory safety.** A large window runs as N bounded chunks, never one `MERGE`
+  whose join build side OOMs the node — both full and incremental chunk. (Only
+  the full path chunking, while a large incremental catch-up ran as one OOMing
+  MERGE, was the original bug.)
+- **Convergence under interruption.** Progress is durable in `current_work`, so
+  a repeatedly-interrupted run resumes from its last committed chunk instead of
+  redoing the window — even a very large window converges.
+- **No window drift.** `M` is pinned and reused verbatim on resume, so the
+  incremental snapshot set `(bookmark, M]` — and the bucket window it derives —
+  is identical across resumes; a newer snapshot overwriting an *older* bucket is
+  out of scope (`> M`) and handled on the next run. (A bare timestamp marker
+  re-derived against the live source would drift the start earlier, and a
+  forward-only resume would skip the correction — silent staleness.) A full
+  backfill instead re-derives `[start, end)` from the live `$files`, which is
+  still safe: the `max(start, resume)` clamp never redoes a committed chunk, and
+  a grown `max_ts` only appends chunks that read empty as of `M`.
+- **No snapshot mixing.** Every chunk reads `FOR VERSION AS OF M`, so the MV
+  advances atomically per run from consistent-as-of-`bookmark` to
+  consistent-as-of-`M` and never blends commit *t* with *t−2* without *t−1*,
+  even under concurrent writes. (Untouched buckets are unchanged between
+  `bookmark` and `M`, so the whole MV is consistent as of `M`.) Single-source is
+  enforced at parse time, so one pin per chunk suffices.
 
 **Resume point comes from the bookmark / `current_work` only — never the
 target table.** The target tells you what data is *present*, not what is
@@ -257,10 +248,6 @@ the source's beginning — always safe. This is also why no provenance flag is
 needed on `current_work`: a stale incremental record is never *misread* by a
 full refresh, because the moment its bookmark dies the record is structurally
 unreconstructable, not merely "ignored by a rule".
-
-**Why skipping committed chunks on resume is safe.** Each chunk is an
-idempotent `MERGE` keyed on the merge keys, over a window pinned by `M`, so
-re-running is always correct — `current_work` only avoids *redundant* work.
 
 ### Why not dbt?
 

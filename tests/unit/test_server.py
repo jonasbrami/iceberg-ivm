@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from iceberg_ivm.config import Config, load_config, load_views
 from iceberg_ivm.executor import QueryInfo
+from iceberg_ivm.introspect import ColumnInfo
 from iceberg_ivm.query_history import QueryHistory
 from iceberg_ivm.server import (
     RECENT_QUERY_LIMIT,
@@ -19,6 +20,12 @@ from iceberg_ivm.server import (
     app,
     rewrite_info_uri,
 )
+
+
+async def _fake_discover(cursor, query):
+    """Shared column-discovery stub for refresh_view tests (date + value col)."""
+    return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+
 
 STATIC_CONFIG_YAML = textwrap.dedent("""\
     trino:
@@ -2513,7 +2520,6 @@ async def test_refresh_view_chunked_full_completes_clears_current_work(setup_sta
     from iceberg_ivm import server as server_mod
     from iceberg_ivm.detector import ChangeResult, RefreshAction
     from iceberg_ivm.executor import QueryInfo
-    from iceberg_ivm.introspect import ColumnInfo
 
     view = _install_chunked_view(setup_state)
     setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
@@ -2527,9 +2533,6 @@ async def test_refresh_view_chunked_full_completes_clears_current_work(setup_sta
 
     async def fake_detect(*a, **kw):
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=42)
-
-    async def fake_discover(cursor, query):
-        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
 
     async def fake_execute_refresh(*a, **kw):
         seen["max_snapshot"] = kw.get("max_snapshot")
@@ -2550,7 +2553,7 @@ async def test_refresh_view_chunked_full_completes_clears_current_work(setup_sta
     try:
         with (
             patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
-            patch.object(server_mod, "discover_columns", fake_discover),
+            patch.object(server_mod, "discover_columns", _fake_discover),
             patch.object(server_mod, "detect_changes", fake_detect),
             patch.object(server_mod, "execute_refresh", fake_execute_refresh),
         ):
@@ -2573,7 +2576,6 @@ async def test_refresh_view_full_resume_reads_current_work(setup_state, tmp_path
 
     from iceberg_ivm import server as server_mod
     from iceberg_ivm.executor import QueryInfo
-    from iceberg_ivm.introspect import ColumnInfo
 
     view = _install_chunked_view(setup_state)
     setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
@@ -2590,9 +2592,6 @@ async def test_refresh_view_full_resume_reads_current_work(setup_state, tmp_path
 
     async def fake_detect(*a, **kw):
         raise AssertionError("detect_changes must not be called when resuming current_work")
-
-    async def fake_discover(cursor, query):
-        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
 
     async def fake_execute_refresh(*a, **kw):
         seen["max_snapshot"] = kw.get("max_snapshot")
@@ -2612,7 +2611,7 @@ async def test_refresh_view_full_resume_reads_current_work(setup_state, tmp_path
     try:
         with (
             patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
-            patch.object(server_mod, "discover_columns", fake_discover),
+            patch.object(server_mod, "discover_columns", _fake_discover),
             patch.object(server_mod, "snapshot_exists", AsyncMock(return_value=True)),
             patch.object(server_mod, "detect_changes", fake_detect),
             patch.object(server_mod, "execute_refresh", fake_execute_refresh),
@@ -2634,7 +2633,6 @@ async def test_refresh_view_interrupt_preserves_current_work(setup_state, tmp_pa
     from iceberg_ivm import server as server_mod
     from iceberg_ivm.detector import ChangeResult, RefreshAction
     from iceberg_ivm.executor import QueryInfo
-    from iceberg_ivm.introspect import ColumnInfo
 
     view = _install_chunked_view(setup_state)
     setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
@@ -2647,9 +2645,6 @@ async def test_refresh_view_interrupt_preserves_current_work(setup_state, tmp_pa
 
     async def fake_detect(*a, **kw):
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=99)
-
-    async def fake_discover(cursor, query):
-        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
 
     async def fake_execute_refresh(*a, **kw):
         yield QueryInfo(
@@ -2678,7 +2673,7 @@ async def test_refresh_view_interrupt_preserves_current_work(setup_state, tmp_pa
     try:
         with (
             patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
-            patch.object(server_mod, "discover_columns", fake_discover),
+            patch.object(server_mod, "discover_columns", _fake_discover),
             patch.object(server_mod, "detect_changes", fake_detect),
             patch.object(server_mod, "execute_refresh", fake_execute_refresh),
         ):
@@ -2701,7 +2696,6 @@ async def test_refresh_view_incremental_interrupt_persists_current_work(setup_st
     from iceberg_ivm import server as server_mod
     from iceberg_ivm.detector import ChangeResult, RefreshAction
     from iceberg_ivm.executor import QueryInfo
-    from iceberg_ivm.introspect import ColumnInfo
 
     view = _install_chunked_view(setup_state)
     setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
@@ -2717,9 +2711,6 @@ async def test_refresh_view_incremental_interrupt_persists_current_work(setup_st
             current_snapshot=42,
             filter_range=(datetime(2026, 5, 16, tzinfo=UTC), datetime(2026, 5, 19, tzinfo=UTC)),
         )
-
-    async def fake_discover(cursor, query):
-        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
 
     async def fake_execute_refresh(*a, **kw):
         # Fresh run → no resume point threaded.
@@ -2751,7 +2742,7 @@ async def test_refresh_view_incremental_interrupt_persists_current_work(setup_st
     try:
         with (
             patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
-            patch.object(server_mod, "discover_columns", fake_discover),
+            patch.object(server_mod, "discover_columns", _fake_discover),
             patch.object(server_mod, "detect_changes", fake_detect),
             patch.object(server_mod, "execute_refresh", fake_execute_refresh),
         ):
@@ -2777,7 +2768,6 @@ async def test_refresh_view_incremental_resume_reuses_pinned_snapshot(setup_stat
 
     from iceberg_ivm import server as server_mod
     from iceberg_ivm.executor import QueryInfo
-    from iceberg_ivm.introspect import ColumnInfo
 
     view = _install_chunked_view(setup_state)
     setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
@@ -2800,9 +2790,6 @@ async def test_refresh_view_incremental_resume_reuses_pinned_snapshot(setup_stat
         seen["max_snapshot"] = max_snapshot
         return (datetime(2026, 5, 16, tzinfo=UTC), datetime(2026, 5, 19, tzinfo=UTC))
 
-    async def fake_discover(cursor, query):
-        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
-
     async def fake_execute_refresh(*a, **kw):
         seen["exec_max_snapshot"] = kw.get("max_snapshot")
         seen["resume_from"] = kw.get("resume_from")
@@ -2821,7 +2808,7 @@ async def test_refresh_view_incremental_resume_reuses_pinned_snapshot(setup_stat
     try:
         with (
             patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
-            patch.object(server_mod, "discover_columns", fake_discover),
+            patch.object(server_mod, "discover_columns", _fake_discover),
             patch.object(server_mod, "detect_changes", fake_detect),
             patch.object(server_mod, "snapshot_exists", AsyncMock(return_value=True)),
             patch.object(server_mod, "incremental_range_since", fake_range_since),
@@ -2850,7 +2837,6 @@ async def test_refresh_view_expired_bookmark_discards_current_work(setup_state, 
     from iceberg_ivm import server as server_mod
     from iceberg_ivm.detector import ChangeResult, RefreshAction
     from iceberg_ivm.executor import QueryInfo
-    from iceberg_ivm.introspect import ColumnInfo
 
     view = _install_chunked_view(setup_state)
     setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
@@ -2870,9 +2856,6 @@ async def test_refresh_view_expired_bookmark_discards_current_work(setup_state, 
     async def fake_detect(*a, **kw):
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=200)
 
-    async def fake_discover(cursor, query):
-        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
-
     async def fake_execute_refresh(*a, **kw):
         seen["max_snapshot"] = kw.get("max_snapshot")
         seen["resume_from"] = kw.get("resume_from")
@@ -2891,7 +2874,7 @@ async def test_refresh_view_expired_bookmark_discards_current_work(setup_state, 
     try:
         with (
             patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
-            patch.object(server_mod, "discover_columns", fake_discover),
+            patch.object(server_mod, "discover_columns", _fake_discover),
             patch.object(server_mod, "snapshot_exists", fake_exists),
             patch.object(server_mod, "detect_changes", fake_detect),
             patch.object(server_mod, "execute_refresh", fake_execute_refresh),
@@ -2918,7 +2901,6 @@ async def test_refresh_view_full_backfill_resume_recovers_when_pinned_snapshot_e
     from iceberg_ivm import server as server_mod
     from iceberg_ivm.detector import ChangeResult, RefreshAction
     from iceberg_ivm.executor import QueryInfo
-    from iceberg_ivm.introspect import ColumnInfo
 
     view = _install_chunked_view(setup_state)
     setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
@@ -2938,9 +2920,6 @@ async def test_refresh_view_full_backfill_resume_recovers_when_pinned_snapshot_e
     async def fake_detect(*a, **kw):
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=200)
 
-    async def fake_discover(cursor, query):
-        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
-
     async def fake_execute_refresh(*a, **kw):
         seen["max_snapshot"] = kw.get("max_snapshot")
         seen["resume_from"] = kw.get("resume_from")
@@ -2959,7 +2938,7 @@ async def test_refresh_view_full_backfill_resume_recovers_when_pinned_snapshot_e
     try:
         with (
             patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
-            patch.object(server_mod, "discover_columns", fake_discover),
+            patch.object(server_mod, "discover_columns", _fake_discover),
             patch.object(server_mod, "snapshot_exists", fake_snapshot_exists),
             patch.object(server_mod, "detect_changes", fake_detect),
             patch.object(server_mod, "execute_refresh", fake_execute_refresh),
@@ -2987,7 +2966,6 @@ async def test_refresh_view_resumed_incremental_empty_window_does_not_advance_bo
 
     from iceberg_ivm import server as server_mod
     from iceberg_ivm.executor import QueryInfo
-    from iceberg_ivm.introspect import ColumnInfo
 
     view = _install_chunked_view(setup_state)
     setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
@@ -3007,9 +2985,6 @@ async def test_refresh_view_resumed_incremental_empty_window_does_not_advance_bo
     async def fake_range_since(*a, **kw):
         return None  # interior snapshot expired → window now empty
 
-    async def fake_discover(cursor, query):
-        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
-
     async def fake_execute_refresh(*a, **kw):
         executed["ran"] = True
         yield QueryInfo(
@@ -3027,7 +3002,7 @@ async def test_refresh_view_resumed_incremental_empty_window_does_not_advance_bo
     try:
         with (
             patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
-            patch.object(server_mod, "discover_columns", fake_discover),
+            patch.object(server_mod, "discover_columns", _fake_discover),
             patch.object(server_mod, "snapshot_exists", AsyncMock(return_value=True)),
             patch.object(server_mod, "incremental_range_since", fake_range_since),
             patch.object(server_mod, "detect_changes", fake_detect),
