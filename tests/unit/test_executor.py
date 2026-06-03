@@ -96,6 +96,7 @@ class TestExecuteRefreshIncremental:
                 parsed,
                 ["volume"],
                 incremental_range=(r_start, r_end),
+                max_snapshot=99,
             )
         ]
         assert len(queries) == 1
@@ -129,6 +130,7 @@ class TestExecuteRefreshIncremental:
                 parsed,
                 ["volume"],
                 incremental_range=(r_start, r_end),
+                max_snapshot=99,
             )
         ]
         assert len(queries) == 3
@@ -162,7 +164,8 @@ class TestExecuteRefreshIncremental:
                 parsed,
                 ["volume"],
                 incremental_range=(r_start, r_end),
-                incremental_resume_from=datetime(2026, 5, 17, tzinfo=UTC),
+                resume_from=datetime(2026, 5, 17, tzinfo=UTC),
+                max_snapshot=99,
             )
         ]
         assert len(queries) == 2
@@ -188,7 +191,8 @@ class TestExecuteRefreshIncremental:
                 parsed,
                 ["volume"],
                 incremental_range=(r_start, r_end),
-                incremental_resume_from=datetime(2026, 5, 18, 6, tzinfo=UTC),
+                resume_from=datetime(2026, 5, 18, 6, tzinfo=UTC),
+                max_snapshot=99,
             )
         ]
         assert len(queries) == 1
@@ -213,7 +217,8 @@ class TestExecuteRefreshIncremental:
                 parsed,
                 ["volume"],
                 incremental_range=(r_start, r_end),
-                incremental_resume_from=datetime(2026, 5, 10, tzinfo=UTC),
+                resume_from=datetime(2026, 5, 10, tzinfo=UTC),
+                max_snapshot=99,
             )
         ]
         assert len(queries) == 3
@@ -236,6 +241,7 @@ class TestExecuteRefreshIncremental:
                 parsed,
                 ["volume"],
                 incremental_range=(r_start, r_end),
+                max_snapshot=99,
             )
         ]
         assert len(queries) == 1
@@ -265,6 +271,7 @@ class TestExecuteRefreshSingleShotFull:
                 "iceberg.out.mv",
                 parsed,
                 ["volume"],
+                max_snapshot=99,
             )
         ]
         assert len(queries) == 1
@@ -289,6 +296,7 @@ class TestExecuteRefreshSingleShotFull:
                 "iceberg.out.mv",
                 parsed,
                 ["volume"],
+                max_snapshot=99,
             )
         ]
         assert queries == []
@@ -316,6 +324,7 @@ class TestExecuteRefreshChunked:
                 "iceberg.out.mv",
                 parsed,
                 ["volume"],
+                max_snapshot=99,
             )
         ]
         assert len(queries) == 3
@@ -363,6 +372,7 @@ class TestExecuteRefreshChunked:
                 parsed,
                 [],
                 resume_from=None,
+                max_snapshot=99,
             )
         ]
         # Every day-chunk from the source's start is re-MERGEd from scratch.
@@ -405,6 +415,7 @@ class TestExecuteRefreshChunked:
                 parsed,
                 [],
                 resume_from=datetime(2026, 4, 9, tzinfo=UTC),
+                max_snapshot=99,
             )
         ]
         assert len(queries) == 2
@@ -438,6 +449,7 @@ class TestExecuteRefreshChunked:
                 parsed,
                 [],
                 resume_from=datetime(2026, 4, 10, 6, tzinfo=UTC),
+                max_snapshot=99,
             )
         ]
         assert len(queries) == 1
@@ -465,6 +477,7 @@ class TestExecuteRefreshChunked:
                 parsed,
                 ["volume"],
                 resume_from=None,
+                max_snapshot=99,
             )
         ]
         source_min_day = datetime(2026, 4, 8, tzinfo=UTC)
@@ -492,6 +505,7 @@ class TestExecuteRefreshChunked:
             "iceberg.out.mv",
             parsed,
             ["volume"],
+            max_snapshot=99,
         ):
             collected.append(q)
             break  # stop after the first chunk commits
@@ -511,6 +525,7 @@ class TestExecuteRefreshChunked:
                 "iceberg.out.mv",
                 parsed,
                 ["volume"],
+                max_snapshot=99,
             )
         ]
         assert queries == []
@@ -541,11 +556,45 @@ class TestExecuteRefreshChunked:
                 parsed,
                 [],
                 resume_from=None,
+                max_snapshot=99,
             )
         ]
         assert len(queries) == 3
         assert queries[0].range_start == datetime(2026, 4, 8, tzinfo=UTC)
         assert queries[-1].range_end == datetime(2026, 4, 11, tzinfo=UTC)
+
+
+# ── snapshot pinning (no source mixing across chunks) ──
+
+
+class TestExecuteRefreshPinsSnapshot:
+    async def test_all_chunks_pin_the_same_snapshot_for_version_as_of(self):
+        # Issue #62, "snapshot mixing": every chunk's MERGE source must read the
+        # source FOR VERSION AS OF the SAME pinned snapshot, so a multi-chunk run
+        # never blends data from different source commits (commit t-2 with t
+        # without t-1). Without pinning the MERGE reads the live source and a
+        # long run drifts across snapshots.
+        cursor = MockCursor(stats={"processedRows": 10})
+        view = make_view(full_refresh_chunk="day")
+        parsed = parse_view_query(view.query)
+        queries = [
+            q
+            async for q in execute_refresh(
+                cursor,
+                view,
+                "iceberg.out.mv",
+                parsed,
+                ["volume"],
+                max_snapshot=12345,
+                incremental_range=(datetime(2026, 5, 16, tzinfo=UTC), datetime(2026, 5, 19, tzinfo=UTC)),
+            )
+        ]
+        assert len(queries) == 3
+        merges = [m for m in cursor.executed if "MERGE INTO" in m]
+        assert len(merges) == 3
+        # Identical pin on every chunk.
+        for m in merges:
+            assert "FOR VERSION AS OF 12345" in m
 
 
 # ── execute_maintenance ──

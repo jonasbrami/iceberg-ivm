@@ -32,7 +32,13 @@ from iceberg_ivm.config import (
     validate_qualified_name,
     validate_view_name,
 )
-from iceberg_ivm.detector import RefreshAction, detect_changes
+from iceberg_ivm.detector import (
+    ExpiredSnapshotError,
+    RefreshAction,
+    detect_changes,
+    get_snapshots_since,
+    incremental_range_since,
+)
 from iceberg_ivm.executor import (
     QueryInfo,
     execute_maintenance,
@@ -390,88 +396,125 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
             value_columns = [c.name for c in columns if c.name not in parsed.merge_keys]
 
             last_snap = await s.history.get_last_source_snapshot(view.name) if s.history is not None else None
-
-            t0 = time.monotonic()
-            result = await detect_changes(
-                cursor,
-                parsed.source_table,
-                parsed.filter_column,
-                parsed.granularity,
-                last_snap,
+            work_max, work_chunk = (
+                await s.history.get_current_work(view.name) if s.history is not None else (None, None)
             )
-            DETECTION_DURATION.labels(view=view.name).observe(time.monotonic() - t0)
-            log.info("%s: detection → %s (%.3fs)", view.name, result.action.name, time.monotonic() - t0)
-            if result.current_snapshot is not None:
-                SOURCE_SNAPSHOT.labels(view=view.name).set(result.current_snapshot)
 
-            if result.action == RefreshAction.NO_CHANGE:
+            # A run PINS ``max_snapshot`` (M) at start; every chunk reads the
+            # source FOR VERSION AS OF M and the window is derived over the
+            # frozen (bookmark, M]. ``current_work = (M, last_merged_chunk)`` is
+            # the in-flight record; while it is set the bookmark is unchanged
+            # (it advances only on clean completion, which clears current_work),
+            # so a tick is either RESUMING current_work or starting FRESH.
+
+            # Resume validation: if an in-flight INCREMENTAL run's window is no
+            # longer derivable (bookmark or pinned M expired from $snapshots),
+            # abandon it and restart from scratch — full-from-scratch is always
+            # safe. A full-backfill resume (last_snap is None) is always
+            # derivable from the source range, so it is never abandoned here.
+            if work_max is not None and last_snap is not None:
+                try:
+                    await get_snapshots_since(cursor, parsed.source_table, last_snap, max_snapshot=work_max)
+                except ExpiredSnapshotError as exc:
+                    log.warning(
+                        "%s: in-flight window no longer derivable (%s) → discarding current_work, full refresh",
+                        view.name,
+                        exc,
+                    )
+                    if s.history is not None:
+                        await s.history.clear_current_work(view.name)
+                    work_max, work_chunk = None, None
+
+            if work_max is not None:
+                # RESUME a pinned run: reuse M verbatim, never re-detect against
+                # the live source — that is what keeps the window frozen and
+                # prevents a later overwrite of an older bucket from drifting it.
+                pinned_max = work_max
+                resume_from = work_chunk
+                if last_snap is None:
+                    action = RefreshAction.FULL_REFRESH
+                    incremental_range = None
+                else:
+                    action = RefreshAction.INCREMENTAL
+                    incremental_range = await incremental_range_since(
+                        cursor,
+                        parsed.source_table,
+                        parsed.filter_column,
+                        parsed.granularity,
+                        last_snap,
+                        pinned_max,
+                    )
+                SOURCE_SNAPSHOT.labels(view=view.name).set(pinned_max)
+                log.info("%s: resuming pinned %s @ snapshot %d from %s", view.name, action.name, pinned_max, work_chunk)
+            else:
+                # FRESH run: detect against the live source and pin its current
+                # snapshot for the duration of this run.
+                t0 = time.monotonic()
+                result = await detect_changes(
+                    cursor,
+                    parsed.source_table,
+                    parsed.filter_column,
+                    parsed.granularity,
+                    last_snap,
+                )
+                DETECTION_DURATION.labels(view=view.name).observe(time.monotonic() - t0)
+                log.info("%s: detection → %s (%.3fs)", view.name, result.action.name, time.monotonic() - t0)
+                if result.current_snapshot is not None:
+                    SOURCE_SNAPSHOT.labels(view=view.name).set(result.current_snapshot)
+
+                if result.action == RefreshAction.NO_CHANGE:
+                    vs.last_action = "skip"
+                    vs.chunks_total = None
+                    vs.chunks_done = 0
+                    REFRESH_TOTAL.labels(view=view.name, type="skip").inc()
+                    # Advance the bookmark past empty-append / compaction-only
+                    # snapshots so we don't re-detect them every cycle.
+                    if (
+                        result.current_snapshot is not None
+                        and result.current_snapshot != last_snap
+                        and s.history is not None
+                    ):
+                        await s.history.set_last_source_snapshot(view.name, result.current_snapshot)
+                    await _persist_view_status(s, view.name, vs)
+                    await maintain_view(s, view, conn, target_table)
+                    return
+
+                pinned_max = result.current_snapshot
+                action = result.action
+                incremental_range = result.filter_range if action == RefreshAction.INCREMENTAL else None
+                resume_from = None
+                # Persist the in-flight record up-front so an interrupted run
+                # resumes from this exact pinned snapshot (and chunk progress).
+                if s.history is not None:
+                    await s.history.set_current_work(view.name, pinned_max, None)
+
+            # An INCREMENTAL window that turns out to have nothing to merge
+            # (only compaction since the bookmark, or a resumed window now empty):
+            # advance the bookmark to M and clear current_work, like a skip.
+            if action == RefreshAction.INCREMENTAL and incremental_range is None:
                 vs.last_action = "skip"
-                # Clear any lingering in-flight chunked-backfill progress that may
-                # have been hydrated from view_status after a mid-backfill restart.
-                # If the source has caught up while iceberg-ivm was down, the
-                # next tick is NO_CHANGE — but the persisted chunks_total would
-                # still claim a backfill is in flight. The committed bookmark
-                # (last_source_snapshot) is the source of truth here.
                 vs.chunks_total = None
                 vs.chunks_done = 0
                 REFRESH_TOTAL.labels(view=view.name, type="skip").inc()
-                # Advance state past empty-append / compaction-only snapshots so
-                # we don't re-detect them every cycle.
-                if (
-                    result.current_snapshot is not None
-                    and result.current_snapshot != last_snap
-                    and s.history is not None
-                ):
-                    await s.history.set_last_source_snapshot(view.name, result.current_snapshot)
+                if s.history is not None:
+                    await s.history.set_last_source_snapshot(view.name, pinned_max)
+                    await s.history.clear_current_work(view.name)
                 await _persist_view_status(s, view.name, vs)
                 await maintain_view(s, view, conn, target_table)
                 return
 
             # Set vs.last_action up-front so /api/views reflects what's running,
-            # not what last finished — matters for multi-hour chunked backfills.
-            chunked = result.action == RefreshAction.FULL_REFRESH and view.full_refresh_chunk
-            # A chunked *incremental* catch-up (#61) is also multi-chunk but
-            # carries its OWN resume marker (incremental_progress), strictly
-            # path-isolated from the FULL path's backfill_progress (#62).
-            chunked_incremental = result.action == RefreshAction.INCREMENTAL and view.full_refresh_chunk
-            if result.action == RefreshAction.FULL_REFRESH:
-                vs.last_action = "chunked_full" if chunked else "full"
-                vs.chunks_done = 0
-                vs.chunks_total = None
-                # Leak-prevention: a FULL refresh must never see (or coexist
-                # with) a stale incremental_progress marker left by an
-                # interrupted chunked-incremental run whose source snapshot then
-                # expired (forcing this FULL path). Clearing it here — symmetric
-                # to the backfill_progress clear below — keeps the two markers
-                # strictly path-isolated: FULL reads only backfill_progress.
-                if s.history is not None:
-                    await s.history.clear_incremental_progress(view.name)
+            # not what last finished — matters for multi-hour chunked runs.
+            if action == RefreshAction.FULL_REFRESH:
+                vs.last_action = "chunked_full" if view.full_refresh_chunk else "full"
             else:
-                vs.last_action = "incremental"
+                vs.last_action = "chunked_incremental" if view.full_refresh_chunk else "incremental"
+            vs.chunks_done = 0
+            vs.chunks_total = None
 
-            incremental_range = result.filter_range if result.action == RefreshAction.INCREMENTAL else None
-            # Resume point for an interrupted chunked full refresh comes ONLY
-            # from the committed-progress marker this from-beginning run wrote
-            # (issue #62) — never from the target's data. Absent (None) → the
-            # backfill recomputes from the source's beginning, so a source that
-            # overwrote historical buckets is fully re-merged, not skipped.
-            resume_from = (
-                await s.history.get_backfill_progress(view.name) if (chunked and s.history is not None) else None
-            )
-            # Resume point for an interrupted chunked *incremental* run comes
-            # ONLY from incremental_progress — never from backfill_progress (the
-            # FULL marker). Keeping the two reads disjoint by path is what
-            # prevents an incremental marker from ever skipping historical
-            # buckets in a full refresh (and vice versa).
-            incremental_resume_from = (
-                await s.history.get_incremental_progress(view.name)
-                if (chunked_incremental and s.history is not None)
-                else None
-            )
             total_elapsed = 0.0
             total_rows = 0
             total_bytes = 0
-            total_queries = 0
 
             async for q in execute_refresh(
                 cursor,
@@ -479,14 +522,13 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
                 target_table,
                 parsed,
                 value_columns,
+                max_snapshot=pinned_max,
                 incremental_range=incremental_range,
                 resume_from=resume_from,
-                incremental_resume_from=incremental_resume_from,
             ):
                 total_elapsed += q.elapsed_ms / 1000.0
                 total_rows += q.processed_rows
                 total_bytes += q.processed_bytes
-                total_queries += 1
                 vs.last_refresh = time.time()
                 vs.last_duration = q.elapsed_ms / 1000.0
                 vs.last_error = None
@@ -503,56 +545,33 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
                 await _record_query(s, view.name, vs, q)
                 await _persist_view_status(s, view.name, vs)
                 if q.chunks_total > 1:
-                    # Record committed-progress AFTER the chunk's MERGE has
-                    # landed: the marker is the upper bound of the last chunk
-                    # *this* from-beginning run committed. The next tick resumes
-                    # from it (skipping redone work) without ever consulting the
-                    # target's data — the core of issue #62.
-                    #
-                    # FULL-path only (``chunked``). The backfill_progress marker
-                    # is the FULL path's resume point (#62), keyed off the
-                    # source's beginning; it must NEVER be written on the
-                    # incremental path (it would leak into a later FULL refresh
-                    # and wrongly skip historical buckets).
-                    if chunked and s.history is not None and q.range_end is not None:
-                        await s.history.set_backfill_progress(view.name, q.range_end)
-                    # INCREMENTAL-path only (``chunked_incremental``, #61). Its
-                    # own durable resume marker, distinct from backfill_progress.
-                    # Without it an interrupted large catch-up never advances the
-                    # bookmark and redoes the window prefix forever (livelock).
-                    # Skipping committed chunks on restart is safe: the window is
-                    # recomputed from the unchanged bookmark (same window), the
-                    # chunks are idempotent keyed MERGEs, and any source change
-                    # below the resume point lands in a newer snapshot the
-                    # still-unadvanced bookmark picks up on a later cycle.
-                    if chunked_incremental and s.history is not None and q.range_end is not None:
-                        await s.history.set_incremental_progress(view.name, q.range_end)
+                    # Persist committed progress AFTER the chunk's MERGE lands:
+                    # current_work = (pinned M, this chunk's range_end). The next
+                    # tick reuses M and resumes from here — never re-detecting
+                    # against the live source, never consulting the target's
+                    # data. One record serves both paths because the window is
+                    # pinned by M (see issues #61/#62).
+                    if s.history is not None and q.range_end is not None:
+                        await s.history.set_current_work(view.name, pinned_max, q.range_end)
                     CHUNKS_COMPLETED.labels(view=view.name).inc()
                     CHUNK_DURATION.labels(view=view.name).observe(q.elapsed_ms / 1000.0)
                     CHUNK_ROWS.labels(view=view.name).inc(q.processed_rows)
                 if s.stop_event.is_set():
-                    # Graceful shutdown mid-backfill — leave last_source_snapshot
-                    # unset so the next tick re-detects FULL_REFRESH and resumes
-                    # from the committed-progress marker written just above.
+                    # Graceful shutdown mid-run — leave the bookmark unadvanced
+                    # and current_work intact so the next tick resumes the SAME
+                    # pinned run from the committed chunk written just above.
                     log.info("%s: refresh interrupted after chunk %d/%d", view.name, q.chunks_done, q.chunks_total)
                     return
 
-            # Non-chunked paths (full or incremental) and completed chunked backfills
-            # commit the source snapshot bookmark. Empty chunked runs (source empty,
-            # or fully caught up) also advance state — total_queries == 0 is fine.
-            REFRESH_TOTAL.labels(view=view.name, type="incremental" if incremental_range else "full").inc()
+            # Clean completion: advance the bookmark to the PINNED snapshot we
+            # read as of (not the live latest), then clear current_work. The MV
+            # is now consistent as of ``pinned_max``; newer commits are picked up
+            # on the next tick over (pinned_max, M']. Empty runs (source empty)
+            # also land here and advance state — total_queries == 0 is fine.
+            REFRESH_TOTAL.labels(view=view.name, type="incremental" if incremental_range is not None else "full").inc()
             if s.history is not None:
-                await s.history.set_last_source_snapshot(view.name, result.current_snapshot)
-                # Clear the committed-progress marker: this backfill finished,
-                # so the next full refresh (if the bookmark is ever lost again)
-                # must start from the source's beginning, not resume from a
-                # marker left by a completed run.
-                await s.history.clear_backfill_progress(view.name)
-                # Symmetric clear for the incremental marker: this incremental
-                # run finished and advanced the bookmark, so any persisted
-                # incremental_progress is now spent — the next tick computes a
-                # fresh window from the advanced bookmark.
-                await s.history.clear_incremental_progress(view.name)
+                await s.history.set_last_source_snapshot(view.name, pinned_max)
+                await s.history.clear_current_work(view.name)
             vs.total_refreshes += 1
             # Clear the "in-flight" marker on clean completion. Leave chunks_done
             # at its last value so the UI can show "12/12 done" alongside total

@@ -71,23 +71,26 @@ CREATE TABLE IF NOT EXISTS view_status (
     chunks_done           INTEGER NOT NULL DEFAULT 0,
     chunks_total          INTEGER,
     last_source_snapshot  INTEGER,
-    -- Committed-progress marker for an in-flight chunked full refresh: the
-    -- upper bound (ISO-8601 string) of the last chunk this from-beginning
-    -- backfill committed. Distinct from last_source_snapshot, which is only
-    -- written on full completion. Lets an interrupted backfill resume without
-    -- redoing committed chunks, while guaranteeing every skipped chunk was
-    -- (re)computed by the *current* run — so it can't reintroduce the
-    -- "resume from target_max" correctness hole (issue #62). NULL means no
-    -- in-flight backfill → start from the source's beginning.
-    backfill_progress     TEXT,
-    -- Committed-progress marker for an in-flight chunked *incremental* catch-up
-    -- (issue #61): the upper bound (ISO-8601) of the last diff-window chunk
-    -- merged. Distinct from backfill_progress — it says nothing about buckets
-    -- below the incremental window's start, so it must NEVER be read by the
-    -- FULL path (that would re-introduce the #62 staleness hole). Written after
-    -- each incremental chunk commits, cleared on clean completion and on entry
-    -- to any full refresh. NULL means no in-flight chunked incremental.
-    incremental_progress  TEXT
+    -- Unified in-flight "current work" record (issue #61/#62), replacing the
+    -- old two-marker design (backfill_progress / incremental_progress).
+    --
+    -- work_max_snapshot:      the PINNED upper snapshot bound of the in-flight
+    --                         run. Reused verbatim on resume (never recomputed
+    --                         from the live source) so every chunk reads the
+    --                         identical immutable snapshot → no source mixing
+    --                         (Bug 2) and a deterministic (bookmark, M] window
+    --                         across resumes → no drift (Bug 1).
+    -- work_last_merged_chunk: ISO-8601 ``range_end`` of the last committed
+    --                         chunk; the resume point, floored to its chunk.
+    --
+    -- INVARIANT: the bookmark (last_source_snapshot) advances ONLY on full
+    -- completion, and completion CLEARS current_work. So while current_work is
+    -- non-NULL the bookmark is invariant, hence the run's MIN bound (bookmark+1
+    -- for incremental, source-start for full) is IMPLIED and never stored —
+    -- which is why no ``min`` column exists. Both columns are NULL when idle
+    -- and are set / cleared together.
+    work_max_snapshot      INTEGER,
+    work_last_merged_chunk TEXT
 );
 """
 
@@ -145,13 +148,21 @@ class QueryHistory:
         ``CREATE TABLE IF NOT EXISTS`` is a no-op on an existing table, so new
         columns must be added explicitly. ``ADD COLUMN`` is idempotent here via
         the column-presence check (SQLite has no ``ADD COLUMN IF NOT EXISTS``).
+
+        The only RELEASED ``view_status`` column beyond the original set is
+        ``last_source_snapshot``. The ``current_work`` columns
+        (``work_max_snapshot`` / ``work_last_merged_chunk``) are new in #65 and
+        guarded here so a prod DB carrying only ``last_source_snapshot`` (plus
+        its counters) migrates cleanly. The old ``backfill_progress`` /
+        ``incremental_progress`` columns were NEVER released (this branch only),
+        so they are simply dropped from ``_SCHEMA`` — no rename/move migration.
         """
         async with self._db.execute("PRAGMA table_info(view_status)") as cur:
             cols = {row[1] for row in await cur.fetchall()}
-        if "backfill_progress" not in cols:
-            await self._db.execute("ALTER TABLE view_status ADD COLUMN backfill_progress TEXT")
-        if "incremental_progress" not in cols:
-            await self._db.execute("ALTER TABLE view_status ADD COLUMN incremental_progress TEXT")
+        if "work_max_snapshot" not in cols:
+            await self._db.execute("ALTER TABLE view_status ADD COLUMN work_max_snapshot INTEGER")
+        if "work_last_merged_chunk" not in cols:
+            await self._db.execute("ALTER TABLE view_status ADD COLUMN work_last_merged_chunk TEXT")
 
     async def close(self) -> None:
         if self._db is not None:
@@ -303,70 +314,62 @@ class QueryHistory:
         )
         await self._db.commit()
 
-    # ── backfill_progress ─────────────────────────────────────────────
-    # Committed-progress marker for an in-flight chunked full refresh. Like
-    # last_source_snapshot it lives on the view_status row but is kept out of
-    # _VIEW_STATUS_COLS so the ViewStatus mirror can't clobber it. Written
-    # after each chunk commits, cleared on clean completion (alongside the
-    # bookmark write). See issue #62.
+    # ── current_work ──────────────────────────────────────────────────
+    # The unified in-flight run record (issue #61/#62), replacing the old
+    # two-marker design. Like last_source_snapshot these columns live on the
+    # view_status row but are kept out of _VIEW_STATUS_COLS so the ViewStatus
+    # mirror can't clobber them. Set together when a run starts (max_snapshot
+    # pinned, last_merged_chunk NULL), the chunk updated after each commit, and
+    # both cleared on clean completion (alongside advancing the bookmark).
+    #
+    # work_max_snapshot is the PINNED upper bound: on resume it is reused
+    # verbatim, never recomputed from the live source — that pin is what gives
+    # a deterministic (bookmark, M] window across resumes (fixes Bug 1) and
+    # lets every chunk read the identical immutable snapshot (fixes Bug 2).
 
-    async def get_backfill_progress(self, view: str) -> datetime | None:
+    async def get_current_work(self, view: str) -> tuple[int | None, datetime | None]:
+        """Return ``(work_max_snapshot, work_last_merged_chunk)`` for ``view``.
+
+        ``(None, None)`` means idle (no in-flight run). A non-NULL
+        ``work_max_snapshot`` with a NULL chunk means a run started but no chunk
+        has committed yet.
+        """
         async with self._db.execute(
-            "SELECT backfill_progress FROM view_status WHERE view = ?",
+            "SELECT work_max_snapshot, work_last_merged_chunk FROM view_status WHERE view = ?",
             (view,),
         ) as cur:
             row = await cur.fetchone()
-        if not row or row[0] is None:
-            return None
-        return datetime.fromisoformat(row[0])
+        if not row:
+            return (None, None)
+        max_snap = row[0]
+        chunk = datetime.fromisoformat(row[1]) if row[1] is not None else None
+        return (max_snap, chunk)
 
-    async def set_backfill_progress(self, view: str, end: datetime) -> None:
+    async def set_current_work(
+        self,
+        view: str,
+        max_snapshot: int,
+        last_merged_chunk: datetime | None,
+    ) -> None:
+        """Persist the in-flight run record. ``max_snapshot`` is the pinned
+        upper bound; ``last_merged_chunk`` is the ``range_end`` of the last
+        committed chunk (NULL at the start of a run)."""
+        chunk_iso = last_merged_chunk.isoformat() if last_merged_chunk is not None else None
         await self._db.execute(
-            "INSERT INTO view_status (view, backfill_progress) VALUES (?, ?) "
+            "INSERT INTO view_status (view, work_max_snapshot, work_last_merged_chunk) "
+            "VALUES (?, ?, ?) "
             "ON CONFLICT(view) DO UPDATE SET "
-            "backfill_progress = excluded.backfill_progress",
-            (view, end.isoformat()),
+            "work_max_snapshot = excluded.work_max_snapshot, "
+            "work_last_merged_chunk = excluded.work_last_merged_chunk",
+            (view, max_snapshot, chunk_iso),
         )
         await self._db.commit()
 
-    async def clear_backfill_progress(self, view: str) -> None:
+    async def clear_current_work(self, view: str) -> None:
+        """Clear the in-flight run record (both columns → NULL). Called on clean
+        completion right after advancing the bookmark."""
         await self._db.execute(
-            "UPDATE view_status SET backfill_progress = NULL WHERE view = ?",
-            (view,),
-        )
-        await self._db.commit()
-
-    # ── incremental_progress ──────────────────────────────────────────
-    # Committed-progress marker for an in-flight chunked *incremental* catch-up
-    # (issue #61). Mirrors backfill_progress exactly (lives on the view_status
-    # row, kept out of _VIEW_STATUS_COLS so the ViewStatus mirror can't clobber
-    # it) but is strictly path-isolated: read/written only on the INCREMENTAL
-    # path, never the FULL path. Written after each incremental chunk commits,
-    # cleared on clean completion (alongside the bookmark write) and on entry to
-    # any full refresh so a stale incremental marker can't leak into a full run.
-
-    async def get_incremental_progress(self, view: str) -> datetime | None:
-        async with self._db.execute(
-            "SELECT incremental_progress FROM view_status WHERE view = ?",
-            (view,),
-        ) as cur:
-            row = await cur.fetchone()
-        if not row or row[0] is None:
-            return None
-        return datetime.fromisoformat(row[0])
-
-    async def set_incremental_progress(self, view: str, end: datetime) -> None:
-        await self._db.execute(
-            "INSERT INTO view_status (view, incremental_progress) VALUES (?, ?) "
-            "ON CONFLICT(view) DO UPDATE SET "
-            "incremental_progress = excluded.incremental_progress",
-            (view, end.isoformat()),
-        )
-        await self._db.commit()
-
-    async def clear_incremental_progress(self, view: str) -> None:
-        await self._db.execute(
-            "UPDATE view_status SET incremental_progress = NULL WHERE view = ?",
+            "UPDATE view_status SET work_max_snapshot = NULL, work_last_merged_chunk = NULL WHERE view = ?",
             (view,),
         )
         await self._db.commit()

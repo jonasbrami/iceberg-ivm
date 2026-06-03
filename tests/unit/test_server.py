@@ -1426,6 +1426,7 @@ async def test_refresh_view_advances_state_on_empty_append_no_change(setup_state
 
     history = AsyncMock()
     history.get_last_source_snapshot.return_value = 100
+    history.get_current_work.return_value = (None, None)
     setup_state.history = history
 
     async def fake_detect(*args, **kwargs):
@@ -2503,9 +2504,10 @@ async def test_refresh_view_interrupt_skips_last_snapshot_write(setup_state, tmp
         await h.close()
 
 
-async def test_refresh_view_chunked_writes_and_clears_progress_marker(setup_state, tmp_path):
-    """Each committed chunk writes the committed-progress marker (range_end);
-    on clean completion the marker is cleared and the bookmark is set (#62)."""
+async def test_refresh_view_chunked_full_completes_clears_current_work(setup_state, tmp_path):
+    """A fresh chunked FULL refresh pins the detected snapshot, writes
+    current_work per chunk and, on clean completion, advances the bookmark to
+    that pinned snapshot and clears current_work (#61/#62)."""
     from datetime import datetime
 
     from iceberg_ivm import server as server_mod
@@ -2521,6 +2523,8 @@ async def test_refresh_view_chunked_writes_and_clears_progress_marker(setup_stat
     await h.open()
     setup_state.history = h
 
+    seen = {}
+
     async def fake_detect(*a, **kw):
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=42)
 
@@ -2528,6 +2532,8 @@ async def test_refresh_view_chunked_writes_and_clears_progress_marker(setup_stat
         return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
 
     async def fake_execute_refresh(*a, **kw):
+        seen["max_snapshot"] = kw.get("max_snapshot")
+        seen["resume_from"] = kw.get("resume_from")
         for i in range(1, 4):
             yield QueryInfo(
                 query_id=f"q{i}",
@@ -2550,21 +2556,22 @@ async def test_refresh_view_chunked_writes_and_clears_progress_marker(setup_stat
         ):
             await server_mod.refresh_view(setup_state, view)
 
-        # Completed cleanly: bookmark set, progress marker cleared.
+        assert seen["max_snapshot"] == 42  # pinned to the detected snapshot
+        assert seen["resume_from"] is None  # fresh run, nothing to resume
+        # Completed cleanly: bookmark advanced to the pinned snapshot, work cleared.
         assert await h.get_last_source_snapshot(view.name) == 42
-        assert await h.get_backfill_progress(view.name) is None
+        assert await h.get_current_work(view.name) == (None, None)
     finally:
         await h.close()
 
 
-async def test_refresh_view_chunked_resumes_from_progress_marker(setup_state, tmp_path):
-    """A pre-existing committed-progress marker (interrupted from-beginning
-    run) is read and threaded to the executor as ``resume_from`` — NOT the
-    target's data. This is the interruption-resume guarantee under #62."""
+async def test_refresh_view_full_resume_reads_current_work(setup_state, tmp_path):
+    """An interrupted full backfill (current_work set, bookmark still None) is
+    resumed by REUSING the pinned snapshot and resume point from current_work —
+    the live source is never re-detected (so the window can't drift)."""
     from datetime import datetime
 
     from iceberg_ivm import server as server_mod
-    from iceberg_ivm.detector import ChangeResult, RefreshAction
     from iceberg_ivm.executor import QueryInfo
     from iceberg_ivm.introspect import ColumnInfo
 
@@ -2575,20 +2582,21 @@ async def test_refresh_view_chunked_resumes_from_progress_marker(setup_state, tm
     h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
     await h.open()
     setup_state.history = h
-    # Marker left by an earlier interrupted backfill of THIS run.
+    # Interrupted from-beginning backfill: pinned snapshot 42, committed up to Apr 9.
     marker = datetime(2026, 4, 9, tzinfo=UTC)
-    await h.set_backfill_progress(view.name, marker)
+    await h.set_current_work(view.name, 42, marker)
 
-    seen_resume_from = {}
+    seen = {}
 
     async def fake_detect(*a, **kw):
-        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=42)
+        raise AssertionError("detect_changes must not be called when resuming current_work")
 
     async def fake_discover(cursor, query):
         return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
 
     async def fake_execute_refresh(*a, **kw):
-        seen_resume_from["value"] = kw.get("resume_from")
+        seen["max_snapshot"] = kw.get("max_snapshot")
+        seen["resume_from"] = kw.get("resume_from")
         yield QueryInfo(
             query_id="q1",
             info_uri="http://trino/q1",
@@ -2610,15 +2618,16 @@ async def test_refresh_view_chunked_resumes_from_progress_marker(setup_state, tm
         ):
             await server_mod.refresh_view(setup_state, view)
 
-        assert seen_resume_from["value"] == marker
+        assert seen["max_snapshot"] == 42  # reused from current_work, not re-detected
+        assert seen["resume_from"] == marker
     finally:
         await h.close()
 
 
-async def test_refresh_view_interrupt_preserves_progress_marker(setup_state, tmp_path):
-    """On interruption mid-backfill the committed-progress marker for the last
-    committed chunk survives (bookmark stays unset) so the next tick resumes
-    from it instead of redoing committed chunks (#62 interruption-resume)."""
+async def test_refresh_view_interrupt_preserves_current_work(setup_state, tmp_path):
+    """On interruption mid-run the bookmark stays unset and current_work holds
+    the pinned snapshot + last committed chunk, so the next tick resumes the
+    SAME pinned run instead of redoing or drifting."""
     from datetime import datetime
 
     from iceberg_ivm import server as server_mod
@@ -2628,6 +2637,8 @@ async def test_refresh_view_interrupt_preserves_progress_marker(setup_state, tmp
 
     view = _install_chunked_view(setup_state)
     setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
+    # The fixture leaves stop_event SET → refresh_view breaks after the first
+    # committed chunk.
 
     h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
     await h.open()
@@ -2651,7 +2662,6 @@ async def test_refresh_view_interrupt_preserves_progress_marker(setup_state, tmp
             chunks_done=1,
             chunks_total=3,
         )
-        setup_state.stop_event.set()
         yield QueryInfo(
             query_id="q2",
             info_uri="http://trino/q2",
@@ -2673,103 +2683,18 @@ async def test_refresh_view_interrupt_preserves_progress_marker(setup_state, tmp
         ):
             await server_mod.refresh_view(setup_state, view)
 
-        # Bookmark not written (interrupted) but the marker for the one chunk
-        # that committed before the stop flag is persisted at its range_end.
+        # Bookmark not advanced; current_work holds (pinned snapshot, last chunk).
         assert await h.get_last_source_snapshot(view.name) is None
-        assert await h.get_backfill_progress(view.name) == datetime(2026, 4, 9, tzinfo=UTC)
+        assert await h.get_current_work(view.name) == (99, datetime(2026, 4, 9, tzinfo=UTC))
     finally:
         await h.close()
 
 
-async def test_refresh_view_chunked_incremental_does_not_write_progress_marker(setup_state, tmp_path):
-    """A multi-chunk INCREMENTAL catch-up (#61) tracks chunks_done/total like a
-    chunked full refresh, but must NOT persist the backfill_progress marker:
-    that marker is the FULL-path resume point (#62), keyed off the source's
-    beginning. Writing it on the incremental path would (a) be ignored on the
-    next incremental tick (resume_from is read only for FULL) and (b) leak a
-    stale marker into a later FULL refresh, wrongly skipping chunks. An
-    interrupted incremental recomputes the same window next tick instead."""
-    from datetime import datetime
-
-    from iceberg_ivm import server as server_mod
-    from iceberg_ivm.detector import ChangeResult, RefreshAction
-    from iceberg_ivm.executor import QueryInfo
-    from iceberg_ivm.introspect import ColumnInfo
-
-    view = _install_chunked_view(setup_state)
-    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
-    # The fixture leaves ``stop_event`` set, so refresh_view breaks after the
-    # first committed chunk — this is the mid-catch-up interruption that,
-    # without the FULL-only gate, would leak a stale backfill_progress marker
-    # into a later FULL refresh.
-
-    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
-    await h.open()
-    setup_state.history = h
-
-    async def fake_detect(*a, **kw):
-        return ChangeResult(
-            action=RefreshAction.INCREMENTAL,
-            current_snapshot=42,
-            filter_range=(datetime(2026, 5, 16, tzinfo=UTC), datetime(2026, 5, 19, tzinfo=UTC)),
-        )
-
-    async def fake_discover(cursor, query):
-        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
-
-    async def fake_execute_refresh(*a, **kw):
-        # The incremental path must NOT pass a resume_from to the executor.
-        assert kw.get("resume_from") is None
-        yield QueryInfo(
-            query_id="q1",
-            info_uri="http://trino/q1",
-            stage="chunk_merge",
-            started_at=1.0,
-            elapsed_ms=100.0,
-            range_start=datetime(2026, 5, 16, tzinfo=UTC),
-            range_end=datetime(2026, 5, 17, tzinfo=UTC),
-            chunks_done=1,
-            chunks_total=3,
-        )
-        yield QueryInfo(
-            query_id="q2",
-            info_uri="http://trino/q2",
-            stage="chunk_merge",
-            started_at=2.0,
-            elapsed_ms=100.0,
-            chunks_done=2,
-            chunks_total=3,
-        )
-
-    try:
-        with (
-            patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
-            patch.object(server_mod, "discover_columns", fake_discover),
-            patch.object(server_mod, "detect_changes", fake_detect),
-            patch.object(server_mod, "execute_refresh", fake_execute_refresh),
-        ):
-            await server_mod.refresh_view(setup_state, view)
-
-        vs = setup_state.view_statuses[view.name]
-        assert vs.last_action == "incremental"
-        # Per-chunk progress still tracked while in flight.
-        assert vs.chunks_done == 1
-        assert vs.chunks_total == 3
-        # Interrupted: bookmark not advanced (next tick recomputes the same
-        # incremental window and re-runs idempotent chunks)...
-        assert await h.get_last_source_snapshot(view.name) is None
-        # ...and crucially the FULL-path resume marker is NEVER written on the
-        # incremental path, so it can't leak into a later FULL refresh.
-        assert await h.get_backfill_progress(view.name) is None
-    finally:
-        await h.close()
-
-
-async def test_refresh_view_chunked_incremental_persists_incremental_progress(setup_state, tmp_path):
-    """An interrupted multi-chunk INCREMENTAL run (#61) persists
-    ``incremental_progress`` per committed chunk and does NOT advance the
-    bookmark, so the next tick can resume from it (skipping committed chunks)
-    instead of livelocking on the window prefix forever (#61/#62)."""
+async def test_refresh_view_incremental_interrupt_persists_current_work(setup_state, tmp_path):
+    """A multi-chunk INCREMENTAL catch-up (#61) persists current_work per
+    committed chunk and does NOT advance the bookmark when interrupted, so the
+    next tick resumes from the committed chunk instead of livelocking on the
+    window prefix. There is ONE record for both paths (no separate marker)."""
     from datetime import datetime
 
     from iceberg_ivm import server as server_mod
@@ -2796,8 +2721,9 @@ async def test_refresh_view_chunked_incremental_persists_incremental_progress(se
         return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
 
     async def fake_execute_refresh(*a, **kw):
-        # No resume marker present yet → incremental_resume_from must be None.
-        assert kw.get("incremental_resume_from") is None
+        # Fresh run → no resume point threaded.
+        assert kw.get("resume_from") is None
+        assert kw.get("max_snapshot") == 42  # pinned for the whole run
         yield QueryInfo(
             query_id="q1",
             info_uri="http://trino/q1",
@@ -2830,24 +2756,25 @@ async def test_refresh_view_chunked_incremental_persists_incremental_progress(se
         ):
             await server_mod.refresh_view(setup_state, view)
 
-        # Interrupted: bookmark NOT advanced (next tick recomputes same window).
+        vs = setup_state.view_statuses[view.name]
+        assert vs.last_action == "chunked_incremental"
+        assert vs.chunks_done == 1
+        assert vs.chunks_total == 3
+        # Interrupted: bookmark not advanced, current_work holds the committed chunk.
         assert await h.get_last_source_snapshot(view.name) is None
-        # Incremental resume marker persisted at the committed chunk's range_end.
-        assert await h.get_incremental_progress(view.name) == datetime(2026, 5, 17, tzinfo=UTC)
-        # FULL-path marker must NOT have been touched on the incremental path.
-        assert await h.get_backfill_progress(view.name) is None
+        assert await h.get_current_work(view.name) == (42, datetime(2026, 5, 17, tzinfo=UTC))
     finally:
         await h.close()
 
 
-async def test_refresh_view_chunked_incremental_resumes_from_incremental_progress(setup_state, tmp_path):
-    """A pre-existing ``incremental_progress`` marker is read and threaded to
-    the executor as ``incremental_resume_from`` (NOT ``resume_from``, which is
-    the FULL path's input)."""
+async def test_refresh_view_incremental_resume_reuses_pinned_snapshot(setup_state, tmp_path):
+    """Drift prevention (#61/#62): resuming an interrupted incremental REUSES
+    the pinned snapshot from current_work and derives the window over
+    (bookmark, pinned_M] — never the live current snapshot — so a newer
+    snapshot that overwrote an older bucket cannot drift the window start."""
     from datetime import datetime
 
     from iceberg_ivm import server as server_mod
-    from iceberg_ivm.detector import ChangeResult, RefreshAction
     from iceberg_ivm.executor import QueryInfo
     from iceberg_ivm.introspect import ColumnInfo
 
@@ -2858,23 +2785,29 @@ async def test_refresh_view_chunked_incremental_resumes_from_incremental_progres
     h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
     await h.open()
     setup_state.history = h
+    await h.set_last_source_snapshot(view.name, 10)  # bookmark present → incremental
     marker = datetime(2026, 5, 17, tzinfo=UTC)
-    await h.set_incremental_progress(view.name, marker)
+    await h.set_current_work(view.name, 42, marker)  # pinned M=42 (live source is newer)
 
     seen = {}
 
     async def fake_detect(*a, **kw):
-        return ChangeResult(
-            action=RefreshAction.INCREMENTAL,
-            current_snapshot=42,
-            filter_range=(datetime(2026, 5, 16, tzinfo=UTC), datetime(2026, 5, 19, tzinfo=UTC)),
-        )
+        raise AssertionError("detect_changes must not be called when resuming current_work")
+
+    async def fake_snapshots_since(cursor, source_table, last_snap, max_snapshot=None):
+        # Resume-validation probe: window still derivable.
+        return [{"snapshot_id": 42, "operation": "append"}]
+
+    async def fake_range_since(cursor, source_table, filter_column, granularity, last_snapshot, max_snapshot=None):
+        seen["last_snap"] = last_snapshot
+        seen["max_snapshot"] = max_snapshot
+        return (datetime(2026, 5, 16, tzinfo=UTC), datetime(2026, 5, 19, tzinfo=UTC))
 
     async def fake_discover(cursor, query):
         return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
 
     async def fake_execute_refresh(*a, **kw):
-        seen["incremental_resume_from"] = kw.get("incremental_resume_from")
+        seen["exec_max_snapshot"] = kw.get("max_snapshot")
         seen["resume_from"] = kw.get("resume_from")
         yield QueryInfo(
             query_id="q1",
@@ -2885,18 +2818,7 @@ async def test_refresh_view_chunked_incremental_resumes_from_incremental_progres
             range_start=datetime(2026, 5, 17, tzinfo=UTC),
             range_end=datetime(2026, 5, 18, tzinfo=UTC),
             chunks_done=1,
-            chunks_total=2,
-        )
-        yield QueryInfo(
-            query_id="q2",
-            info_uri="http://trino/q2",
-            stage="chunk_merge",
-            started_at=2.0,
-            elapsed_ms=100.0,
-            range_start=datetime(2026, 5, 18, tzinfo=UTC),
-            range_end=datetime(2026, 5, 19, tzinfo=UTC),
-            chunks_done=2,
-            chunks_total=2,
+            chunks_total=1,
         )
 
     try:
@@ -2904,29 +2826,32 @@ async def test_refresh_view_chunked_incremental_resumes_from_incremental_progres
             patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
             patch.object(server_mod, "discover_columns", fake_discover),
             patch.object(server_mod, "detect_changes", fake_detect),
+            patch.object(server_mod, "get_snapshots_since", fake_snapshots_since),
+            patch.object(server_mod, "incremental_range_since", fake_range_since),
             patch.object(server_mod, "execute_refresh", fake_execute_refresh),
         ):
             await server_mod.refresh_view(setup_state, view)
 
-        # Resume value came from incremental_progress, not from the FULL input.
-        assert seen["incremental_resume_from"] == marker
-        assert seen["resume_from"] is None
-        # Clean completion: bookmark advanced AND the marker cleared.
+        # Window derived over (bookmark=10, PINNED 42] — not the live snapshot.
+        assert seen["last_snap"] == 10
+        assert seen["max_snapshot"] == 42
+        assert seen["exec_max_snapshot"] == 42
+        assert seen["resume_from"] == marker
+        # Clean completion: bookmark advanced to the pinned snapshot, work cleared.
         assert await h.get_last_source_snapshot(view.name) == 42
-        assert await h.get_incremental_progress(view.name) is None
+        assert await h.get_current_work(view.name) == (None, None)
     finally:
         await h.close()
 
 
-async def test_refresh_view_full_refresh_clears_lingering_incremental_progress(setup_state, tmp_path):
-    """Leak-prevention: a FULL_REFRESH must clear any lingering
-    ``incremental_progress`` (left by an interrupted incremental whose source
-    snapshot then expired) and must NEVER read it as a resume point — the FULL
-    path's resume comes ONLY from ``backfill_progress``."""
+async def test_refresh_view_expired_bookmark_discards_current_work(setup_state, tmp_path):
+    """If an in-flight incremental run's window is no longer derivable (its
+    bookmark expired from $snapshots), current_work is discarded and the view
+    restarts as a FULL refresh from scratch (no stale resume, no leak)."""
     from datetime import datetime
 
     from iceberg_ivm import server as server_mod
-    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.detector import ChangeResult, ExpiredSnapshotError, RefreshAction
     from iceberg_ivm.executor import QueryInfo
     from iceberg_ivm.introspect import ColumnInfo
 
@@ -2937,31 +2862,31 @@ async def test_refresh_view_full_refresh_clears_lingering_incremental_progress(s
     h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
     await h.open()
     setup_state.history = h
-    # A stale incremental marker survives from an interrupted incremental run.
-    await h.set_incremental_progress(view.name, datetime(2026, 5, 17, tzinfo=UTC))
-    # And a legitimate FULL-path resume marker.
-    backfill_marker = datetime(2026, 4, 9, tzinfo=UTC)
-    await h.set_backfill_progress(view.name, backfill_marker)
+    await h.set_last_source_snapshot(view.name, 10)  # bookmark that will be 'expired'
+    await h.set_current_work(view.name, 99, datetime(2026, 5, 17, tzinfo=UTC))
 
     seen = {}
 
+    async def fake_snapshots_since(cursor, source_table, last_snap, max_snapshot=None):
+        raise ExpiredSnapshotError("bookmark gone")
+
     async def fake_detect(*a, **kw):
-        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=42)
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=200)
 
     async def fake_discover(cursor, query):
         return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
 
     async def fake_execute_refresh(*a, **kw):
+        seen["max_snapshot"] = kw.get("max_snapshot")
         seen["resume_from"] = kw.get("resume_from")
-        seen["incremental_resume_from"] = kw.get("incremental_resume_from")
         yield QueryInfo(
             query_id="q1",
             info_uri="http://trino/q1",
             stage="chunk_merge",
             started_at=1.0,
             elapsed_ms=100.0,
-            range_start=datetime(2026, 4, 9, tzinfo=UTC),
-            range_end=datetime(2026, 4, 10, tzinfo=UTC),
+            range_start=datetime(2026, 4, 8, tzinfo=UTC),
+            range_end=datetime(2026, 4, 9, tzinfo=UTC),
             chunks_done=1,
             chunks_total=1,
         )
@@ -2970,17 +2895,17 @@ async def test_refresh_view_full_refresh_clears_lingering_incremental_progress(s
         with (
             patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
             patch.object(server_mod, "discover_columns", fake_discover),
+            patch.object(server_mod, "get_snapshots_since", fake_snapshots_since),
             patch.object(server_mod, "detect_changes", fake_detect),
             patch.object(server_mod, "execute_refresh", fake_execute_refresh),
         ):
             await server_mod.refresh_view(setup_state, view)
 
-        # FULL path resume comes ONLY from backfill_progress.
-        assert seen["resume_from"] == backfill_marker
-        # The stale incremental marker was never consumed as a resume point...
-        assert seen["incremental_resume_from"] is None
-        # ...and is cleared so it can never coexist with / leak into a full run.
-        assert await h.get_incremental_progress(view.name) is None
+        # Stale current_work discarded; fresh full pinned to the new live snapshot.
+        assert seen["resume_from"] is None
+        assert seen["max_snapshot"] == 200
+        assert await h.get_last_source_snapshot(view.name) == 200
+        assert await h.get_current_work(view.name) == (None, None)
     finally:
         await h.close()
 

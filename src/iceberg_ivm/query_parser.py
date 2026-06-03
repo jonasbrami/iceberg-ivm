@@ -130,6 +130,52 @@ def inject_range_filter(sql: str, filter_column: str, start: datetime, end: date
     return str(stmt)
 
 
+def inject_version_pin(sql: str, source_table: str, snapshot_id: int) -> str:
+    """Pin the source-table reference to ``FOR VERSION AS OF <snapshot_id>``.
+
+    Locates the ``FROM <source_table>`` reference (reusing the same logic as
+    ``_extract_source_table``) and rewrites it to
+    ``FROM <source_table> FOR VERSION AS OF <snapshot_id> [alias]``.
+
+    Composed with ``inject_range_filter`` by the executor so every chunk of a
+    run reads the IDENTICAL immutable snapshot ``M`` — the MV transitions
+    atomically from consistent-as-of-bookmark to consistent-as-of-M and never
+    mixes source snapshots across chunks (issue #62, Bug 2). Single-source is a
+    hard precondition (joins are rejected at parse time); ``snapshot_id`` is a
+    bigint Iceberg snapshot id.
+
+    The Trino ``FOR VERSION AS OF`` clause binds to the table reference and
+    sits before any alias, so we splice it immediately after the qualified
+    name and preserve whatever alias / whitespace followed.
+    """
+    stmt = _single_statement(sql)
+    from_idx = next(
+        (i for i, t in enumerate(stmt.tokens) if t.ttype is Keyword and t.normalized.upper() == "FROM"),
+        None,
+    )
+    if from_idx is None:
+        raise ValueError("FROM clause missing")
+    tref_idx, tref = stmt.token_next(from_idx, skip_ws=True, skip_cm=True)
+    if tref is None:
+        raise ValueError("could not locate table reference after FROM to pin")
+    # The table reference is either a bare Name token (no alias) or an
+    # Identifier grouping the qualified name plus optional alias. Splice the
+    # pin clause after the qualified name, keeping any trailing alias text.
+    original = str(tref)
+    lead = original[: len(original) - len(original.lstrip())]
+    body = original.lstrip()
+    if body.startswith(source_table):
+        rest = body[len(source_table) :]
+        pinned = f"{lead}{source_table} FOR VERSION AS OF {snapshot_id}{rest}"
+    else:
+        # Defensive: the located reference should start with the source table.
+        # If the text doesn't (quoted/odd shape), fall back to a string replace
+        # of the first occurrence so the pin still lands.
+        pinned = original.replace(source_table, f"{source_table} FOR VERSION AS OF {snapshot_id}", 1)
+    stmt.tokens[tref_idx] = Token(None, pinned)
+    return str(stmt)
+
+
 # ---------------------------------------------------------------------------
 # internals
 # ---------------------------------------------------------------------------

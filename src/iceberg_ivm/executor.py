@@ -25,7 +25,7 @@ from iceberg_ivm.detector import (
     get_source_column_range,
     walk_buckets,
 )
-from iceberg_ivm.query_parser import ParsedView, inject_range_filter
+from iceberg_ivm.query_parser import ParsedView, inject_range_filter, inject_version_pin
 
 log = logging.getLogger(__name__)
 
@@ -187,35 +187,39 @@ async def execute_refresh(
     parsed: ParsedView,
     value_columns: list[str],
     *,
+    max_snapshot: int,
     incremental_range: tuple[datetime, datetime] | None = None,
     resume_from: datetime | None = None,
-    incremental_resume_from: datetime | None = None,
 ) -> AsyncIterator[QueryInfo]:
     """Execute a refresh as a sequence of per-range MERGE commits.
 
+    ``max_snapshot`` is the PINNED source snapshot this run reads as of: every
+    chunk's MERGE source is rewritten to ``FROM <source> FOR VERSION AS OF
+    max_snapshot`` (``inject_version_pin``) so all chunks read the identical
+    immutable source state. The materialized view therefore transitions
+    atomically from consistent-as-of-bookmark to consistent-as-of-max_snapshot
+    and never mixes data from different commits, even across a multi-hour run
+    while the source is being written (issue #62, "snapshot mixing").
+
     - ``incremental_range`` given → one MERGE over it, unless
-      ``view.full_refresh_chunk`` is set, in which case the window is split
-      into N bucket-aligned per-chunk MERGEs (issue #61) — a large catch-up
-      window would otherwise OOM as a single MERGE. ``incremental_resume_from``
-      (the incremental committed-progress marker, distinct from ``resume_from``)
-      lets an interrupted chunked-incremental run skip already-committed chunks.
-    - ``view.full_refresh_chunk`` set (no incremental_range) → N MERGEs, one per chunk, from the
-      source's beginning (or from ``resume_from`` — a committed-progress
-      marker for an interrupted backfill, see ``_backfill_ranges``).
+      ``view.full_refresh_chunk`` is set, in which case the window is split into
+      N bucket-aligned per-chunk MERGEs (issue #61) — a large catch-up window
+      would otherwise OOM as a single MERGE.
+    - ``view.full_refresh_chunk`` set (no incremental_range) → N MERGEs from the
+      source's beginning.
     - otherwise → one MERGE over the full source range (single-shot full).
 
+    ``resume_from`` is the committed-progress point of an interrupted run
+    (``current_work.work_last_merged_chunk``); chunks at/below its containing
+    chunk are skipped. It applies uniformly to both the chunked-incremental and
+    chunked-full paths — the resume mechanism no longer differs by path because
+    the window itself is pinned by ``max_snapshot`` (see ``server.refresh_view``).
+
     Yields one ``QueryInfo`` per committed MERGE. Caller cancels by ``break``;
-    each MERGE is one Iceberg commit, so a partial run leaves the target in a
-    valid state and the caller persists the committed-progress marker so the
-    next tick resumes from it.
+    each MERGE is one Iceberg commit, so a partial run leaves the target valid
+    and the caller persists ``current_work`` so the next tick resumes from it.
     """
     if incremental_range is not None:
-        # A large catch-up incremental window (view fell far behind) would
-        # otherwise run as ONE giant MERGE whose join build side OOMs the node
-        # (issue #61). When chunking is configured, split it the same way the
-        # full path does so the window closes as N bounded per-chunk MERGEs;
-        # a steady-state tiny window collapses to a single chunk — no real
-        # behavior change beyond the stage label.
         if view.full_refresh_chunk:
             # The detector already snapped ``incremental_range`` to the view's
             # own (finer-or-equal) granularity as a HALF-OPEN ``[start, end)``.
@@ -225,17 +229,8 @@ async def execute_refresh(
             # chunk-aligned end is NOT over-expanded by a whole empty chunk.
             r_start, r_end = incremental_range
             start, end = expand_to_bucket_bounds(r_start, r_end - timedelta(microseconds=1), view.full_refresh_chunk)
-            if incremental_resume_from is not None:
-                # Resume an interrupted chunked-incremental run: floor the
-                # committed-progress marker to its containing chunk and skip
-                # earlier (already-committed) chunks. Safe because the window is
-                # recomputed from the unchanged source bookmark (same window),
-                # the chunks are idempotent keyed MERGEs, and any source change
-                # below the resume point lands in a newer snapshot the
-                # still-unadvanced bookmark picks up on a later cycle. The
-                # ``max`` guard (via _floor_resume_to_chunk) never resumes
-                # before the window's start.
-                start = _floor_resume_to_chunk(start, incremental_resume_from, view.full_refresh_chunk)
+            if resume_from is not None:
+                start = _floor_resume_to_chunk(start, resume_from, view.full_refresh_chunk)
             ranges: list[tuple[datetime, datetime]] = list(walk_buckets(start, end, view.full_refresh_chunk))
             stage = "chunk_merge"
         else:
@@ -248,8 +243,12 @@ async def execute_refresh(
     total = len(ranges)
     for i, (start, end) in enumerate(ranges, start=1):
         src = inject_range_filter(view.query, parsed.filter_column, start, end)
+        # Pin the source read to the run's snapshot so all chunks see the same
+        # immutable state (no snapshot mixing). Single-source is guaranteed by
+        # the parser (joins/subqueries are rejected), so one pin suffices.
+        src = inject_version_pin(src, parsed.source_table, max_snapshot)
         sql = build_merge_sql(target_table, src, parsed.merge_keys, value_columns)
-        log.info("%s: %s %d/%d [%s, %s)", view.name, stage, i, total, start, end)
+        log.info("%s: %s %d/%d [%s, %s) @ snapshot %d", view.name, stage, i, total, start, end, max_snapshot)
         yield await _execute_tracked(
             cursor,
             sql,
