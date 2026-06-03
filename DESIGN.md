@@ -243,11 +243,10 @@ This single mechanism delivers four guarantees:
 
 **Resume point comes from the bookmark / `current_work` only — never the
 target table.** The target tells you what data is *present*, not what is
-*correct*. The old full path resumed from `max(bucket_alias)` in the target and
-walked forward only; for a source that overwrites a *historical* bucket
-(allowed — see *No-data-loss* above) that silently skipped the corrected older
-bucket. `get_target_bucket_max` is retained only as a metadata helper, wired
-into no refresh path.
+*correct*. The old full path resumed from `max(bucket_alias)` in the target
+(via a `get_target_bucket_max` helper, removed in this change) and walked
+forward only; for a source that overwrites a *historical* bucket (allowed —
+see *No-data-loss* above) that silently skipped the corrected older bucket.
 
 **Lost bookmark → recompute from scratch.** A full refresh is forced when the
 bookmark is gone (`expire_snapshots` removed it, fresh `state.db`, or the view

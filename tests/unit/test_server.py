@@ -2976,6 +2976,74 @@ async def test_refresh_view_full_backfill_resume_recovers_when_pinned_snapshot_e
         await h.close()
 
 
+async def test_refresh_view_resumed_incremental_empty_window_does_not_advance_bookmark(setup_state, tmp_path):
+    """Resume guard: if a resumed incremental's frozen window comes back empty
+    even though chunks were already committed (an INTERIOR change snapshot
+    expired — the endpoint snapshot_exists probes can't catch that), the
+    bookmark must NOT advance to M (that would orphan the un-merged chunks
+    above the resume point). current_work is discarded and the bookmark left
+    unchanged so the next tick re-derives a fresh window and re-covers them."""
+    from datetime import datetime
+
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.executor import QueryInfo
+    from iceberg_ivm.introspect import ColumnInfo
+
+    view = _install_chunked_view(setup_state)
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
+    setup_state.stop_event.clear()
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+    await h.set_last_source_snapshot(view.name, 10)  # bookmark present → incremental resume
+    await h.set_current_work(view.name, 42, datetime(2026, 5, 17, tzinfo=UTC))  # committed up to chunk end
+
+    executed = {"ran": False}
+
+    async def fake_detect(*a, **kw):
+        raise AssertionError("detect_changes must not be called on resume")
+
+    async def fake_range_since(*a, **kw):
+        return None  # interior snapshot expired → window now empty
+
+    async def fake_discover(cursor, query):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+
+    async def fake_execute_refresh(*a, **kw):
+        executed["ran"] = True
+        yield QueryInfo(
+            query_id="q",
+            info_uri="u",
+            stage="chunk_merge",
+            started_at=1.0,
+            elapsed_ms=1.0,
+            range_start=datetime(2026, 5, 17, tzinfo=UTC),
+            range_end=datetime(2026, 5, 18, tzinfo=UTC),
+            chunks_done=1,
+            chunks_total=1,
+        )
+
+    try:
+        with (
+            patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+            patch.object(server_mod, "discover_columns", fake_discover),
+            patch.object(server_mod, "snapshot_exists", AsyncMock(return_value=True)),
+            patch.object(server_mod, "incremental_range_since", fake_range_since),
+            patch.object(server_mod, "detect_changes", fake_detect),
+            patch.object(server_mod, "execute_refresh", fake_execute_refresh),
+        ):
+            await server_mod.refresh_view(setup_state, view)
+
+        # No merge ran; bookmark UNCHANGED (not advanced to 42); current_work cleared
+        # so the next tick re-derives a fresh window from bookmark 10.
+        assert executed["ran"] is False
+        assert await h.get_last_source_snapshot(view.name) == 10
+        assert await h.get_current_work(view.name) == (None, None)
+    finally:
+        await h.close()
+
+
 def test_chunk_metrics_defined():
     """Per-chunk Prometheus metrics are registered so operators can build
     chunked-backfill dashboards without scraping stdout."""

@@ -363,7 +363,7 @@ async def incremental_range_since(
     """
     snapshots = await get_snapshots_since(cursor, source_table, last_snapshot, max_snapshot=max_snapshot)
     if not snapshots:
-        log.debug("%s: no new snapshots in (%d, %d]", source_table, last_snapshot, max_snapshot)
+        log.debug("%s: no new snapshots in (%s, %s]", source_table, last_snapshot, max_snapshot)
         return None
 
     ops = [s["operation"] for s in snapshots]

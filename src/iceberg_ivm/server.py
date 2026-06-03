@@ -493,17 +493,34 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
                 if s.history is not None:
                     await s.history.set_current_work(view.name, pinned_max, None)
 
-            # An INCREMENTAL window that turns out to have nothing to merge
-            # (only compaction since the bookmark, or a resumed window now empty):
-            # advance the bookmark to M and clear current_work, like a skip.
+            # An INCREMENTAL window with nothing to merge.
             if action == RefreshAction.INCREMENTAL and incremental_range is None:
                 vs.last_action = "skip"
                 vs.chunks_total = None
                 vs.chunks_done = 0
                 REFRESH_TOTAL.labels(view=view.name, type="skip").inc()
-                if s.history is not None:
-                    await s.history.set_last_source_snapshot(view.name, pinned_max)
-                    await s.history.clear_current_work(view.name)
+                if resume_from is not None:
+                    # RESUME whose frozen window came back empty even though chunks
+                    # were already committed — only reachable if an INTERIOR change
+                    # snapshot expired (the endpoint snapshot_exists probes can't
+                    # catch that). Advancing the bookmark to M here would orphan the
+                    # un-merged chunks above resume_from → silent staleness. Instead
+                    # clear current_work but leave the bookmark UNCHANGED, so the next
+                    # tick re-derives a fresh window from the bookmark and re-covers
+                    # them (idempotent re-merge of the already-committed chunks).
+                    log.warning(
+                        "%s: resumed incremental window unexpectedly empty (interior "
+                        "snapshot expired?) → discarding current_work, re-detecting next tick",
+                        view.name,
+                    )
+                    if s.history is not None:
+                        await s.history.clear_current_work(view.name)
+                else:
+                    # Fresh detection found nothing to merge (only compaction since
+                    # the bookmark): advance the bookmark to M and clear current_work.
+                    if s.history is not None:
+                        await s.history.set_last_source_snapshot(view.name, pinned_max)
+                        await s.history.clear_current_work(view.name)
                 await _persist_view_status(s, view.name, vs)
                 await maintain_view(s, view, conn, target_table)
                 return
