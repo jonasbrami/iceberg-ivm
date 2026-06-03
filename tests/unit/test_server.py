@@ -2613,6 +2613,7 @@ async def test_refresh_view_full_resume_reads_current_work(setup_state, tmp_path
         with (
             patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
             patch.object(server_mod, "discover_columns", fake_discover),
+            patch.object(server_mod, "snapshot_exists", AsyncMock(return_value=True)),
             patch.object(server_mod, "detect_changes", fake_detect),
             patch.object(server_mod, "execute_refresh", fake_execute_refresh),
         ):
@@ -2794,10 +2795,6 @@ async def test_refresh_view_incremental_resume_reuses_pinned_snapshot(setup_stat
     async def fake_detect(*a, **kw):
         raise AssertionError("detect_changes must not be called when resuming current_work")
 
-    async def fake_snapshots_since(cursor, source_table, last_snap, max_snapshot=None):
-        # Resume-validation probe: window still derivable.
-        return [{"snapshot_id": 42, "operation": "append"}]
-
     async def fake_range_since(cursor, source_table, filter_column, granularity, last_snapshot, max_snapshot=None):
         seen["last_snap"] = last_snapshot
         seen["max_snapshot"] = max_snapshot
@@ -2826,7 +2823,7 @@ async def test_refresh_view_incremental_resume_reuses_pinned_snapshot(setup_stat
             patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
             patch.object(server_mod, "discover_columns", fake_discover),
             patch.object(server_mod, "detect_changes", fake_detect),
-            patch.object(server_mod, "get_snapshots_since", fake_snapshots_since),
+            patch.object(server_mod, "snapshot_exists", AsyncMock(return_value=True)),
             patch.object(server_mod, "incremental_range_since", fake_range_since),
             patch.object(server_mod, "execute_refresh", fake_execute_refresh),
         ):
@@ -2851,7 +2848,7 @@ async def test_refresh_view_expired_bookmark_discards_current_work(setup_state, 
     from datetime import datetime
 
     from iceberg_ivm import server as server_mod
-    from iceberg_ivm.detector import ChangeResult, ExpiredSnapshotError, RefreshAction
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
     from iceberg_ivm.executor import QueryInfo
     from iceberg_ivm.introspect import ColumnInfo
 
@@ -2867,8 +2864,8 @@ async def test_refresh_view_expired_bookmark_discards_current_work(setup_state, 
 
     seen = {}
 
-    async def fake_snapshots_since(cursor, source_table, last_snap, max_snapshot=None):
-        raise ExpiredSnapshotError("bookmark gone")
+    async def fake_exists(cursor, source_table, snapshot_id):
+        return snapshot_id != 10  # the bookmark (10) has been expired from $snapshots
 
     async def fake_detect(*a, **kw):
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=200)
@@ -2895,13 +2892,82 @@ async def test_refresh_view_expired_bookmark_discards_current_work(setup_state, 
         with (
             patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
             patch.object(server_mod, "discover_columns", fake_discover),
-            patch.object(server_mod, "get_snapshots_since", fake_snapshots_since),
+            patch.object(server_mod, "snapshot_exists", fake_exists),
             patch.object(server_mod, "detect_changes", fake_detect),
             patch.object(server_mod, "execute_refresh", fake_execute_refresh),
         ):
             await server_mod.refresh_view(setup_state, view)
 
         # Stale current_work discarded; fresh full pinned to the new live snapshot.
+        assert seen["resume_from"] is None
+        assert seen["max_snapshot"] == 200
+        assert await h.get_last_source_snapshot(view.name) == 200
+        assert await h.get_current_work(view.name) == (None, None)
+    finally:
+        await h.close()
+
+
+async def test_refresh_view_full_backfill_resume_recovers_when_pinned_snapshot_expired(setup_state, tmp_path):
+    """A full backfill (bookmark NULL) pins M and reads every chunk FOR VERSION
+    AS OF M. If a long backfill outlives source snapshot retention and M
+    expires, the resume must NOT keep failing on the dead snapshot forever:
+    current_work is discarded and a fresh full refresh re-pins to the live
+    snapshot."""
+    from datetime import datetime
+
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.executor import QueryInfo
+    from iceberg_ivm.introspect import ColumnInfo
+
+    view = _install_chunked_view(setup_state)
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
+    setup_state.stop_event.clear()
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+    # Interrupted full backfill: bookmark still NULL, pinned snapshot 99.
+    await h.set_current_work(view.name, 99, datetime(2026, 4, 9, tzinfo=UTC))
+
+    seen = {}
+
+    async def fake_snapshot_exists(cursor, source_table, snapshot_id):
+        return snapshot_id != 99  # 99 has been expired from $snapshots
+
+    async def fake_detect(*a, **kw):
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=200)
+
+    async def fake_discover(cursor, query):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+
+    async def fake_execute_refresh(*a, **kw):
+        seen["max_snapshot"] = kw.get("max_snapshot")
+        seen["resume_from"] = kw.get("resume_from")
+        yield QueryInfo(
+            query_id="q1",
+            info_uri="http://trino/q1",
+            stage="chunk_merge",
+            started_at=1.0,
+            elapsed_ms=100.0,
+            range_start=datetime(2026, 4, 8, tzinfo=UTC),
+            range_end=datetime(2026, 4, 9, tzinfo=UTC),
+            chunks_done=1,
+            chunks_total=1,
+        )
+
+    try:
+        with (
+            patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+            patch.object(server_mod, "discover_columns", fake_discover),
+            patch.object(server_mod, "snapshot_exists", fake_snapshot_exists),
+            patch.object(server_mod, "detect_changes", fake_detect),
+            patch.object(server_mod, "execute_refresh", fake_execute_refresh),
+        ):
+            await server_mod.refresh_view(setup_state, view)
+
+        # Did NOT keep resuming the dead snapshot 99: discarded it and re-pinned
+        # to the live snapshot via a fresh full refresh.
         assert seen["resume_from"] is None
         assert seen["max_snapshot"] == 200
         assert await h.get_last_source_snapshot(view.name) == 200

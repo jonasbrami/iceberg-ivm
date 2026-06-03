@@ -33,11 +33,10 @@ from iceberg_ivm.config import (
     validate_view_name,
 )
 from iceberg_ivm.detector import (
-    ExpiredSnapshotError,
     RefreshAction,
     detect_changes,
-    get_snapshots_since,
     incremental_range_since,
+    snapshot_exists,
 )
 from iceberg_ivm.executor import (
     QueryInfo,
@@ -407,19 +406,25 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
             # (it advances only on clean completion, which clears current_work),
             # so a tick is either RESUMING current_work or starting FRESH.
 
-            # Resume validation: if an in-flight INCREMENTAL run's window is no
-            # longer derivable (bookmark or pinned M expired from $snapshots),
-            # abandon it and restart from scratch — full-from-scratch is always
-            # safe. A full-backfill resume (last_snap is None) is always
-            # derivable from the source range, so it is never abandoned here.
-            if work_max is not None and last_snap is not None:
-                try:
-                    await get_snapshots_since(cursor, parsed.source_table, last_snap, max_snapshot=work_max)
-                except ExpiredSnapshotError as exc:
+            # Resume validation: the pinned snapshot M must still exist (EVERY
+            # chunk reads FOR VERSION AS OF M, so an expired M can never merge —
+            # this guards both the incremental AND the full-backfill resume), and
+            # for an incremental resume the bookmark must too (the window is
+            # derived over (bookmark, M]). If either is gone, discard the
+            # in-flight run and restart from scratch — full-from-scratch is
+            # always safe. Otherwise an expired pin would fail every chunk and
+            # the run would re-enter the same doomed resume forever.
+            if work_max is not None:
+                valid = await snapshot_exists(cursor, parsed.source_table, work_max)
+                if valid and last_snap is not None:
+                    valid = await snapshot_exists(cursor, parsed.source_table, last_snap)
+                if not valid:
                     log.warning(
-                        "%s: in-flight window no longer derivable (%s) → discarding current_work, full refresh",
+                        "%s: in-flight run's pinned snapshot %d (or bookmark %s) expired → "
+                        "discarding current_work, full refresh from scratch",
                         view.name,
-                        exc,
+                        work_max,
+                        last_snap,
                     )
                     if s.history is not None:
                         await s.history.clear_current_work(view.name)

@@ -72,6 +72,18 @@ async def get_current_snapshot(cursor, source_table: str) -> int | None:
     return row[0] if row else None
 
 
+async def snapshot_exists(cursor, source_table: str, snapshot_id: int) -> bool:
+    """True iff ``snapshot_id`` is still present in ``$snapshots``.
+
+    Metadata-only. Used to validate a pinned in-flight snapshot before resuming
+    a run: every chunk reads ``FOR VERSION AS OF`` it, so if it has been expired
+    (a long backfill outliving source snapshot retention) the resume can never
+    succeed and the run must be discarded and restarted from a live snapshot.
+    """
+    await cursor.execute(f"SELECT 1 FROM {system_table(source_table, 'snapshots')} WHERE snapshot_id = {snapshot_id}")
+    return (await cursor.fetchone()) is not None
+
+
 async def get_snapshots_since(cursor, source_table: str, last_snap: int, max_snapshot: int | None = None) -> list[dict]:
     """Return snapshots in ``(last_snap, max_snapshot]``, ordered by (committed_at, snapshot_id).
 
@@ -218,34 +230,6 @@ async def get_source_column_range(
     if not lows or not highs:
         return None
     return (min(lows), max(highs))
-
-
-async def get_target_bucket_max(
-    cursor,
-    target_table: str,
-    bucket_alias: str,
-) -> datetime | None:
-    """Read the max ``upper_bound`` of ``bucket_alias`` across live data
-    files in ``target_table``.
-
-    NOT used as a chunked-refresh resume point any more (issue #62): resuming
-    from the target's newest bucket conflated "data present up to T" with
-    "data correct up to T", silently skipping older buckets that a
-    non-append-only source had overwritten. The full-refresh resume point now
-    comes solely from the bookmark / ``current_work`` record in the state DB
-    (see ``executor.execute_refresh`` and ``QueryHistory.get_current_work``).
-    Kept as a standalone metadata helper. Returns ``None`` for an empty target
-    or one whose files carry no bounds on ``bucket_alias`` yet.
-
-    Filters ``content = 0`` (data files) so V2 position/equality delete
-    files don't skew the max upward.
-    """
-    await cursor.execute(f"SELECT readable_metrics FROM {system_table(target_table, 'files')} WHERE content = 0")
-    rows = await cursor.fetchall()
-    if not rows:
-        return None
-    _, highs, _ = _iter_column_bounds(rows, bucket_alias)
-    return max(highs) if highs else None
 
 
 def midnight(dt: datetime) -> datetime:

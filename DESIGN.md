@@ -218,14 +218,20 @@ This single mechanism delivers four guarantees:
   so a run that is repeatedly cut off (deploy, crash, timeout) resumes from its
   last committed chunk instead of redoing the window from the start — a
   sufficiently large window still converges.
-- **No window drift.** Because `M` is *pinned* and reused verbatim on resume
-  (never re-read from the live source), the snapshot set `(bookmark, M]` — and
-  therefore the bucket window it derives — is identical across resumes. A
-  *newer* snapshot that overwrites an *older* bucket cannot move the window's
-  start mid-run; it is simply out of scope (`> M`) and is picked up on the next
-  run over `(M, M']`. (With a bare timestamp marker re-derived against the live
-  source, that newer snapshot would drift the window start earlier and a
-  forward-only resume would skip the correction — silent staleness.)
+- **No window drift (incremental).** Because `M` is *pinned* and reused
+  verbatim on resume (never re-read from the live source), the snapshot set
+  `(bookmark, M]` — and therefore the incremental bucket window it derives — is
+  identical across resumes. A *newer* snapshot that overwrites an *older*
+  bucket cannot move the window's start mid-run; it is simply out of scope
+  (`> M`) and is picked up on the next run over `(M, M']`. (With a bare
+  timestamp marker re-derived against the live source, that newer snapshot
+  would drift the window start earlier and a forward-only resume would skip the
+  correction — silent staleness.) A *full* backfill re-derives its `[start,
+  end)` from the live `$files` range each resume rather than from the pinned
+  snapshot set, so its window is not frozen the same way — but it stays correct
+  and monotonic: `_floor_resume_to_chunk`'s `max(start, resume)` clamp never
+  redoes a committed chunk, and a grown `max_ts` only appends *trailing* chunks
+  that read empty as of `M` (any data ≤ `M` was already live at detection).
 - **No snapshot mixing.** Every chunk reads `FOR VERSION AS OF M`, so a
   multi-hour run sees one immutable source state throughout. The MV advances
   **atomically per run** from consistent-as-of-`bookmark` to

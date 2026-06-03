@@ -15,7 +15,6 @@ from iceberg_ivm.detector import (
     get_new_files_column_range,
     get_snapshots_since,
     get_source_column_range,
-    get_target_bucket_max,
     walk_buckets,
 )
 
@@ -903,61 +902,3 @@ class TestGetSourceColumnRange:
         )
         with pytest.raises(MissingFilterColumnError):
             await get_source_column_range(cursor, "db.t", "ts")
-
-
-# ── get_target_bucket_max ──
-
-
-class TestGetTargetBucketMax:
-    async def test_reads_max_upper_bound(self):
-        cursor = MockCursor(
-            [
-                [
-                    (
-                        {
-                            "minute": {
-                                "lower_bound": "2026-04-08T00:00:00+00:00",
-                                "upper_bound": "2026-04-08T23:59:00+00:00",
-                            }
-                        },
-                    ),
-                    (
-                        {
-                            "minute": {
-                                "lower_bound": "2026-04-09T00:00:00+00:00",
-                                "upper_bound": "2026-04-09T23:59:00+00:00",
-                            }
-                        },
-                    ),
-                ]
-            ]
-        )
-        result = await get_target_bucket_max(cursor, "iceberg.out.mv", "minute")
-        assert result == datetime(2026, 4, 9, 23, 59, tzinfo=UTC)
-
-    async def test_empty_target_returns_none(self):
-        cursor = MockCursor([[]])
-        assert await get_target_bucket_max(cursor, "db.t", "minute") is None
-
-    async def test_bucket_column_absent_returns_none(self):
-        """Target has files but none carry metrics for the bucket column —
-        treat as empty resume (not an error), since the target may be a
-        fresh table whose first chunk is still in flight."""
-        cursor = MockCursor(
-            [
-                [
-                    ({"other": {"lower_bound": "1", "upper_bound": "2"}},),
-                ]
-            ]
-        )
-        assert await get_target_bucket_max(cursor, "db.t", "minute") is None
-
-    async def test_filters_out_delete_files(self):
-        """$files exposes V2 position/equality delete files via the `content`
-        column (0=DATA, 1=POS_DELETES, 2=EQ_DELETES). The resume point must
-        be computed from data files only — including delete-file metrics
-        would skew the max upward and skip live buckets on resume."""
-        cursor = MockCursor([[]])
-        await get_target_bucket_max(cursor, "db.t", "minute")
-        sql = cursor.executed_sql[0]
-        assert "content = 0" in sql or "content=0" in sql

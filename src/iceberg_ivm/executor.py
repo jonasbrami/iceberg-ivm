@@ -5,7 +5,11 @@ One refresh = one or more MERGE commits over bucket-aligned time ranges:
   - incremental refresh: one MERGE over the detector's snapped range.
   - full refresh: one MERGE over the source's whole range.
   - chunked full refresh: N MERGEs, one per chunk, with per-chunk commit so
-    a crash or restart resumes from target metadata.
+    a crash or restart resumes from the ``current_work`` record (never from
+    the target's own data).
+
+Every chunk reads its source ``FOR VERSION AS OF`` the run's pinned snapshot,
+so a multi-chunk run never mixes data from different source commits.
 
 ``execute_refresh`` is a single async generator that yields one ``QueryInfo``
 per committed MERGE. Callers cancel via ``break`` — no callback plumbing.
