@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 
 from iceberg_ivm.config import ViewConfig
-from iceberg_ivm.detector import RefreshAction, detect_changes
+from iceberg_ivm.detector import RefreshAction, detect_changes, get_current_snapshot
 from iceberg_ivm.executor import execute_refresh
 from iceberg_ivm.introspect import build_create_table_sql, discover_columns
 from iceberg_ivm.query_parser import parse_view_query
@@ -101,7 +101,9 @@ class TestFullRefresh:
         result = await detect_changes(cursor, SOURCE_TABLE, "ts", "minute", last_snapshot=None)
         assert result.action == RefreshAction.FULL_REFRESH
 
-        await _drain(execute_refresh(cursor, VIEW, TARGET_TABLE, PARSED, value_cols))
+        await _drain(
+            execute_refresh(cursor, VIEW, TARGET_TABLE, PARSED, value_cols, max_snapshot=result.current_snapshot)
+        )
         bars = await query_bars(cursor)
         assert len(bars) == 3
         b = [b for b in bars if "09:30" in str(b["minute"])][0]
@@ -119,7 +121,8 @@ class TestIncrementalRefresh:
         value_cols = await _value_cols(cursor)
         cols = await discover_columns(cursor, VIEW.query)
         await cursor.execute(build_create_table_sql(TARGET_TABLE, cols, "ARRAY['day(minute)']"))
-        await _drain(execute_refresh(cursor, VIEW, TARGET_TABLE, PARSED, value_cols))
+        M = await get_current_snapshot(cursor, SOURCE_TABLE)
+        await _drain(execute_refresh(cursor, VIEW, TARGET_TABLE, PARSED, value_cols, max_snapshot=M))
 
         result = await detect_changes(cursor, SOURCE_TABLE, "ts", "minute", last_snapshot=None)
 
@@ -137,6 +140,7 @@ class TestIncrementalRefresh:
                 PARSED,
                 value_cols,
                 incremental_range=result.filter_range,
+                max_snapshot=result.current_snapshot,
             )
         )
         assert len(await query_bars(cursor)) == 2
@@ -149,7 +153,8 @@ class TestIncrementalRefresh:
         value_cols = await _value_cols(cursor)
         cols = await discover_columns(cursor, VIEW.query)
         await cursor.execute(build_create_table_sql(TARGET_TABLE, cols, "ARRAY['day(minute)']"))
-        await _drain(execute_refresh(cursor, VIEW, TARGET_TABLE, PARSED, value_cols))
+        M = await get_current_snapshot(cursor, SOURCE_TABLE)
+        await _drain(execute_refresh(cursor, VIEW, TARGET_TABLE, PARSED, value_cols, max_snapshot=M))
 
         result = await detect_changes(cursor, SOURCE_TABLE, "ts", "minute", last_snapshot=None)
 
@@ -166,6 +171,7 @@ class TestIncrementalRefresh:
                 PARSED,
                 value_cols,
                 incremental_range=result.filter_range,
+                max_snapshot=result.current_snapshot,
             )
         )
         bars = await query_bars(cursor)
@@ -233,6 +239,8 @@ class TestChunkedFullRefresh:
         cursor = await trino_conn.cursor()
         value_cols = await self._seed(cursor)
 
+        M = await get_current_snapshot(cursor, SOURCE_TABLE)
+
         chunked_qs = await _drain(
             execute_refresh(
                 cursor,
@@ -240,6 +248,7 @@ class TestChunkedFullRefresh:
                 TARGET_TABLE,
                 PARSED,
                 value_cols,
+                max_snapshot=M,
             )
         )
         assert all(q.stage == "chunk_merge" for q in chunked_qs)
@@ -254,6 +263,7 @@ class TestChunkedFullRefresh:
                 TARGET_TABLE,
                 PARSED,
                 value_cols,
+                max_snapshot=M,
             )
         )
         assert len(single_qs) == 1
@@ -264,20 +274,26 @@ class TestChunkedFullRefresh:
 
     async def test_interrupt_and_resume(self, trino_conn):
         """Breaking out of the generator after the first chunk must leave only
-        that chunk's data in target. A second call must resume from target
-        metadata and complete the remaining chunks without re-emitting the
-        first."""
+        that chunk's data in target. Resuming with the SAME pinned ``max_snapshot``
+        and ``resume_from`` = the committed chunk's ``range_end`` must complete the
+        remaining chunks without re-emitting the first, producing gap-free output
+        identical to a single-shot full refresh over the same pinned snapshot."""
         cursor = await trino_conn.cursor()
         value_cols = await self._seed(cursor)
 
+        # Pin the source snapshot once; the resume reuses the SAME M.
+        M = await get_current_snapshot(cursor, SOURCE_TABLE)
+
         first = await _drain(
-            execute_refresh(cursor, CHUNKED_VIEW, TARGET_TABLE, PARSED, value_cols),
+            execute_refresh(cursor, CHUNKED_VIEW, TARGET_TABLE, PARSED, value_cols, max_snapshot=M),
             stop_after=1,
         )
         assert len(first) == 1
         assert first[0].chunks_done == 1
         assert first[0].chunks_total == 3
 
+        # Resume from the committed chunk's end (the ``current_work`` marker the
+        # server would have persisted), pinned to the SAME snapshot M.
         second = await _drain(
             execute_refresh(
                 cursor,
@@ -285,22 +301,28 @@ class TestChunkedFullRefresh:
                 TARGET_TABLE,
                 PARSED,
                 value_cols,
+                max_snapshot=M,
+                resume_from=first[0].range_end,
             )
         )
         assert len(second) == 2
 
         resumed_bars = await query_bars(cursor)
         await cursor.execute(f"DELETE FROM {TARGET_TABLE} WHERE true")
-        await _drain(execute_refresh(cursor, VIEW, TARGET_TABLE, PARSED, value_cols))
+        await _drain(execute_refresh(cursor, VIEW, TARGET_TABLE, PARSED, value_cols, max_snapshot=M))
         reference = await query_bars(cursor)
         assert resumed_bars == reference
 
     async def test_replay_is_idempotent(self, trino_conn):
-        """Running the same chunked refresh twice (simulating a committed-
-        but-not-acked retry) must not duplicate rows: resume from target
-        metadata sees everything already covered and emits zero chunks."""
+        """Running the same chunked refresh twice with the SAME pinned
+        ``max_snapshot`` and no ``resume_from`` (simulating a committed-but-not-
+        acked retry that re-runs from scratch) must be idempotent: every chunk is
+        re-MERGEd, but the MERGE keys mean no rows are duplicated — the target is
+        byte-identical to the first run."""
         cursor = await trino_conn.cursor()
         value_cols = await self._seed(cursor)
+
+        M = await get_current_snapshot(cursor, SOURCE_TABLE)
 
         await _drain(
             execute_refresh(
@@ -309,10 +331,12 @@ class TestChunkedFullRefresh:
                 TARGET_TABLE,
                 PARSED,
                 value_cols,
+                max_snapshot=M,
             )
         )
         first = await query_bars(cursor)
 
+        # Replay: same M, no resume_from → re-runs all chunks idempotently.
         replay = await _drain(
             execute_refresh(
                 cursor,
@@ -320,8 +344,11 @@ class TestChunkedFullRefresh:
                 TARGET_TABLE,
                 PARSED,
                 value_cols,
+                max_snapshot=M,
             )
         )
-        assert replay == []
+        assert len(replay) == 3, "replay must re-run every chunk under the new model"
         second = await query_bars(cursor)
+        # Idempotent: identical row counts and values, no duplicates.
         assert first == second
+        assert len(second) == len(first)
