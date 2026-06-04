@@ -5,6 +5,7 @@ on:
     branches: ["**"]
     tags: ["v*.*.*"]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   lint:
@@ -41,6 +42,42 @@ jobs:
       - run: uv sync
 
       - run: uv run pytest -m "not integration"
+
+  # Heavy: boots Trino + MinIO + Postgres. Gated to PRs targeting master and
+  # manual dispatch, so it doesn't run on every branch push. First CI lane for
+  # the whole tests/integration suite (run manually/locally before this).
+  integration:
+    runs-on: ubuntu-latest
+    needs: lint
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && github.base_ref == 'master')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start Trino + MinIO + Postgres
+        run: docker compose -f tests/docker-compose.yml up -d --wait trino
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - run: uv sync
+
+      - name: Run integration tests
+        env:
+          TRINO_HOST: localhost
+          TRINO_PORT: "18080"
+        run: uv run pytest -m integration
+
+      - name: Trino logs on failure
+        if: failure()
+        run: docker compose -f tests/docker-compose.yml logs trino
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f tests/docker-compose.yml down -v
 
   publish:
     runs-on: ubuntu-latest
