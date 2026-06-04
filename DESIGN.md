@@ -173,81 +173,59 @@ because compactions triggered needless full rewrites.
 
 ### Chunked, snapshot-pinned, resumable refresh
 
-This is a **generic** orchestrator: it makes no assumption about how much data
-a refresh touches. A single source snapshot may add a terabyte; a view that
-has fallen far behind has a correspondingly large catch-up window. So every
-refresh — full *or* incremental — must hold for **any** allowed source, not
-one specific workload. The model is two pieces of state plus a single rule.
+A **generic** orchestrator: a single source snapshot may add a terabyte, and a
+view far behind has a large catch-up window, so every refresh — full or
+incremental — must hold for any source. The model is two pieces of state plus
+one rule.
 
-**State.** Just two things per view, in `view_status`:
+**State** (per view, in `view_status`):
 
-- `last_source_snapshot` — the **bookmark**: the source snapshot the view is
-  fully and correctly materialized up to. `NULL` until the first run completes.
-- `current_work = (work_max_snapshot, work_last_merged_chunk)` — the
-  **in-flight run**: the snapshot it pinned and the end of the last chunk it
-  committed. Both `NULL` when idle; set/cleared together.
+- `last_source_snapshot` — the **bookmark**: the snapshot the view is correctly
+  materialized up to. `NULL` until the first run completes.
+- `current_work = (work_max_snapshot, work_last_merged_chunk)` — the in-flight
+  run's pinned snapshot and last committed chunk. `NULL` when idle.
 
-The run's *lower* bound is **implied**, never stored: it is `bookmark + 1` for
-an incremental run, or the source's beginning for a full backfill (`bookmark
-is NULL`). This is sound because the bookmark advances **only on clean
-completion**, and completion clears `current_work` — so while `current_work`
-is set the bookmark cannot move. A tick is therefore either *resuming*
-`current_work` or starting *fresh*; there is no third state to disambiguate.
+The run's lower bound is implied (`bookmark + 1`, or source start for a full
+backfill), never stored: the bookmark advances only on completion — which
+clears `current_work` — so while `current_work` is set the bookmark can't move,
+and a tick is unambiguously *resuming* it or starting *fresh*.
 
-**The rule.** A run **pins** `M = work_max_snapshot` at the start and:
+**The rule.** A run pins `M = work_max_snapshot` and: (1) derives its window
+over the **frozen** range `(bookmark, M]` (full backfill: the whole source
+range) and splits it into bucket-aligned idempotent `MERGE` chunks; (2) reads
+every chunk `FROM <source> FOR VERSION AS OF M`; (3) on completion advances the
+bookmark to `M` and clears `current_work`, else leaves both so the next tick
+resumes the same pinned run from `work_last_merged_chunk`.
 
-1. derives its window over the **frozen** snapshot range `(bookmark, M]` (full
-   backfill: the whole source range), then splits it into bucket-aligned
-   chunks (`walk_buckets` / `expand_to_bucket_bounds`), each chunk one
-   idempotent Iceberg `MERGE`;
-2. reads **every** chunk's MERGE source `FROM <source> FOR VERSION AS OF M`
-   (`inject_version_pin`);
-3. on clean completion advances `last_source_snapshot = M` and clears
-   `current_work`. On interruption it leaves both untouched, so the next tick
-   resumes the *same* pinned run from `work_last_merged_chunk`
-   (`_floor_resume_to_chunk` re-MERGEs at most the one in-flight chunk).
+This delivers four guarantees:
 
-This single mechanism delivers four guarantees:
+- **Memory safety.** A large window runs as N bounded chunks, not one OOMing
+  `MERGE` — both paths chunk (only the full path chunking was the original bug).
+- **Convergence.** Progress is durable in `current_work`, so a
+  repeatedly-interrupted run resumes instead of redoing the window.
+- **No drift.** `M` is pinned and reused verbatim, so the incremental window
+  `(bookmark, M]` is identical across resumes; a newer snapshot overwriting an
+  older bucket is out of scope (`> M`) until the next run. (A bare timestamp
+  marker re-derived live would drift the start and skip the correction.) A full
+  backfill re-derives `[start, end)` from live `$files`, still safe: the
+  `max(start, resume)` clamp never redoes a committed chunk and a grown max only
+  appends chunks empty as of `M`.
+- **No mixing.** Every chunk reads `FOR VERSION AS OF M`, so the MV advances
+  atomically per run from consistent-as-of-`bookmark` to -`M`, never blending
+  commits even under concurrent writes (untouched buckets are unchanged, so the
+  whole MV is consistent as of `M`).
 
-- **Memory safety.** A large window runs as N bounded chunks, never one `MERGE`
-  whose join build side OOMs the node — both full and incremental chunk. (Only
-  the full path chunking, while a large incremental catch-up ran as one OOMing
-  MERGE, was the original bug.)
-- **Convergence under interruption.** Progress is durable in `current_work`, so
-  a repeatedly-interrupted run resumes from its last committed chunk instead of
-  redoing the window — even a very large window converges.
-- **No window drift.** `M` is pinned and reused verbatim on resume, so the
-  incremental snapshot set `(bookmark, M]` — and the bucket window it derives —
-  is identical across resumes; a newer snapshot overwriting an *older* bucket is
-  out of scope (`> M`) and handled on the next run. (A bare timestamp marker
-  re-derived against the live source would drift the start earlier, and a
-  forward-only resume would skip the correction — silent staleness.) A full
-  backfill instead re-derives `[start, end)` from the live `$files`, which is
-  still safe: the `max(start, resume)` clamp never redoes a committed chunk, and
-  a grown `max_ts` only appends chunks that read empty as of `M`.
-- **No snapshot mixing.** Every chunk reads `FOR VERSION AS OF M`, so the MV
-  advances atomically per run from consistent-as-of-`bookmark` to
-  consistent-as-of-`M` and never blends commit *t* with *t−2* without *t−1*,
-  even under concurrent writes. (Untouched buckets are unchanged between
-  `bookmark` and `M`, so the whole MV is consistent as of `M`.) Single-source is
-  enforced at parse time, so one pin per chunk suffices.
+**Resume comes from the bookmark / `current_work`, never the target** (which
+shows what's *present*, not *correct*): the old path resumed from the target's
+`max(bucket_alias)` and walked forward, silently skipping a source's overwritten
+historical buckets.
 
-**Resume point comes from the bookmark / `current_work` only — never the
-target table.** The target tells you what data is *present*, not what is
-*correct*. The old full path resumed from `max(bucket_alias)` in the target
-(via a `get_target_bucket_max` helper, removed in this change) and walked
-forward only; for a source that overwrites a *historical* bucket (allowed —
-see *No-data-loss* above) that silently skipped the corrected older bucket.
-
-**Lost bookmark → recompute from scratch.** A full refresh is forced when the
-bookmark is gone (`expire_snapshots` removed it, fresh `state.db`, or the view
-was deleted+re-added). If an in-flight incremental's bookmark expires, its
-window `(bookmark, M]` is no longer derivable (`ExpiredSnapshotError`), so
-`current_work` is **discarded** and the view restarts as a full refresh from
-the source's beginning — always safe. This is also why no provenance flag is
-needed on `current_work`: a stale incremental record is never *misread* by a
-full refresh, because the moment its bookmark dies the record is structurally
-unreconstructable, not merely "ignored by a rule".
+**Lost bookmark → recompute from scratch.** When the bookmark is gone
+(`expire_snapshots`, fresh `state.db`, view re-added) or an in-flight
+incremental's window `(bookmark, M]` is no longer derivable, `current_work` is
+discarded and the view recomputes full-from-scratch (always safe). Hence no
+provenance flag is needed: a stale record can't be misread — once its bookmark
+dies it's structurally unreconstructable.
 
 ### Why not dbt?
 

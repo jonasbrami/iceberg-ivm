@@ -73,12 +73,11 @@ async def get_current_snapshot(cursor, source_table: str) -> int | None:
 
 
 async def snapshot_exists(cursor, source_table: str, snapshot_id: int) -> bool:
-    """True iff ``snapshot_id`` is still present in ``$snapshots``.
+    """True iff ``snapshot_id`` is still in ``$snapshots`` (metadata-only).
 
-    Metadata-only. Used to validate a pinned in-flight snapshot before resuming
-    a run: every chunk reads ``FOR VERSION AS OF`` it, so if it has been expired
-    (a long backfill outliving source snapshot retention) the resume can never
-    succeed and the run must be discarded and restarted from a live snapshot.
+    Validates a pinned in-flight snapshot before resuming: every chunk reads
+    ``FOR VERSION AS OF`` it, so if it expired the resume can never succeed and
+    must be discarded (see ``server.refresh_view``).
     """
     await cursor.execute(f"SELECT 1 FROM {system_table(source_table, 'snapshots')} WHERE snapshot_id = {snapshot_id}")
     return (await cursor.fetchone()) is not None
@@ -87,13 +86,9 @@ async def snapshot_exists(cursor, source_table: str, snapshot_id: int) -> bool:
 async def get_snapshots_since(cursor, source_table: str, last_snap: int, max_snapshot: int | None = None) -> list[dict]:
     """Return snapshots in ``(last_snap, max_snapshot]``, ordered by (committed_at, snapshot_id).
 
-    With ``max_snapshot=None`` this is "strictly after last_snap" up to the
-    latest. Passing ``max_snapshot`` bounds the upper end too, so a run can PIN
-    the set of snapshots it processes and stay deterministic across resumes even
-    as new snapshots land — this is what stops a later overwrite of an older
-    bucket from drifting the window start (issues #61/#62).
-
-    The snapshot_id tiebreak matters: committed_at is millisecond-precision, so
+    ``max_snapshot=None`` → up to the latest (live detection); a bound pins the
+    set a run processes, freezing the window across resumes (#61/#62). The
+    snapshot_id tiebreak matters: committed_at is millisecond-precision, so
     sibling snapshots can share a timestamp. Raises ExpiredSnapshotError if
     ``last_snap`` (or, when given, ``max_snapshot``) is no longer in $snapshots.
     """

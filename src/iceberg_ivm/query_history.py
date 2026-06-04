@@ -71,24 +71,12 @@ CREATE TABLE IF NOT EXISTS view_status (
     chunks_done           INTEGER NOT NULL DEFAULT 0,
     chunks_total          INTEGER,
     last_source_snapshot  INTEGER,
-    -- Unified in-flight "current work" record (issue #61/#62), replacing the
-    -- old two-marker design (backfill_progress / incremental_progress).
-    --
-    -- work_max_snapshot:      the PINNED upper snapshot bound of the in-flight
-    --                         run. Reused verbatim on resume (never recomputed
-    --                         from the live source) so every chunk reads the
-    --                         identical immutable snapshot → no source mixing
-    --                         (Bug 2) and a deterministic (bookmark, M] window
-    --                         across resumes → no drift (Bug 1).
-    -- work_last_merged_chunk: ISO-8601 ``range_end`` of the last committed
-    --                         chunk; the resume point, floored to its chunk.
-    --
-    -- INVARIANT: the bookmark (last_source_snapshot) advances ONLY on full
-    -- completion, and completion CLEARS current_work. So while current_work is
-    -- non-NULL the bookmark is invariant, hence the run's MIN bound (bookmark+1
-    -- for incremental, source-start for full) is IMPLIED and never stored —
-    -- which is why no ``min`` column exists. Both columns are NULL when idle
-    -- and are set / cleared together.
+    -- In-flight run (#61/#62): work_max_snapshot = the pinned snapshot M (reused
+    -- verbatim on resume → frozen window, no drift/mixing); work_last_merged_chunk
+    -- = ISO-8601 range_end of the last committed chunk (the resume point). NULL
+    -- when idle, set/cleared together. INVARIANT: the bookmark advances only on
+    -- completion (which clears current_work), so while current_work is set the run's
+    -- MIN bound is implied (bookmark+1, or source start) and needs no column.
     work_max_snapshot      INTEGER,
     work_last_merged_chunk TEXT
 );
@@ -143,19 +131,11 @@ class QueryHistory:
         log.info("query history opened at %s (limit=%d per view)", self.db_path, self.limit)
 
     async def _migrate(self) -> None:
-        """Add columns introduced after a DB was first created.
-
-        ``CREATE TABLE IF NOT EXISTS`` is a no-op on an existing table, so new
-        columns must be added explicitly. ``ADD COLUMN`` is idempotent here via
-        the column-presence check (SQLite has no ``ADD COLUMN IF NOT EXISTS``).
-
-        The only RELEASED ``view_status`` column beyond the original set is
-        ``last_source_snapshot``. The ``current_work`` columns
-        (``work_max_snapshot`` / ``work_last_merged_chunk``) are new in #65 and
-        guarded here so a prod DB carrying only ``last_source_snapshot`` (plus
-        its counters) migrates cleanly. The old ``backfill_progress`` /
-        ``incremental_progress`` columns were NEVER released (this branch only),
-        so they are simply dropped from ``_SCHEMA`` — no rename/move migration.
+        """Add columns introduced after a DB was first created (``CREATE TABLE
+        IF NOT EXISTS`` won't). Idempotent via the column-presence check (SQLite
+        has no ``ADD COLUMN IF NOT EXISTS``), so a released DB carrying only
+        ``last_source_snapshot`` + counters gains the ``current_work`` columns
+        cleanly.
         """
         async with self._db.execute("PRAGMA table_info(view_status)") as cur:
             cols = {row[1] for row in await cur.fetchall()}
@@ -320,11 +300,8 @@ class QueryHistory:
     # mirror can't clobber it; set/cleared together with the bookmark write.
 
     async def get_current_work(self, view: str) -> tuple[int | None, datetime | None]:
-        """Return ``(work_max_snapshot, work_last_merged_chunk)`` for ``view``.
-
-        ``(None, None)`` means idle (no in-flight run). A non-NULL
-        ``work_max_snapshot`` with a NULL chunk means a run started but no chunk
-        has committed yet.
+        """``(work_max_snapshot, work_last_merged_chunk)``; ``(None, None)`` =
+        idle. A non-NULL snapshot with NULL chunk = run started, no chunk yet.
         """
         async with self._db.execute(
             "SELECT work_max_snapshot, work_last_merged_chunk FROM view_status WHERE view = ?",

@@ -126,14 +126,10 @@ def _floor_resume_to_chunk(
     resume_from: datetime,
     chunk: str,
 ) -> datetime:
-    """Floor a committed-progress marker to the start of its containing chunk,
-    clamped to never precede ``start`` (the window/source beginning).
-
-    Shared by the full path (``_backfill_ranges``) and the incremental path so
-    both resume identically: the containing chunk is re-MERGEd in full —
-    idempotent, gap-free even if ``full_refresh_chunk`` changed mid-run — and
-    the ``max`` guard prevents resuming before the run's own start (e.g. a
-    marker that predates the current window/source beginning).
+    """Floor a resume marker to its containing chunk start, clamped to never
+    precede ``start``. The containing chunk is re-MERGEd in full (idempotent,
+    gap-free even if ``full_refresh_chunk`` changed); the ``max`` clamp stops a
+    stale marker from resuming before the window's own beginning.
     """
     resume_start = expand_to_bucket_bounds(resume_from, resume_from, chunk)[0]
     return max(start, resume_start)
@@ -146,17 +142,12 @@ async def _backfill_ranges(
     *,
     resume_from: datetime | None = None,
 ) -> list[tuple[datetime, datetime]]:
-    """Return the ordered (start, end) ranges for a full refresh.
+    """Ordered (start, end) ranges for a full refresh (1 = single-shot, N =
+    chunked, empty = empty source).
 
-    One element = single-shot; N elements = chunked. Empty = empty source.
-
-    A full refresh always recomputes from the **source's beginning** so a
-    source that overwrote historical buckets is fully re-merged — never
-    skipped (issue #62). The sole way to skip a chunk is ``resume_from``: a
-    committed-progress marker produced by *this* from-beginning run, used to
-    resume an interrupted backfill without redoing committed chunks. It is
-    NOT derived from the target's data (which may be stale historical rows
-    from an earlier incremental cursor) — that conflation was the bug.
+    Always recomputes from the source's beginning so overwritten historical
+    buckets are re-merged, not skipped (#62). ``resume_from`` (this run's own
+    committed progress, never the target's data) skips already-committed chunks.
     """
     source_range = await get_source_column_range(
         cursor,
@@ -216,12 +207,9 @@ async def execute_refresh(
     """
     if incremental_range is not None:
         if view.full_refresh_chunk:
-            # The detector already snapped ``incremental_range`` to the view's
-            # own (finer-or-equal) granularity as a HALF-OPEN ``[start, end)``.
-            # Re-align it outward to the (coarser-or-equal) chunk grid: floor
-            # the start, and expand the *last instant* of the window
-            # (``end`` exclusive → ``end - 1µs`` inclusive) so an already
-            # chunk-aligned end is NOT over-expanded by a whole empty chunk.
+            # Re-align the half-open ``[start, end)`` outward to the chunk grid.
+            # Expand the last *instant* (``end`` exclusive → ``end - 1µs``) so an
+            # already chunk-aligned end isn't over-expanded by a whole empty chunk.
             r_start, r_end = incremental_range
             start, end = expand_to_bucket_bounds(r_start, r_end - timedelta(microseconds=1), view.full_refresh_chunk)
             if resume_from is not None:
@@ -238,9 +226,8 @@ async def execute_refresh(
     total = len(ranges)
     for i, (start, end) in enumerate(ranges, start=1):
         src = inject_range_filter(view.query, parsed.filter_column, start, end)
-        # Pin the source read to the run's snapshot so all chunks see the same
-        # immutable state (no snapshot mixing). Single-source is guaranteed by
-        # the parser (joins/subqueries are rejected), so one pin suffices.
+        # Pin every chunk to the run's snapshot (no mixing); parser guarantees
+        # single-source, so one pin suffices.
         src = inject_version_pin(src, parsed.source_table, max_snapshot)
         sql = build_merge_sql(target_table, src, parsed.merge_keys, value_columns)
         log.info("%s: %s %d/%d [%s, %s) @ snapshot %d", view.name, stage, i, total, start, end, max_snapshot)
