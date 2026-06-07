@@ -10,6 +10,7 @@ from iceberg_ivm.query_parser import (
     VALID_GRANULARITIES,
     ParsedView,
     inject_range_filter,
+    inject_version_pin,
     parse_view_query,
 )
 
@@ -383,3 +384,56 @@ class TestInjectRangeFilter:
         stripped = sqlparse.format(out, strip_comments=True)
         assert "ts >= TIMESTAMP" in stripped
         assert "ts < TIMESTAMP" in stripped
+
+
+class TestInjectVersionPin:
+    """Pin the source-table read to an immutable snapshot id (issue #62 Bug 2).
+
+    Every chunk of a run must read the source ``FOR VERSION AS OF <M>`` so a
+    long run can't mix data from different source snapshots.
+    """
+
+    def test_pins_bare_table(self):
+        sql = "SELECT date_trunc('day', ts) AS d FROM iceberg.md.trades GROUP BY 1"
+        out = inject_version_pin(sql, "iceberg.md.trades", 42)
+        assert "iceberg.md.trades FOR VERSION AS OF 42" in out
+        # Re-parses cleanly and preserves the rest of the query.
+        assert "GROUP BY 1" in out
+        assert out.count("FOR VERSION AS OF") == 1
+
+    def test_pins_table_with_existing_where(self):
+        sql = "SELECT date_trunc('day', ts) AS d FROM iceberg.md.trades WHERE color = 'red' GROUP BY 1"
+        out = inject_version_pin(sql, "iceberg.md.trades", 7)
+        assert "iceberg.md.trades FOR VERSION AS OF 7" in out
+        assert "color = 'red'" in out
+
+    def test_composes_with_inject_range_filter(self):
+        # The executor pins THEN range-filters; the result must carry both the
+        # version pin and the time predicate, and re-parse to the same view.
+        sql = "SELECT symbol, date_trunc('day', ts) AS d, sum(q) AS v FROM iceberg.md.trades GROUP BY 1, 2"
+        pinned = inject_version_pin(sql, "iceberg.md.trades", 99)
+        ranged = inject_range_filter(pinned, "ts", datetime(2026, 4, 6, tzinfo=UTC), datetime(2026, 4, 13, tzinfo=UTC))
+        assert "iceberg.md.trades FOR VERSION AS OF 99" in ranged
+        assert "ts >= TIMESTAMP '2026-04-06 00:00:00.000000 UTC'" in ranged
+        assert "ts < TIMESTAMP '2026-04-13 00:00:00.000000 UTC'" in ranged
+        p = parse_view_query(ranged)
+        assert p.source_table == "iceberg.md.trades"
+        assert p.merge_keys == ("symbol", "d")
+
+    def test_pins_table_with_alias(self):
+        # A FROM with a table alias must keep the alias after the pin so the
+        # rest of the query (which may reference it) still resolves.
+        sql = "SELECT date_trunc('day', t.ts) AS d FROM iceberg.md.trades t GROUP BY 1"
+        out = inject_version_pin(sql, "iceberg.md.trades", 5)
+        assert "iceberg.md.trades FOR VERSION AS OF 5" in out
+
+
+class TestSingleSourceEnforced:
+    """A view query that references more than one base table cannot be pinned
+    to a single snapshot consistently (issue #62 Bug 2), so it must be rejected
+    at parse/validation time. Joins are the way to reference two tables."""
+
+    def test_join_rejected(self):
+        sql = "SELECT date_trunc('day', a.ts) AS d FROM iceberg.md.a a JOIN iceberg.md.b b ON a.id = b.id GROUP BY 1"
+        with pytest.raises(ValueError, match="single source table|join"):
+            parse_view_query(sql)

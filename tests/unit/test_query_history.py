@@ -361,3 +361,156 @@ async def test_last_source_snapshot_survives_reopen(tmp_path):
         assert await h2.get_last_source_snapshot("v") == 42
     finally:
         await h2.close()
+
+
+# ── current_work (unified in-flight run record, issue #61/#62) ──
+#
+# Replaces the old two-marker design (backfill_progress / incremental_progress)
+# with a single record: (work_max_snapshot, work_last_merged_chunk). Both NULL
+# when idle; set together when a run starts; cleared together on completion.
+
+
+async def test_get_current_work_unknown_view(history):
+    """No row at all → (None, None): idle, no in-flight run."""
+    assert await history.get_current_work("never-seen") == (None, None)
+
+
+async def test_get_current_work_row_without_work(history):
+    """Row exists from upsert_view_status but the work columns are NULL."""
+    await history.upsert_view_status("v", {"total_refreshes": 3})
+    assert await history.get_current_work("v") == (None, None)
+
+
+async def test_set_then_get_current_work(history):
+    from datetime import UTC, datetime
+
+    chunk = datetime(2026, 4, 9, tzinfo=UTC)
+    await history.set_current_work("v", 42, chunk)
+    assert await history.get_current_work("v") == (42, chunk)
+
+
+async def test_set_current_work_with_null_chunk(history):
+    """At the start of a run no chunk has committed yet → last_merged_chunk None
+    but max_snapshot pinned."""
+    await history.set_current_work("v", 42, None)
+    assert await history.get_current_work("v") == (42, None)
+
+
+async def test_set_current_work_updates(history):
+    from datetime import UTC, datetime
+
+    await history.set_current_work("v", 42, datetime(2026, 4, 9, tzinfo=UTC))
+    await history.set_current_work("v", 42, datetime(2026, 4, 10, tzinfo=UTC))
+    assert await history.get_current_work("v") == (42, datetime(2026, 4, 10, tzinfo=UTC))
+
+
+async def test_clear_current_work(history):
+    from datetime import UTC, datetime
+
+    await history.set_current_work("v", 42, datetime(2026, 4, 9, tzinfo=UTC))
+    await history.clear_current_work("v")
+    assert await history.get_current_work("v") == (None, None)
+
+
+async def test_current_work_orthogonal_to_bookmark_and_mirror(history):
+    """current_work shares the view_status row with the bookmark and the
+    ViewStatus mirror — all must stay orthogonal (no write clobbers another)."""
+    from datetime import UTC, datetime
+
+    chunk = datetime(2026, 4, 9, tzinfo=UTC)
+    await history.upsert_view_status("v", {"total_refreshes": 7, "last_action": "chunked_full"})
+    await history.set_last_source_snapshot("v", 99)
+    await history.set_current_work("v", 42, chunk)
+
+    persisted = await history.get_view_status("v")
+    assert persisted["total_refreshes"] == 7
+    assert persisted["last_action"] == "chunked_full"
+    assert await history.get_last_source_snapshot("v") == 99
+    assert await history.get_current_work("v") == (42, chunk)
+
+    # A later ViewStatus mirror write must leave bookmark + work alone.
+    await history.upsert_view_status("v", {"total_refreshes": 8})
+    assert await history.get_current_work("v") == (42, chunk)
+    assert await history.get_last_source_snapshot("v") == 99
+
+    # Setting the bookmark must not clobber current_work.
+    await history.set_last_source_snapshot("v", 100)
+    assert await history.get_current_work("v") == (42, chunk)
+
+
+async def test_current_work_survives_reopen(tmp_path):
+    from datetime import UTC, datetime
+
+    chunk = datetime(2026, 4, 9, tzinfo=UTC)
+    path = tmp_path / "state.db"
+    h1 = QueryHistory(path, limit=5)
+    await h1.open()
+    await h1.set_current_work("v", 42, chunk)
+    await h1.close()
+
+    h2 = QueryHistory(path, limit=5)
+    await h2.open()
+    try:
+        assert await h2.get_current_work("v") == (42, chunk)
+    finally:
+        await h2.close()
+
+
+async def test_delete_view_purges_current_work(history):
+    from datetime import UTC, datetime
+
+    await history.set_current_work("v", 42, datetime(2026, 4, 9, tzinfo=UTC))
+    await history.delete_view("v")
+    assert await history.get_current_work("v") == (None, None)
+
+
+async def test_current_work_migration_idempotent(tmp_path):
+    """A prod DB carrying only ``last_source_snapshot`` (the sole RELEASED
+    column) must migrate cleanly: the new work columns are added, opening twice
+    is a no-op, and the bookmark + counters survive untouched."""
+    from datetime import UTC, datetime
+
+    import aiosqlite
+
+    path = tmp_path / "state.db"
+    # Old released schema: view_status WITHOUT the work columns (and without the
+    # unreleased backfill_progress / incremental_progress, which never shipped).
+    async with aiosqlite.connect(str(path)) as db:
+        await db.execute(
+            "CREATE TABLE view_status ("
+            "  view TEXT PRIMARY KEY,"
+            "  last_refresh REAL,"
+            "  last_duration REAL,"
+            "  last_action TEXT NOT NULL DEFAULT 'pending',"
+            "  last_range TEXT,"
+            "  last_error TEXT,"
+            "  total_refreshes INTEGER NOT NULL DEFAULT 0,"
+            "  total_errors INTEGER NOT NULL DEFAULT 0,"
+            "  chunks_done INTEGER NOT NULL DEFAULT 0,"
+            "  chunks_total INTEGER,"
+            "  last_source_snapshot INTEGER"
+            ")"
+        )
+        await db.execute("INSERT INTO view_status (view, total_refreshes, last_source_snapshot) VALUES ('v', 5, 77)")
+        await db.commit()
+
+    # First open migrates the work columns in.
+    h1 = QueryHistory(path, limit=5)
+    await h1.open()
+    try:
+        assert await h1.get_current_work("v") == (None, None)  # new columns NULL
+        assert await h1.get_last_source_snapshot("v") == 77
+        assert (await h1.get_view_status("v"))["total_refreshes"] == 5
+        await h1.set_current_work("v", 88, datetime(2026, 5, 17, tzinfo=UTC))
+    finally:
+        await h1.close()
+
+    # Opening again must not error (ADD COLUMN is guarded) and must preserve.
+    h2 = QueryHistory(path, limit=5)
+    await h2.open()
+    try:
+        assert await h2.get_current_work("v") == (88, datetime(2026, 5, 17, tzinfo=UTC))
+        assert await h2.get_last_source_snapshot("v") == 77
+        assert (await h2.get_view_status("v"))["total_refreshes"] == 5
+    finally:
+        await h2.close()

@@ -180,8 +180,8 @@ def validate_chunk_compatibility(chunk: str | None, query: str) -> None:
         raise ValueError(
             "full_refresh_chunk requires date_trunc("
             f"{parsed.granularity!r}, {parsed.filter_column}) to appear "
-            "as a direct projection with an alias (the target needs a "
-            "column to read as the resume point)"
+            "as a direct aliased projection, so the chunk grid lines up with "
+            "the query's own GROUP BY bucket"
         )
 
 

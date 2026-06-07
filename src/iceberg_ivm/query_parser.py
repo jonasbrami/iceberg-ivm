@@ -130,6 +130,38 @@ def inject_range_filter(sql: str, filter_column: str, start: datetime, end: date
     return str(stmt)
 
 
+def inject_version_pin(sql: str, source_table: str, snapshot_id: int) -> str:
+    """Rewrite ``FROM <source_table>`` → ``FROM <source_table> FOR VERSION AS OF
+    <snapshot_id> [alias]`` (the clause binds before any alias). Composed with
+    ``inject_range_filter`` so every chunk reads the identical immutable snapshot
+    — no source mixing (#62). Single-source is guaranteed (joins rejected at
+    parse time).
+    """
+    stmt = _single_statement(sql)
+    from_idx = next(
+        (i for i, t in enumerate(stmt.tokens) if t.ttype is Keyword and t.normalized.upper() == "FROM"),
+        None,
+    )
+    if from_idx is None:
+        raise ValueError("FROM clause missing")
+    tref_idx, tref = stmt.token_next(from_idx, skip_ws=True, skip_cm=True)
+    if tref is None:
+        raise ValueError("could not locate table reference after FROM to pin")
+    # Splice the pin after the qualified name, keeping any trailing alias text.
+    original = str(tref)
+    lead = original[: len(original) - len(original.lstrip())]
+    body = original.lstrip()
+    if body.startswith(source_table):
+        rest = body[len(source_table) :]
+        pinned = f"{lead}{source_table} FOR VERSION AS OF {snapshot_id}{rest}"
+    else:
+        # Defensive fallback for a quoted/odd reference shape: string-replace the
+        # first occurrence so the pin still lands.
+        pinned = original.replace(source_table, f"{source_table} FOR VERSION AS OF {snapshot_id}", 1)
+    stmt.tokens[tref_idx] = Token(None, pinned)
+    return str(stmt)
+
+
 # ---------------------------------------------------------------------------
 # internals
 # ---------------------------------------------------------------------------

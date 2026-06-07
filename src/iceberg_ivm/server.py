@@ -32,7 +32,12 @@ from iceberg_ivm.config import (
     validate_qualified_name,
     validate_view_name,
 )
-from iceberg_ivm.detector import RefreshAction, detect_changes
+from iceberg_ivm.detector import (
+    RefreshAction,
+    detect_changes,
+    incremental_range_since,
+    snapshot_exists,
+)
 from iceberg_ivm.executor import (
     QueryInfo,
     execute_maintenance,
@@ -367,6 +372,29 @@ async def _record_query(s: AppState, view_name: str, vs: ViewStatus, q: QueryInf
         vs.recent_queries = ([q, *vs.recent_queries])[:RECENT_QUERY_LIMIT]
 
 
+async def _skip_tick(
+    s: AppState,
+    view: ViewConfig,
+    conn,
+    target_table: str,
+    vs: ViewStatus,
+    *,
+    advance_to: int | None,
+) -> None:
+    """Skip-this-tick bookkeeping: mark skip, advance the bookmark to
+    ``advance_to`` (``None`` → leave unchanged), clear current_work, persist."""
+    vs.last_action = "skip"
+    vs.chunks_total = None
+    vs.chunks_done = 0
+    REFRESH_TOTAL.labels(view=view.name, type="skip").inc()
+    if s.history is not None:
+        if advance_to is not None:
+            await s.history.set_last_source_snapshot(view.name, advance_to)
+        await s.history.clear_current_work(view.name)
+    await _persist_view_status(s, view.name, vs)
+    await maintain_view(s, view, conn, target_table)
+
+
 async def refresh_view(s: AppState, view: ViewConfig) -> None:
     conn = get_trino_connection(s)
     cursor = await conn.cursor()
@@ -390,58 +418,118 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
             value_columns = [c.name for c in columns if c.name not in parsed.merge_keys]
 
             last_snap = await s.history.get_last_source_snapshot(view.name) if s.history is not None else None
-
-            t0 = time.monotonic()
-            result = await detect_changes(
-                cursor,
-                parsed.source_table,
-                parsed.filter_column,
-                parsed.granularity,
-                last_snap,
+            work_max, work_chunk = (
+                await s.history.get_current_work(view.name) if s.history is not None else (None, None)
             )
-            DETECTION_DURATION.labels(view=view.name).observe(time.monotonic() - t0)
-            log.info("%s: detection → %s (%.3fs)", view.name, result.action.name, time.monotonic() - t0)
-            if result.current_snapshot is not None:
-                SOURCE_SNAPSHOT.labels(view=view.name).set(result.current_snapshot)
 
-            if result.action == RefreshAction.NO_CHANGE:
-                vs.last_action = "skip"
-                # Clear any lingering in-flight chunked-backfill progress that may
-                # have been hydrated from view_status after a mid-backfill restart.
-                # If the source has caught up while iceberg-ivm was down, the
-                # next tick is NO_CHANGE — but the persisted chunks_total would
-                # still claim a backfill is in flight. The committed bookmark
-                # (last_source_snapshot) is the source of truth here.
-                vs.chunks_total = None
-                vs.chunks_done = 0
-                REFRESH_TOTAL.labels(view=view.name, type="skip").inc()
-                # Advance state past empty-append / compaction-only snapshots so
-                # we don't re-detect them every cycle.
-                if (
-                    result.current_snapshot is not None
-                    and result.current_snapshot != last_snap
-                    and s.history is not None
-                ):
-                    await s.history.set_last_source_snapshot(view.name, result.current_snapshot)
-                await _persist_view_status(s, view.name, vs)
-                await maintain_view(s, view, conn, target_table)
+            # current_work=(M, last_merged_chunk) is the in-flight run; while set,
+            # the bookmark can't move (it advances only on completion, which clears
+            # current_work), so a tick is either RESUMING it or starting FRESH.
+            # See DESIGN.md "Chunked, snapshot-pinned, resumable refresh".
+
+            # Validate the pin before resuming: M must still exist (every chunk
+            # reads FOR VERSION AS OF M), and for an incremental resume so must the
+            # bookmark (window is (bookmark, M]). If either expired, discard and
+            # restart full-from-scratch — else an expired pin fails every chunk forever.
+            if work_max is not None:
+                valid = await snapshot_exists(cursor, parsed.source_table, work_max)
+                if valid and last_snap is not None:
+                    valid = await snapshot_exists(cursor, parsed.source_table, last_snap)
+                if not valid:
+                    log.warning(
+                        "%s: in-flight run's pinned snapshot %d (or bookmark %s) expired → "
+                        "discarding current_work, full refresh from scratch",
+                        view.name,
+                        work_max,
+                        last_snap,
+                    )
+                    if s.history is not None:
+                        await s.history.clear_current_work(view.name)
+                    work_max, work_chunk = None, None
+
+            if work_max is not None:
+                # RESUME: reuse M verbatim, never re-detect — keeps the window
+                # frozen so a later overwrite of an older bucket can't drift it.
+                max_snapshot = work_max
+                resume_from = work_chunk
+                if last_snap is None:
+                    action = RefreshAction.FULL_REFRESH
+                    incremental_range = None
+                else:
+                    action = RefreshAction.INCREMENTAL
+                    incremental_range = await incremental_range_since(
+                        cursor,
+                        parsed.source_table,
+                        parsed.filter_column,
+                        parsed.granularity,
+                        last_snap,
+                        max_snapshot,
+                    )
+                SOURCE_SNAPSHOT.labels(view=view.name).set(max_snapshot)
+                log.info(
+                    "%s: resuming pinned %s @ snapshot %d from %s", view.name, action.name, max_snapshot, work_chunk
+                )
+            else:
+                # FRESH run: detect against the live source and pin its current
+                # snapshot for the duration of this run.
+                t0 = time.monotonic()
+                result = await detect_changes(
+                    cursor,
+                    parsed.source_table,
+                    parsed.filter_column,
+                    parsed.granularity,
+                    last_snap,
+                )
+                DETECTION_DURATION.labels(view=view.name).observe(time.monotonic() - t0)
+                log.info("%s: detection → %s (%.3fs)", view.name, result.action.name, time.monotonic() - t0)
+                if result.current_snapshot is not None:
+                    SOURCE_SNAPSHOT.labels(view=view.name).set(result.current_snapshot)
+
+                if result.action == RefreshAction.NO_CHANGE:
+                    # Advance the bookmark past empty-append / compaction-only
+                    # snapshots so we don't re-detect them every cycle.
+                    advance = result.current_snapshot if result.current_snapshot != last_snap else None
+                    await _skip_tick(s, view, conn, target_table, vs, advance_to=advance)
+                    return
+
+                max_snapshot = result.current_snapshot
+                action = result.action
+                incremental_range = result.filter_range if action == RefreshAction.INCREMENTAL else None
+                resume_from = None
+                # Persist the in-flight record so an interrupt resumes from this pin.
+                if s.history is not None:
+                    await s.history.set_current_work(view.name, max_snapshot, None)
+
+            # An INCREMENTAL window with nothing to merge.
+            if action == RefreshAction.INCREMENTAL and incremental_range is None:
+                if resume_from is not None:
+                    # Frozen resume window came back empty though chunks committed →
+                    # an INTERIOR snapshot expired (endpoints passed the probes).
+                    # Advancing to M would orphan the un-merged chunks; instead keep
+                    # the bookmark and clear current_work so the next tick re-covers.
+                    log.warning(
+                        "%s: resumed incremental window unexpectedly empty (interior "
+                        "snapshot expired?) → discarding current_work, re-detecting next tick",
+                        view.name,
+                    )
+                    await _skip_tick(s, view, conn, target_table, vs, advance_to=None)
+                else:
+                    # Nothing to merge (only compaction since bookmark): advance to M.
+                    await _skip_tick(s, view, conn, target_table, vs, advance_to=max_snapshot)
                 return
 
             # Set vs.last_action up-front so /api/views reflects what's running,
-            # not what last finished — matters for multi-hour chunked backfills.
-            chunked = result.action == RefreshAction.FULL_REFRESH and view.full_refresh_chunk
-            if result.action == RefreshAction.FULL_REFRESH:
-                vs.last_action = "chunked_full" if chunked else "full"
-                vs.chunks_done = 0
-                vs.chunks_total = None
+            # not what last finished — matters for multi-hour chunked runs.
+            if action == RefreshAction.FULL_REFRESH:
+                vs.last_action = "chunked_full" if view.full_refresh_chunk else "full"
             else:
-                vs.last_action = "incremental"
+                vs.last_action = "chunked_incremental" if view.full_refresh_chunk else "incremental"
+            vs.chunks_done = 0
+            vs.chunks_total = None
 
-            incremental_range = result.filter_range if result.action == RefreshAction.INCREMENTAL else None
             total_elapsed = 0.0
             total_rows = 0
             total_bytes = 0
-            total_queries = 0
 
             async for q in execute_refresh(
                 cursor,
@@ -449,12 +537,13 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
                 target_table,
                 parsed,
                 value_columns,
+                max_snapshot=max_snapshot,
                 incremental_range=incremental_range,
+                resume_from=resume_from,
             ):
                 total_elapsed += q.elapsed_ms / 1000.0
                 total_rows += q.processed_rows
                 total_bytes += q.processed_bytes
-                total_queries += 1
                 vs.last_refresh = time.time()
                 vs.last_duration = q.elapsed_ms / 1000.0
                 vs.last_error = None
@@ -471,25 +560,28 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
                 await _record_query(s, view.name, vs, q)
                 await _persist_view_status(s, view.name, vs)
                 if q.chunks_total > 1:
+                    # Record progress AFTER the chunk's MERGE lands, so the next
+                    # tick resumes from this committed chunk under the same pin.
+                    if s.history is not None and q.range_end is not None:
+                        await s.history.set_current_work(view.name, max_snapshot, q.range_end)
                     CHUNKS_COMPLETED.labels(view=view.name).inc()
                     CHUNK_DURATION.labels(view=view.name).observe(q.elapsed_ms / 1000.0)
                     CHUNK_ROWS.labels(view=view.name).inc(q.processed_rows)
                 if s.stop_event.is_set():
-                    # Graceful shutdown mid-backfill — leave last_source_snapshot
-                    # unset so the next tick resumes from target metadata.
+                    # Graceful shutdown mid-run — leave bookmark + current_work so
+                    # the next tick resumes the same pinned run from this chunk.
                     log.info("%s: refresh interrupted after chunk %d/%d", view.name, q.chunks_done, q.chunks_total)
                     return
 
-            # Non-chunked paths (full or incremental) and completed chunked backfills
-            # commit the source snapshot bookmark. Empty chunked runs (source empty,
-            # or fully caught up) also advance state — total_queries == 0 is fine.
-            REFRESH_TOTAL.labels(view=view.name, type="incremental" if incremental_range else "full").inc()
+            # Clean completion: advance the bookmark to the pinned M (not the live
+            # latest) and clear current_work. The MV is now consistent as of M;
+            # newer commits land on the next tick over (M, M'].
+            REFRESH_TOTAL.labels(view=view.name, type="incremental" if incremental_range is not None else "full").inc()
             if s.history is not None:
-                await s.history.set_last_source_snapshot(view.name, result.current_snapshot)
+                await s.history.set_last_source_snapshot(view.name, max_snapshot)
+                await s.history.clear_current_work(view.name)
             vs.total_refreshes += 1
-            # Clear the "in-flight" marker on clean completion. Leave chunks_done
-            # at its last value so the UI can show "12/12 done" alongside total
-            # counters until the next tick overwrites it.
+            # Clear in-flight marker; leave chunks_done so the UI shows "12/12".
             vs.chunks_total = None
             REFRESH_DURATION.labels(view=view.name).observe(total_elapsed)
             REFRESH_LAST_SUCCESS.labels(view=view.name).set(vs.last_refresh or time.time())

@@ -171,6 +171,62 @@ correctness model can't reconstruct a removed bucket from `$all_entries`.
 The old behavior — treating every non-append as a full refresh — was wrong
 because compactions triggered needless full rewrites.
 
+### Chunked, snapshot-pinned, resumable refresh
+
+A **generic** orchestrator: a single source snapshot may add a terabyte, and a
+view far behind has a large catch-up window, so every refresh — full or
+incremental — must hold for any source. The model is two pieces of state plus
+one rule.
+
+**State** (per view, in `view_status`):
+
+- `last_source_snapshot` — the **bookmark**: the snapshot the view is correctly
+  materialized up to. `NULL` until the first run completes.
+- `current_work = (work_max_snapshot, work_last_merged_chunk)` — the in-flight
+  run's pinned snapshot and last committed chunk. `NULL` when idle.
+
+The run's lower bound is implied (`bookmark + 1`, or source start for a full
+backfill), never stored: the bookmark advances only on completion — which
+clears `current_work` — so while `current_work` is set the bookmark can't move,
+and a tick is unambiguously *resuming* it or starting *fresh*.
+
+**The rule.** A run pins `M = work_max_snapshot` and: (1) derives its window
+over the **frozen** range `(bookmark, M]` (full backfill: the whole source
+range) and splits it into bucket-aligned idempotent `MERGE` chunks; (2) reads
+every chunk `FROM <source> FOR VERSION AS OF M`; (3) on completion advances the
+bookmark to `M` and clears `current_work`, else leaves both so the next tick
+resumes the same pinned run from `work_last_merged_chunk`.
+
+This delivers four guarantees:
+
+- **Memory safety.** A large window runs as N bounded chunks, not one OOMing
+  `MERGE` — both paths chunk (only the full path chunking was the original bug).
+- **Convergence.** Progress is durable in `current_work`, so a
+  repeatedly-interrupted run resumes instead of redoing the window.
+- **No drift.** `M` is pinned and reused verbatim, so the incremental window
+  `(bookmark, M]` is identical across resumes; a newer snapshot overwriting an
+  older bucket is out of scope (`> M`) until the next run. (A bare timestamp
+  marker re-derived live would drift the start and skip the correction.) A full
+  backfill re-derives `[start, end)` from live `$files`, still safe: the
+  `max(start, resume)` clamp never redoes a committed chunk and a grown max only
+  appends chunks empty as of `M`.
+- **No mixing.** Every chunk reads `FOR VERSION AS OF M`, so the MV advances
+  atomically per run from consistent-as-of-`bookmark` to -`M`, never blending
+  commits even under concurrent writes (untouched buckets are unchanged, so the
+  whole MV is consistent as of `M`).
+
+**Resume comes from the bookmark / `current_work`, never the target** (which
+shows what's *present*, not *correct*): the old path resumed from the target's
+`max(bucket_alias)` and walked forward, silently skipping a source's overwritten
+historical buckets.
+
+**Lost bookmark → recompute from scratch.** When the bookmark is gone
+(`expire_snapshots`, fresh `state.db`, view re-added) or an in-flight
+incremental's window `(bookmark, M]` is no longer derivable, `current_work` is
+discarded and the view recomputes full-from-scratch (always safe). Hence no
+provenance flag is needed: a stale record can't be misread — once its bookmark
+dies it's structurally unreconstructable.
+
 ### Why not dbt?
 
 Discussed during the conversation. dbt's `incremental_strategy='merge'`

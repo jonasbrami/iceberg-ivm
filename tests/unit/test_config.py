@@ -443,7 +443,7 @@ def test_full_refresh_chunk_rejects_view_without_direct_bucket_projection(tmp_pa
         "    target_table: iceberg.analytics.v\n"
         "    full_refresh_chunk: day\n"
     )
-    with pytest.raises(ValueError, match="direct projection"):
+    with pytest.raises(ValueError, match="aliased projection"):
         load_views(write_views(tmp_path, wrapped))
 
 

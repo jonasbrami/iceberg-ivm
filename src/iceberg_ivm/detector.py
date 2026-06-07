@@ -72,12 +72,25 @@ async def get_current_snapshot(cursor, source_table: str) -> int | None:
     return row[0] if row else None
 
 
-async def get_snapshots_since(cursor, source_table: str, last_snap: int) -> list[dict]:
-    """Return snapshots strictly after last_snap, ordered by (committed_at, snapshot_id).
+async def snapshot_exists(cursor, source_table: str, snapshot_id: int) -> bool:
+    """True iff ``snapshot_id`` is still in ``$snapshots`` (metadata-only).
 
-    The snapshot_id tiebreak matters: committed_at is millisecond-precision, so
+    Validates a pinned in-flight snapshot before resuming: every chunk reads
+    ``FOR VERSION AS OF`` it, so if it expired the resume can never succeed and
+    must be discarded (see ``server.refresh_view``).
+    """
+    await cursor.execute(f"SELECT 1 FROM {system_table(source_table, 'snapshots')} WHERE snapshot_id = {snapshot_id}")
+    return (await cursor.fetchone()) is not None
+
+
+async def get_snapshots_since(cursor, source_table: str, last_snap: int, max_snapshot: int | None = None) -> list[dict]:
+    """Return snapshots in ``(last_snap, max_snapshot]``, ordered by (committed_at, snapshot_id).
+
+    ``max_snapshot=None`` → up to the latest (live detection); a bound pins the
+    set a run processes, freezing the window across resumes (#61/#62). The
+    snapshot_id tiebreak matters: committed_at is millisecond-precision, so
     sibling snapshots can share a timestamp. Raises ExpiredSnapshotError if
-    last_snap itself has been expired from $snapshots.
+    ``last_snap`` (or, when given, ``max_snapshot``) is no longer in $snapshots.
     """
     snaps = system_table(source_table, "snapshots")
     await cursor.execute(f"SELECT committed_at FROM {snaps} WHERE snapshot_id = {last_snap}")
@@ -88,11 +101,26 @@ async def get_snapshots_since(cursor, source_table: str, last_snap: int) -> list
             f"(expired?). Cannot compute the set of new snapshots."
         )
     committed_at = row[0]
+    lower = (
+        f"(committed_at > TIMESTAMP '{committed_at}' "
+        f"OR (committed_at = TIMESTAMP '{committed_at}' AND snapshot_id > {last_snap}))"
+    )
+    upper = ""
+    if max_snapshot is not None:
+        await cursor.execute(f"SELECT committed_at FROM {snaps} WHERE snapshot_id = {max_snapshot}")
+        mrow = await cursor.fetchone()
+        if mrow is None:
+            raise ExpiredSnapshotError(
+                f"{source_table}: max_snapshot={max_snapshot} is not in $snapshots "
+                f"(expired?). Cannot compute the pinned snapshot window."
+            )
+        max_committed = mrow[0]
+        upper = (
+            f" AND (committed_at < TIMESTAMP '{max_committed}' "
+            f"OR (committed_at = TIMESTAMP '{max_committed}' AND snapshot_id <= {max_snapshot}))"
+        )
     await cursor.execute(
-        f"SELECT snapshot_id, operation FROM {snaps} "
-        f"WHERE committed_at > TIMESTAMP '{committed_at}' "
-        f"   OR (committed_at = TIMESTAMP '{committed_at}' AND snapshot_id > {last_snap}) "
-        f"ORDER BY committed_at, snapshot_id"
+        f"SELECT snapshot_id, operation FROM {snaps} WHERE {lower}{upper} ORDER BY committed_at, snapshot_id"
     )
     return [{"snapshot_id": r[0], "operation": r[1]} for r in await cursor.fetchall()]
 
@@ -197,31 +225,6 @@ async def get_source_column_range(
     if not lows or not highs:
         return None
     return (min(lows), max(highs))
-
-
-async def get_target_bucket_max(
-    cursor,
-    target_table: str,
-    bucket_alias: str,
-) -> datetime | None:
-    """Read the max ``upper_bound`` of ``bucket_alias`` across live data
-    files in ``target_table``.
-
-    The chunked full-refresh uses this as its resume point: the target's
-    own Iceberg metadata, rather than a separate cursor key, records what
-    has been committed. Returns ``None`` for an empty target or one whose
-    files carry no bounds on ``bucket_alias`` yet.
-
-    Filters ``content = 0`` (data files) so V2 position/equality delete
-    files don't skew the max upward and cause the resume to skip live
-    buckets.
-    """
-    await cursor.execute(f"SELECT readable_metrics FROM {system_table(target_table, 'files')} WHERE content = 0")
-    rows = await cursor.fetchall()
-    if not rows:
-        return None
-    _, highs, _ = _iter_column_bounds(rows, bucket_alias)
-    return max(highs) if highs else None
 
 
 def midnight(dt: datetime) -> datetime:
@@ -332,6 +335,60 @@ def expand_to_bucket_bounds(
     return floor(min_ts), nxt(max_ts)
 
 
+async def incremental_range_since(
+    cursor,
+    source_table: str,
+    filter_column: str,
+    filter_granularity: str,
+    last_snapshot: int,
+    max_snapshot: int | None = None,
+) -> tuple[datetime, datetime] | None:
+    """Snapped ``[start, end)`` of buckets touched by append/overwrite files in
+    snapshots ``(last_snapshot, max_snapshot]`` (``max_snapshot=None`` → up to
+    the latest, used by live detection; a pinned bound freezes the window across
+    resumes — see DESIGN.md "No window drift", #61/#62).
+
+    Returns ``None`` when the window has no data to merge (no new snapshots, or
+    only compaction). Raises ``ExpiredSnapshotError`` if a bound snapshot is
+    gone, ``UnexpectedOperationError`` on a delete/unknown op.
+    """
+    snapshots = await get_snapshots_since(cursor, source_table, last_snapshot, max_snapshot=max_snapshot)
+    if not snapshots:
+        log.debug("%s: no new snapshots in (%s, %s]", source_table, last_snapshot, max_snapshot)
+        return None
+
+    ops = [s["operation"] for s in snapshots]
+    log.debug("%s: %d snapshots in window, operations: %s", source_table, len(snapshots), ops)
+
+    # append, overwrite → real data changes; replace → compaction (skip);
+    # anything else (delete, unknown op) → fail loudly.
+    unknown = [op for op in ops if op not in ALLOWED_OPS]
+    if unknown:
+        raise UnexpectedOperationError(
+            f"{source_table}: unexpected snapshot operations {unknown} — "
+            f"source must only see append / overwrite (data changes) or "
+            f"replace (compaction); pure deletes are not supported."
+        )
+
+    change_snaps = [s for s in snapshots if s["operation"] in CHANGE_OPS]
+    if not change_snaps:
+        log.info("%s: only compaction (replace) snapshots in window → nothing to merge", source_table)
+        return None
+
+    # Files added in CHANGE snapshots only (append + overwrite); compaction-added
+    # files would uselessly expand the range with rewritten copies.
+    snap_ids = [s["snapshot_id"] for s in change_snaps]
+    col_range = await get_new_files_column_range(cursor, source_table, snap_ids, filter_column)
+    if col_range is None:
+        log.debug("%s: snapshots in window but no data files (compaction?)", source_table)
+        return None
+
+    min_ts, max_ts = col_range
+    snapped = expand_to_bucket_bounds(min_ts, max_ts, filter_granularity)
+    log.info("file stats: %s in [%s, %s] → snapped to [%s, %s)", filter_column, min_ts, max_ts, snapped[0], snapped[1])
+    return snapped
+
+
 async def detect_changes(
     cursor,
     source_table: str,
@@ -359,13 +416,12 @@ async def detect_changes(
         log.info("%s: first run (no last_snapshot) → full refresh", source_table)
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=current_snap)
 
-    # Get intermediate snapshots. If ``last_snapshot`` has been expired from
-    # ``$snapshots`` (most commonly: the source table was dropped and recreated,
-    # or its history aged out), we can't compute an incremental range — but
-    # we *can* recover by re-materializing everything from the current source.
-    # Treat the expired bookmark as a fresh first run.
+    # Derive the incremental window over (last_snapshot, current_snap]. If
+    # last_snapshot has been expired from $snapshots (source dropped+recreated,
+    # or history aged out) we can't diff — recover by re-materializing
+    # everything from the current source (treat as a fresh full refresh).
     try:
-        snapshots = await get_snapshots_since(cursor, source_table, last_snapshot)
+        rng = await incremental_range_since(cursor, source_table, filter_column, filter_granularity, last_snapshot)
     except ExpiredSnapshotError as exc:
         log.warning(
             "%s: bookmark snapshot %d expired (%s) → falling back to FULL_REFRESH",
@@ -375,59 +431,12 @@ async def detect_changes(
         )
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=current_snap)
 
-    if not snapshots:
-        log.debug("%s: no new snapshots since %d", source_table, last_snapshot)
+    if rng is None:
+        # No new snapshots, or only compaction → nothing to merge; advance state.
         return ChangeResult(action=RefreshAction.NO_CHANGE, current_snapshot=current_snap)
-
-    ops = [s["operation"] for s in snapshots]
-    log.debug("%s: %d new snapshots, operations: %s", source_table, len(snapshots), ops)
-
-    # Classify operations:
-    #   append, overwrite → real data changes, drive incremental refresh
-    #   replace           → compaction (files rewritten, no data change) — skip
-    #   anything else     → fail loudly (delete, or some new Iceberg op)
-    unknown = [op for op in ops if op not in ALLOWED_OPS]
-    if unknown:
-        raise UnexpectedOperationError(
-            f"{source_table}: unexpected snapshot operations {unknown} — "
-            f"source must only see append / overwrite (data changes) or "
-            f"replace (compaction); pure deletes are not supported."
-        )
-
-    change_snaps = [s for s in snapshots if s["operation"] in CHANGE_OPS]
-    if not change_snaps:
-        # Only compactions since last_snap; advance state, don't refresh.
-        log.info(
-            "%s: only compaction (replace) snapshots since %d → advance state, skip",
-            source_table,
-            last_snapshot,
-        )
-        return ChangeResult(action=RefreshAction.NO_CHANGE, current_snapshot=current_snap)
-
-    # Read column range from files added in CHANGE snapshots only
-    # (append + overwrite). Including compaction-added files would
-    # uselessly expand the range with rewritten copies of unchanged data.
-    snap_ids = [s["snapshot_id"] for s in change_snaps]
-    col_range = await get_new_files_column_range(cursor, source_table, snap_ids, filter_column)
-    if col_range is None:
-        # New snapshots but no data files (e.g. compaction-only)
-        log.debug("%s: new snapshots but no data files (compaction?)", source_table)
-        return ChangeResult(action=RefreshAction.NO_CHANGE, current_snapshot=current_snap)
-
-    min_ts, max_ts = col_range
-    snapped_start, snapped_end = expand_to_bucket_bounds(min_ts, max_ts, filter_granularity)
-
-    log.info(
-        "file stats: %s in [%s, %s] → snapped to [%s, %s)",
-        filter_column,
-        min_ts,
-        max_ts,
-        snapped_start,
-        snapped_end,
-    )
 
     return ChangeResult(
         action=RefreshAction.INCREMENTAL,
         current_snapshot=current_snap,
-        filter_range=(snapped_start, snapped_end),
+        filter_range=rng,
     )

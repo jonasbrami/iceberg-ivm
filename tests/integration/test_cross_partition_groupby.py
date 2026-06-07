@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 
 from iceberg_ivm.config import ViewConfig
-from iceberg_ivm.detector import RefreshAction, detect_changes
+from iceberg_ivm.detector import RefreshAction, detect_changes, get_current_snapshot
 from iceberg_ivm.executor import execute_refresh
 from iceberg_ivm.introspect import build_create_table_sql, discover_columns
 from iceberg_ivm.query_parser import parse_view_query
@@ -72,7 +72,8 @@ async def setup_and_full_refresh(cursor, view, parsed, target):
     cols = await discover_columns(cursor, view.query)
     value_cols = [c.name for c in cols if c.name not in parsed.merge_keys]
     await cursor.execute(build_create_table_sql(target, cols, view.target_partitioning))
-    await _drain(execute_refresh(cursor, view, target, parsed, value_cols))
+    M = await get_current_snapshot(cursor, SOURCE_TABLE)
+    await _drain(execute_refresh(cursor, view, target, parsed, value_cols, max_snapshot=M))
     result = await detect_changes(cursor, SOURCE_TABLE, "ts", parsed.granularity, last_snapshot=None)
     return result, value_cols
 
@@ -120,6 +121,7 @@ class TestWeeklyBarsCrossPartition:
                 WEEKLY_PARSED,
                 value_cols,
                 incremental_range=result.filter_range,
+                max_snapshot=result.current_snapshot,
             )
         )
 
@@ -156,6 +158,7 @@ class TestWeeklyBarsCrossPartition:
                 WEEKLY_PARSED,
                 value_cols,
                 incremental_range=result.filter_range,
+                max_snapshot=result.current_snapshot,
             )
         )
 
@@ -206,6 +209,7 @@ class TestLateArrivingData:
                 WEEKLY_PARSED,
                 value_cols,
                 incremental_range=result.filter_range,
+                max_snapshot=result.current_snapshot,
             )
         )
         last_snap = result.current_snapshot
@@ -236,6 +240,7 @@ class TestLateArrivingData:
                 WEEKLY_PARSED,
                 value_cols,
                 incremental_range=result.filter_range,
+                max_snapshot=result.current_snapshot,
             )
         )
 
@@ -281,6 +286,7 @@ class TestMonthlyBarsCrossPartition:
                 MONTHLY_PARSED,
                 value_cols,
                 incremental_range=result.filter_range,
+                max_snapshot=result.current_snapshot,
             )
         )
 

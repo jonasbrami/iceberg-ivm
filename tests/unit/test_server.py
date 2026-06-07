@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from iceberg_ivm.config import Config, load_config, load_views
 from iceberg_ivm.executor import QueryInfo
+from iceberg_ivm.introspect import ColumnInfo
 from iceberg_ivm.query_history import QueryHistory
 from iceberg_ivm.server import (
     RECENT_QUERY_LIMIT,
@@ -19,6 +20,12 @@ from iceberg_ivm.server import (
     app,
     rewrite_info_uri,
 )
+
+
+async def _fake_discover(cursor, query):
+    """Shared column-discovery stub for refresh_view tests (date + value col)."""
+    return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+
 
 STATIC_CONFIG_YAML = textwrap.dedent("""\
     trino:
@@ -1426,6 +1433,7 @@ async def test_refresh_view_advances_state_on_empty_append_no_change(setup_state
 
     history = AsyncMock()
     history.get_last_source_snapshot.return_value = 100
+    history.get_current_work.return_value = (None, None)
     setup_state.history = history
 
     async def fake_detect(*args, **kwargs):
@@ -2499,6 +2507,514 @@ async def test_refresh_view_interrupt_skips_last_snapshot_write(setup_state, tmp
         assert vs.last_duration == pytest.approx(0.25)
         assert vs.chunks_done == 1
         assert vs.chunks_total == 3
+    finally:
+        await h.close()
+
+
+async def test_refresh_view_chunked_full_completes_clears_current_work(setup_state, tmp_path):
+    """A fresh chunked FULL refresh pins the detected snapshot, writes
+    current_work per chunk and, on clean completion, advances the bookmark to
+    that pinned snapshot and clears current_work (#61/#62)."""
+    from datetime import datetime
+
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.executor import QueryInfo
+
+    view = _install_chunked_view(setup_state)
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
+    setup_state.stop_event.clear()
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+
+    seen = {}
+
+    async def fake_detect(*a, **kw):
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=42)
+
+    async def fake_execute_refresh(*a, **kw):
+        seen["max_snapshot"] = kw.get("max_snapshot")
+        seen["resume_from"] = kw.get("resume_from")
+        for i in range(1, 4):
+            yield QueryInfo(
+                query_id=f"q{i}",
+                info_uri=f"http://trino/q{i}",
+                stage="chunk_merge",
+                started_at=float(i),
+                elapsed_ms=100.0,
+                range_start=datetime(2026, 4, 7 + i, tzinfo=UTC),
+                range_end=datetime(2026, 4, 8 + i, tzinfo=UTC),
+                chunks_done=i,
+                chunks_total=3,
+            )
+
+    try:
+        with (
+            patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+            patch.object(server_mod, "discover_columns", _fake_discover),
+            patch.object(server_mod, "detect_changes", fake_detect),
+            patch.object(server_mod, "execute_refresh", fake_execute_refresh),
+        ):
+            await server_mod.refresh_view(setup_state, view)
+
+        assert seen["max_snapshot"] == 42  # pinned to the detected snapshot
+        assert seen["resume_from"] is None  # fresh run, nothing to resume
+        # Completed cleanly: bookmark advanced to the pinned snapshot, work cleared.
+        assert await h.get_last_source_snapshot(view.name) == 42
+        assert await h.get_current_work(view.name) == (None, None)
+    finally:
+        await h.close()
+
+
+async def test_refresh_view_full_resume_reads_current_work(setup_state, tmp_path):
+    """An interrupted full backfill (current_work set, bookmark still None) is
+    resumed by REUSING the pinned snapshot and resume point from current_work —
+    the live source is never re-detected (so the window can't drift)."""
+    from datetime import datetime
+
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.executor import QueryInfo
+
+    view = _install_chunked_view(setup_state)
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
+    setup_state.stop_event.clear()
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+    # Interrupted from-beginning backfill: pinned snapshot 42, committed up to Apr 9.
+    marker = datetime(2026, 4, 9, tzinfo=UTC)
+    await h.set_current_work(view.name, 42, marker)
+
+    seen = {}
+
+    async def fake_detect(*a, **kw):
+        raise AssertionError("detect_changes must not be called when resuming current_work")
+
+    async def fake_execute_refresh(*a, **kw):
+        seen["max_snapshot"] = kw.get("max_snapshot")
+        seen["resume_from"] = kw.get("resume_from")
+        yield QueryInfo(
+            query_id="q1",
+            info_uri="http://trino/q1",
+            stage="chunk_merge",
+            started_at=1.0,
+            elapsed_ms=100.0,
+            range_start=datetime(2026, 4, 9, tzinfo=UTC),
+            range_end=datetime(2026, 4, 10, tzinfo=UTC),
+            chunks_done=1,
+            chunks_total=1,
+        )
+
+    try:
+        with (
+            patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+            patch.object(server_mod, "discover_columns", _fake_discover),
+            patch.object(server_mod, "snapshot_exists", AsyncMock(return_value=True)),
+            patch.object(server_mod, "detect_changes", fake_detect),
+            patch.object(server_mod, "execute_refresh", fake_execute_refresh),
+        ):
+            await server_mod.refresh_view(setup_state, view)
+
+        assert seen["max_snapshot"] == 42  # reused from current_work, not re-detected
+        assert seen["resume_from"] == marker
+    finally:
+        await h.close()
+
+
+async def test_refresh_view_interrupt_preserves_current_work(setup_state, tmp_path):
+    """On interruption mid-run the bookmark stays unset and current_work holds
+    the pinned snapshot + last committed chunk, so the next tick resumes the
+    SAME pinned run instead of redoing or drifting."""
+    from datetime import datetime
+
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.executor import QueryInfo
+
+    view = _install_chunked_view(setup_state)
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
+    # The fixture leaves stop_event SET → refresh_view breaks after the first
+    # committed chunk.
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+
+    async def fake_detect(*a, **kw):
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=99)
+
+    async def fake_execute_refresh(*a, **kw):
+        yield QueryInfo(
+            query_id="q1",
+            info_uri="http://trino/q1",
+            stage="chunk_merge",
+            started_at=1.0,
+            elapsed_ms=100.0,
+            range_start=datetime(2026, 4, 8, tzinfo=UTC),
+            range_end=datetime(2026, 4, 9, tzinfo=UTC),
+            chunks_done=1,
+            chunks_total=3,
+        )
+        yield QueryInfo(
+            query_id="q2",
+            info_uri="http://trino/q2",
+            stage="chunk_merge",
+            started_at=2.0,
+            elapsed_ms=100.0,
+            range_start=datetime(2026, 4, 9, tzinfo=UTC),
+            range_end=datetime(2026, 4, 10, tzinfo=UTC),
+            chunks_done=2,
+            chunks_total=3,
+        )
+
+    try:
+        with (
+            patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+            patch.object(server_mod, "discover_columns", _fake_discover),
+            patch.object(server_mod, "detect_changes", fake_detect),
+            patch.object(server_mod, "execute_refresh", fake_execute_refresh),
+        ):
+            await server_mod.refresh_view(setup_state, view)
+
+        # Bookmark not advanced; current_work holds (pinned snapshot, last chunk).
+        assert await h.get_last_source_snapshot(view.name) is None
+        assert await h.get_current_work(view.name) == (99, datetime(2026, 4, 9, tzinfo=UTC))
+    finally:
+        await h.close()
+
+
+async def test_refresh_view_incremental_interrupt_persists_current_work(setup_state, tmp_path):
+    """A multi-chunk INCREMENTAL catch-up (#61) persists current_work per
+    committed chunk and does NOT advance the bookmark when interrupted, so the
+    next tick resumes from the committed chunk instead of livelocking on the
+    window prefix. There is ONE record for both paths (no separate marker)."""
+    from datetime import datetime
+
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.executor import QueryInfo
+
+    view = _install_chunked_view(setup_state)
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
+    # Fixture leaves stop_event set → break after the first committed chunk.
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+
+    async def fake_detect(*a, **kw):
+        return ChangeResult(
+            action=RefreshAction.INCREMENTAL,
+            current_snapshot=42,
+            filter_range=(datetime(2026, 5, 16, tzinfo=UTC), datetime(2026, 5, 19, tzinfo=UTC)),
+        )
+
+    async def fake_execute_refresh(*a, **kw):
+        # Fresh run → no resume point threaded.
+        assert kw.get("resume_from") is None
+        assert kw.get("max_snapshot") == 42  # pinned for the whole run
+        yield QueryInfo(
+            query_id="q1",
+            info_uri="http://trino/q1",
+            stage="chunk_merge",
+            started_at=1.0,
+            elapsed_ms=100.0,
+            range_start=datetime(2026, 5, 16, tzinfo=UTC),
+            range_end=datetime(2026, 5, 17, tzinfo=UTC),
+            chunks_done=1,
+            chunks_total=3,
+        )
+        yield QueryInfo(
+            query_id="q2",
+            info_uri="http://trino/q2",
+            stage="chunk_merge",
+            started_at=2.0,
+            elapsed_ms=100.0,
+            range_start=datetime(2026, 5, 17, tzinfo=UTC),
+            range_end=datetime(2026, 5, 18, tzinfo=UTC),
+            chunks_done=2,
+            chunks_total=3,
+        )
+
+    try:
+        with (
+            patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+            patch.object(server_mod, "discover_columns", _fake_discover),
+            patch.object(server_mod, "detect_changes", fake_detect),
+            patch.object(server_mod, "execute_refresh", fake_execute_refresh),
+        ):
+            await server_mod.refresh_view(setup_state, view)
+
+        vs = setup_state.view_statuses[view.name]
+        assert vs.last_action == "chunked_incremental"
+        assert vs.chunks_done == 1
+        assert vs.chunks_total == 3
+        # Interrupted: bookmark not advanced, current_work holds the committed chunk.
+        assert await h.get_last_source_snapshot(view.name) is None
+        assert await h.get_current_work(view.name) == (42, datetime(2026, 5, 17, tzinfo=UTC))
+    finally:
+        await h.close()
+
+
+async def test_refresh_view_incremental_resume_reuses_pinned_snapshot(setup_state, tmp_path):
+    """Drift prevention (#61/#62): resuming an interrupted incremental REUSES
+    the pinned snapshot from current_work and derives the window over
+    (bookmark, pinned_M] — never the live current snapshot — so a newer
+    snapshot that overwrote an older bucket cannot drift the window start."""
+    from datetime import datetime
+
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.executor import QueryInfo
+
+    view = _install_chunked_view(setup_state)
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
+    setup_state.stop_event.clear()
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+    await h.set_last_source_snapshot(view.name, 10)  # bookmark present → incremental
+    marker = datetime(2026, 5, 17, tzinfo=UTC)
+    await h.set_current_work(view.name, 42, marker)  # pinned M=42 (live source is newer)
+
+    seen = {}
+
+    async def fake_detect(*a, **kw):
+        raise AssertionError("detect_changes must not be called when resuming current_work")
+
+    async def fake_range_since(cursor, source_table, filter_column, granularity, last_snapshot, max_snapshot=None):
+        seen["last_snap"] = last_snapshot
+        seen["max_snapshot"] = max_snapshot
+        return (datetime(2026, 5, 16, tzinfo=UTC), datetime(2026, 5, 19, tzinfo=UTC))
+
+    async def fake_execute_refresh(*a, **kw):
+        seen["exec_max_snapshot"] = kw.get("max_snapshot")
+        seen["resume_from"] = kw.get("resume_from")
+        yield QueryInfo(
+            query_id="q1",
+            info_uri="http://trino/q1",
+            stage="chunk_merge",
+            started_at=1.0,
+            elapsed_ms=100.0,
+            range_start=datetime(2026, 5, 17, tzinfo=UTC),
+            range_end=datetime(2026, 5, 18, tzinfo=UTC),
+            chunks_done=1,
+            chunks_total=1,
+        )
+
+    try:
+        with (
+            patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+            patch.object(server_mod, "discover_columns", _fake_discover),
+            patch.object(server_mod, "detect_changes", fake_detect),
+            patch.object(server_mod, "snapshot_exists", AsyncMock(return_value=True)),
+            patch.object(server_mod, "incremental_range_since", fake_range_since),
+            patch.object(server_mod, "execute_refresh", fake_execute_refresh),
+        ):
+            await server_mod.refresh_view(setup_state, view)
+
+        # Window derived over (bookmark=10, PINNED 42] — not the live snapshot.
+        assert seen["last_snap"] == 10
+        assert seen["max_snapshot"] == 42
+        assert seen["exec_max_snapshot"] == 42
+        assert seen["resume_from"] == marker
+        # Clean completion: bookmark advanced to the pinned snapshot, work cleared.
+        assert await h.get_last_source_snapshot(view.name) == 42
+        assert await h.get_current_work(view.name) == (None, None)
+    finally:
+        await h.close()
+
+
+async def test_refresh_view_expired_bookmark_discards_current_work(setup_state, tmp_path):
+    """If an in-flight incremental run's window is no longer derivable (its
+    bookmark expired from $snapshots), current_work is discarded and the view
+    restarts as a FULL refresh from scratch (no stale resume, no leak)."""
+    from datetime import datetime
+
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.executor import QueryInfo
+
+    view = _install_chunked_view(setup_state)
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
+    setup_state.stop_event.clear()
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+    await h.set_last_source_snapshot(view.name, 10)  # bookmark that will be 'expired'
+    await h.set_current_work(view.name, 99, datetime(2026, 5, 17, tzinfo=UTC))
+
+    seen = {}
+
+    async def fake_exists(cursor, source_table, snapshot_id):
+        return snapshot_id != 10  # the bookmark (10) has been expired from $snapshots
+
+    async def fake_detect(*a, **kw):
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=200)
+
+    async def fake_execute_refresh(*a, **kw):
+        seen["max_snapshot"] = kw.get("max_snapshot")
+        seen["resume_from"] = kw.get("resume_from")
+        yield QueryInfo(
+            query_id="q1",
+            info_uri="http://trino/q1",
+            stage="chunk_merge",
+            started_at=1.0,
+            elapsed_ms=100.0,
+            range_start=datetime(2026, 4, 8, tzinfo=UTC),
+            range_end=datetime(2026, 4, 9, tzinfo=UTC),
+            chunks_done=1,
+            chunks_total=1,
+        )
+
+    try:
+        with (
+            patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+            patch.object(server_mod, "discover_columns", _fake_discover),
+            patch.object(server_mod, "snapshot_exists", fake_exists),
+            patch.object(server_mod, "detect_changes", fake_detect),
+            patch.object(server_mod, "execute_refresh", fake_execute_refresh),
+        ):
+            await server_mod.refresh_view(setup_state, view)
+
+        # Stale current_work discarded; fresh full pinned to the new live snapshot.
+        assert seen["resume_from"] is None
+        assert seen["max_snapshot"] == 200
+        assert await h.get_last_source_snapshot(view.name) == 200
+        assert await h.get_current_work(view.name) == (None, None)
+    finally:
+        await h.close()
+
+
+async def test_refresh_view_full_backfill_resume_recovers_when_pinned_snapshot_expired(setup_state, tmp_path):
+    """A full backfill (bookmark NULL) pins M and reads every chunk FOR VERSION
+    AS OF M. If a long backfill outlives source snapshot retention and M
+    expires, the resume must NOT keep failing on the dead snapshot forever:
+    current_work is discarded and a fresh full refresh re-pins to the live
+    snapshot."""
+    from datetime import datetime
+
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.executor import QueryInfo
+
+    view = _install_chunked_view(setup_state)
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
+    setup_state.stop_event.clear()
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+    # Interrupted full backfill: bookmark still NULL, pinned snapshot 99.
+    await h.set_current_work(view.name, 99, datetime(2026, 4, 9, tzinfo=UTC))
+
+    seen = {}
+
+    async def fake_snapshot_exists(cursor, source_table, snapshot_id):
+        return snapshot_id != 99  # 99 has been expired from $snapshots
+
+    async def fake_detect(*a, **kw):
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=200)
+
+    async def fake_execute_refresh(*a, **kw):
+        seen["max_snapshot"] = kw.get("max_snapshot")
+        seen["resume_from"] = kw.get("resume_from")
+        yield QueryInfo(
+            query_id="q1",
+            info_uri="http://trino/q1",
+            stage="chunk_merge",
+            started_at=1.0,
+            elapsed_ms=100.0,
+            range_start=datetime(2026, 4, 8, tzinfo=UTC),
+            range_end=datetime(2026, 4, 9, tzinfo=UTC),
+            chunks_done=1,
+            chunks_total=1,
+        )
+
+    try:
+        with (
+            patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+            patch.object(server_mod, "discover_columns", _fake_discover),
+            patch.object(server_mod, "snapshot_exists", fake_snapshot_exists),
+            patch.object(server_mod, "detect_changes", fake_detect),
+            patch.object(server_mod, "execute_refresh", fake_execute_refresh),
+        ):
+            await server_mod.refresh_view(setup_state, view)
+
+        # Did NOT keep resuming the dead snapshot 99: discarded it and re-pinned
+        # to the live snapshot via a fresh full refresh.
+        assert seen["resume_from"] is None
+        assert seen["max_snapshot"] == 200
+        assert await h.get_last_source_snapshot(view.name) == 200
+        assert await h.get_current_work(view.name) == (None, None)
+    finally:
+        await h.close()
+
+
+async def test_refresh_view_resumed_incremental_empty_window_does_not_advance_bookmark(setup_state, tmp_path):
+    """Resume guard: if a resumed incremental's frozen window comes back empty
+    even though chunks were already committed (an INTERIOR change snapshot
+    expired — the endpoint snapshot_exists probes can't catch that), the
+    bookmark must NOT advance to M (that would orphan the un-merged chunks
+    above the resume point). current_work is discarded and the bookmark left
+    unchanged so the next tick re-derives a fresh window and re-covers them."""
+    from datetime import datetime
+
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.executor import QueryInfo
+
+    view = _install_chunked_view(setup_state)
+    setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
+    setup_state.stop_event.clear()
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+    await h.set_last_source_snapshot(view.name, 10)  # bookmark present → incremental resume
+    await h.set_current_work(view.name, 42, datetime(2026, 5, 17, tzinfo=UTC))  # committed up to chunk end
+
+    executed = {"ran": False}
+
+    async def fake_detect(*a, **kw):
+        raise AssertionError("detect_changes must not be called on resume")
+
+    async def fake_range_since(*a, **kw):
+        return None  # interior snapshot expired → window now empty
+
+    async def fake_execute_refresh(*a, **kw):
+        executed["ran"] = True
+        yield QueryInfo(
+            query_id="q",
+            info_uri="u",
+            stage="chunk_merge",
+            started_at=1.0,
+            elapsed_ms=1.0,
+            range_start=datetime(2026, 5, 17, tzinfo=UTC),
+            range_end=datetime(2026, 5, 18, tzinfo=UTC),
+            chunks_done=1,
+            chunks_total=1,
+        )
+
+    try:
+        with (
+            patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+            patch.object(server_mod, "discover_columns", _fake_discover),
+            patch.object(server_mod, "snapshot_exists", AsyncMock(return_value=True)),
+            patch.object(server_mod, "incremental_range_since", fake_range_since),
+            patch.object(server_mod, "detect_changes", fake_detect),
+            patch.object(server_mod, "execute_refresh", fake_execute_refresh),
+        ):
+            await server_mod.refresh_view(setup_state, view)
+
+        # No merge ran; bookmark UNCHANGED (not advanced to 42); current_work cleared
+        # so the next tick re-derives a fresh window from bookmark 10.
+        assert executed["ran"] is False
+        assert await h.get_last_source_snapshot(view.name) == 10
+        assert await h.get_current_work(view.name) == (None, None)
     finally:
         await h.close()
 

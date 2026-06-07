@@ -14,6 +14,7 @@ dedicated background thread so the event loop stays unblocked.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from pathlib import Path
 
 import aiosqlite
@@ -69,7 +70,15 @@ CREATE TABLE IF NOT EXISTS view_status (
     total_errors          INTEGER NOT NULL DEFAULT 0,
     chunks_done           INTEGER NOT NULL DEFAULT 0,
     chunks_total          INTEGER,
-    last_source_snapshot  INTEGER
+    last_source_snapshot  INTEGER,
+    -- In-flight run (#61/#62): work_max_snapshot = the pinned snapshot M (reused
+    -- verbatim on resume → frozen window, no drift/mixing); work_last_merged_chunk
+    -- = ISO-8601 range_end of the last committed chunk (the resume point). NULL
+    -- when idle, set/cleared together. INVARIANT: the bookmark advances only on
+    -- completion (which clears current_work), so while current_work is set the run's
+    -- MIN bound is implied (bookmark+1, or source start) and needs no column.
+    work_max_snapshot      INTEGER,
+    work_last_merged_chunk TEXT
 );
 """
 
@@ -117,8 +126,23 @@ class QueryHistory:
     async def open(self) -> None:
         self._db = await aiosqlite.connect(self.db_path)
         await self._db.executescript(_SCHEMA)
+        await self._migrate()
         await self._db.commit()
         log.info("query history opened at %s (limit=%d per view)", self.db_path, self.limit)
+
+    async def _migrate(self) -> None:
+        """Add columns introduced after a DB was first created (``CREATE TABLE
+        IF NOT EXISTS`` won't). Idempotent via the column-presence check (SQLite
+        has no ``ADD COLUMN IF NOT EXISTS``), so a released DB carrying only
+        ``last_source_snapshot`` + counters gains the ``current_work`` columns
+        cleanly.
+        """
+        async with self._db.execute("PRAGMA table_info(view_status)") as cur:
+            cols = {row[1] for row in await cur.fetchall()}
+        if "work_max_snapshot" not in cols:
+            await self._db.execute("ALTER TABLE view_status ADD COLUMN work_max_snapshot INTEGER")
+        if "work_last_merged_chunk" not in cols:
+            await self._db.execute("ALTER TABLE view_status ADD COLUMN work_last_merged_chunk TEXT")
 
     async def close(self) -> None:
         if self._db is not None:
@@ -267,6 +291,55 @@ class QueryHistory:
             "ON CONFLICT(view) DO UPDATE SET "
             "last_source_snapshot = excluded.last_source_snapshot",
             (view, snapshot_id),
+        )
+        await self._db.commit()
+
+    # ── current_work ──────────────────────────────────────────────────
+    # The unified in-flight run record (#61/#62); see _SCHEMA for the pin
+    # rationale and invariant. Kept out of _VIEW_STATUS_COLS so the ViewStatus
+    # mirror can't clobber it; set/cleared together with the bookmark write.
+
+    async def get_current_work(self, view: str) -> tuple[int | None, datetime | None]:
+        """``(work_max_snapshot, work_last_merged_chunk)``; ``(None, None)`` =
+        idle. A non-NULL snapshot with NULL chunk = run started, no chunk yet.
+        """
+        async with self._db.execute(
+            "SELECT work_max_snapshot, work_last_merged_chunk FROM view_status WHERE view = ?",
+            (view,),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return (None, None)
+        max_snap = row[0]
+        chunk = datetime.fromisoformat(row[1]) if row[1] is not None else None
+        return (max_snap, chunk)
+
+    async def set_current_work(
+        self,
+        view: str,
+        max_snapshot: int,
+        last_merged_chunk: datetime | None,
+    ) -> None:
+        """Persist the in-flight run record. ``max_snapshot`` is the pinned
+        upper bound; ``last_merged_chunk`` is the ``range_end`` of the last
+        committed chunk (NULL at the start of a run)."""
+        chunk_iso = last_merged_chunk.isoformat() if last_merged_chunk is not None else None
+        await self._db.execute(
+            "INSERT INTO view_status (view, work_max_snapshot, work_last_merged_chunk) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(view) DO UPDATE SET "
+            "work_max_snapshot = excluded.work_max_snapshot, "
+            "work_last_merged_chunk = excluded.work_last_merged_chunk",
+            (view, max_snapshot, chunk_iso),
+        )
+        await self._db.commit()
+
+    async def clear_current_work(self, view: str) -> None:
+        """Clear the in-flight run record (both columns → NULL). Called on clean
+        completion right after advancing the bookmark."""
+        await self._db.execute(
+            "UPDATE view_status SET work_max_snapshot = NULL, work_last_merged_chunk = NULL WHERE view = ?",
+            (view,),
         )
         await self._db.commit()
 
