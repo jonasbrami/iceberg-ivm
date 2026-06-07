@@ -248,6 +248,95 @@ class TestExecuteRefreshIncremental:
         assert queries[0].stage == "chunk_merge"
         assert queries[0].range_start == r_start and queries[0].range_end == r_end
 
+    async def test_single_shot_snaps_window_to_view_granularity(self):
+        # Regression guard for the unified ranging path: a non-chunked
+        # incremental refresh round-trips its window through
+        # expand_to_bucket_bounds(lo, hi - 1µs, granularity). To make the snap
+        # OBSERVABLE (and load-bearing), feed a window that is NOT aligned to the
+        # view's coarse (month) granularity: the single emitted MERGE must be
+        # snapped OUTWARD to whole-month bounds. This distinguishes the correct
+        # month snap from both a raw passthrough (would keep the unaligned input)
+        # and a finer-granularity round-trip (would also keep it).
+        cursor = MockCursor(stats={"processedRows": 10})
+        view = make_view(
+            query="SELECT symbol, date_trunc('month', ts) AS month, sum(qty) AS volume "
+            "FROM iceberg.market_data.trades GROUP BY 1, 2",
+        )
+        parsed = parse_view_query(view.query)
+        queries = [
+            q
+            async for q in execute_refresh(
+                cursor,
+                view,
+                "iceberg.out.mv",
+                parsed,
+                ["volume"],
+                incremental_range=(datetime(2026, 2, 10, tzinfo=UTC), datetime(2026, 4, 15, tzinfo=UTC)),
+                max_snapshot=99,
+            )
+        ]
+        assert len(queries) == 1
+        assert queries[0].stage == "merge"
+        # Feb 10 → floored to Feb 1; Apr 15 → ceiled to May 1 (whole-month grid).
+        assert queries[0].range_start == datetime(2026, 2, 1, tzinfo=UTC)
+        assert queries[0].range_end == datetime(2026, 5, 1, tzinfo=UTC)
+
+    async def test_resume_marker_floors_to_containing_week_chunk(self):
+        # Coarser-chunk-than-granularity resume (granularity=minute, chunk=week),
+        # and the grow-the-chunk-mid-run direction: a marker left at a day
+        # boundary (from when the chunk was finer) floors to the start of its
+        # containing WEEK (Monday), re-MERGEing that week in full — gap-free.
+        cursor = MockCursor(stats={"processedRows": 10})
+        view = make_view(
+            full_refresh_chunk="week",
+            query="SELECT symbol, date_trunc('minute', ts) AS minute FROM iceberg.market_data.trades GROUP BY 1, 2",
+        )
+        parsed = parse_view_query(view.query)
+        # Week-aligned window (2026-01-05, -12, -19, -26 are Mondays); marker is a
+        # mid-week Wednesday in the second week → floors to Monday 2026-01-12.
+        r_start = datetime(2026, 1, 5, tzinfo=UTC)
+        r_end = datetime(2026, 1, 26, tzinfo=UTC)
+        queries = [
+            q
+            async for q in execute_refresh(
+                cursor,
+                view,
+                "iceberg.out.mv",
+                parsed,
+                [],
+                incremental_range=(r_start, r_end),
+                resume_from=datetime(2026, 1, 14, tzinfo=UTC),
+                max_snapshot=99,
+            )
+        ]
+        assert len(queries) == 2
+        assert queries[0].range_start == datetime(2026, 1, 12, tzinfo=UTC)
+        assert queries[1].range_start == datetime(2026, 1, 19, tzinfo=UTC)
+        assert queries[1].range_end == datetime(2026, 1, 26, tzinfo=UTC)
+
+    async def test_resume_marker_at_window_end_emits_nothing(self):
+        # Forward-progress invariant: a run resumed after every chunk already
+        # committed (marker == window end) emits zero MERGEs. The caller then
+        # falls through to clean completion (advance bookmark, clear current_work)
+        # rather than looping — so resume always terminates.
+        cursor = MockCursor(stats={"processedRows": 10})
+        view = make_view(full_refresh_chunk="day")
+        parsed = parse_view_query(view.query)
+        queries = [
+            q
+            async for q in execute_refresh(
+                cursor,
+                view,
+                "iceberg.out.mv",
+                parsed,
+                ["volume"],
+                incremental_range=(datetime(2026, 5, 16, tzinfo=UTC), datetime(2026, 5, 19, tzinfo=UTC)),
+                resume_from=datetime(2026, 5, 19, tzinfo=UTC),
+                max_snapshot=99,
+            )
+        ]
+        assert queries == []
+
 
 # ── execute_refresh: single-shot full refresh (no chunk) ──
 
