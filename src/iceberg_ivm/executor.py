@@ -135,44 +135,35 @@ def _floor_resume_to_chunk(
     return max(start, resume_start)
 
 
-async def _backfill_ranges(
-    cursor,
-    view: ViewConfig,
-    parsed: ParsedView,
-    *,
-    resume_from: datetime | None = None,
+def _window_ranges(
+    lo: datetime,
+    hi_inclusive: datetime,
+    chunk: str | None,
+    granularity: str,
+    bucket_alias: str | None,
+    resume_from: datetime | None,
 ) -> list[tuple[datetime, datetime]]:
-    """Ordered (start, end) ranges for a full refresh (1 = single-shot, N =
-    chunked, empty = empty source).
+    """Inclusive ``[lo, hi]`` → ordered half-open ``(start, end)`` ranges.
 
-    Always recomputes from the source's beginning so overwritten historical
-    buckets are re-merged, not skipped (#62). ``resume_from`` (this run's own
-    committed progress, never the target's data) skips already-committed chunks.
+    The single ranging path for both full and incremental refreshes — they
+    differ only in where the window comes from, not how it is chunked.
+    ``chunk`` None → one granularity-snapped range (single-shot); else N
+    bucket-aligned per-chunk ranges, resuming past ``resume_from`` (this run's
+    own committed progress). The chunk containing ``resume_from`` is re-MERGEd
+    in full — idempotent, gap-free even if ``full_refresh_chunk`` changed mid-run.
     """
-    source_range = await get_source_column_range(
-        cursor,
-        parsed.source_table,
-        parsed.filter_column,
-    )
-    if source_range is None:
-        log.info("%s: source %s is empty, nothing to backfill", view.name, parsed.source_table)
-        return []
-
-    chunk = view.full_refresh_chunk or parsed.granularity
-    start, end = expand_to_bucket_bounds(source_range[0], source_range[1], chunk)
-
-    if view.full_refresh_chunk is None:
-        return [(start, end)]  # single-shot full refresh
-
-    # Chunked. Config validation guarantees bucket_alias is set whenever
-    # full_refresh_chunk is — assert so a future refactor can't silently
-    # re-introduce a fallback that breaks chunking.
-    assert parsed.bucket_alias is not None, (
-        "chunked full refresh requires bucket_alias; validate_chunk_compatibility should have rejected this view"
+    start, end = expand_to_bucket_bounds(lo, hi_inclusive, chunk or granularity)
+    if chunk is None:
+        return [(start, end)]  # single-shot
+    # Config validation guarantees bucket_alias is set whenever a chunk is —
+    # assert so a future refactor can't silently re-introduce a fallback that
+    # breaks chunking.
+    assert bucket_alias is not None, (
+        "chunked refresh requires bucket_alias; validate_chunk_compatibility should have rejected this view"
     )
     if resume_from is not None:
-        start = _floor_resume_to_chunk(start, resume_from, view.full_refresh_chunk)
-    return list(walk_buckets(start, end, view.full_refresh_chunk))
+        start = _floor_resume_to_chunk(start, resume_from, chunk)
+    return list(walk_buckets(start, end, chunk))
 
 
 async def execute_refresh(
@@ -192,12 +183,11 @@ async def execute_refresh(
     ``FROM <source> FOR VERSION AS OF max_snapshot`` (``inject_version_pin``) so
     all chunks see one immutable source state — no snapshot mixing (#62).
 
-    - ``incremental_range`` given → one MERGE over it, or N bucket-aligned
-      per-chunk MERGEs when ``view.full_refresh_chunk`` is set (#61: a large
-      catch-up window would otherwise OOM as a single MERGE).
-    - ``view.full_refresh_chunk`` set (no incremental_range) → N MERGEs from the
-      source's beginning.
-    - otherwise → one MERGE over the full source range (single-shot full).
+    The window comes from ``incremental_range`` (#61: a large catch-up window
+    is chunked, not run as one OOM-prone MERGE) or, absent it, from the source's
+    full extent (full refresh). Both feed one ranging path (``_window_ranges``):
+    chunked into N per-chunk MERGEs when ``view.full_refresh_chunk`` is set,
+    else a single MERGE.
 
     ``resume_from`` (``current_work.work_last_merged_chunk``) skips chunks
     at/below its containing chunk — one resume path for both full and
@@ -206,22 +196,22 @@ async def execute_refresh(
     Yields one ``QueryInfo`` per committed MERGE; caller cancels by ``break``.
     """
     if incremental_range is not None:
-        if view.full_refresh_chunk:
-            # Re-align the half-open ``[start, end)`` outward to the chunk grid.
-            # Expand the last *instant* (``end`` exclusive → ``end - 1µs``) so an
-            # already chunk-aligned end isn't over-expanded by a whole empty chunk.
-            r_start, r_end = incremental_range
-            start, end = expand_to_bucket_bounds(r_start, r_end - timedelta(microseconds=1), view.full_refresh_chunk)
-            if resume_from is not None:
-                start = _floor_resume_to_chunk(start, resume_from, view.full_refresh_chunk)
-            ranges: list[tuple[datetime, datetime]] = list(walk_buckets(start, end, view.full_refresh_chunk))
-            stage = "chunk_merge"
-        else:
-            ranges = [incremental_range]
-            stage = "merge"
+        # Detector hands a half-open ``[start, end)``; convert to an inclusive
+        # hi (``end - 1µs``) so an already chunk-aligned end isn't over-expanded
+        # by a whole empty chunk when re-aligned to the (coarser) chunk grid.
+        lo, hi_inclusive = incremental_range[0], incremental_range[1] - timedelta(microseconds=1)
     else:
-        ranges = await _backfill_ranges(cursor, view, parsed, resume_from=resume_from)
-        stage = "chunk_merge" if view.full_refresh_chunk else "merge"
+        # Full refresh recomputes from the source's beginning so overwritten
+        # historical buckets are re-merged, not skipped (#62).
+        source_range = await get_source_column_range(cursor, parsed.source_table, parsed.filter_column)
+        if source_range is None:
+            log.info("%s: source %s is empty, nothing to refresh", view.name, parsed.source_table)
+            return
+        lo, hi_inclusive = source_range
+    ranges = _window_ranges(
+        lo, hi_inclusive, view.full_refresh_chunk, parsed.granularity, parsed.bucket_alias, resume_from
+    )
+    stage = "chunk_merge" if view.full_refresh_chunk else "merge"
 
     total = len(ranges)
     for i, (start, end) in enumerate(ranges, start=1):
