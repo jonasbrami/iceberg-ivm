@@ -1456,6 +1456,45 @@ async def test_refresh_view_advances_state_on_empty_append_no_change(setup_state
     )
 
 
+async def test_refresh_view_no_change_clears_sticky_error(setup_state):
+    """A successful detection that resolves to NO_CHANGE must clear any prior
+    sticky ``last_error`` (issue #54).
+
+    After a transient connection reset, the view sits in ``idle error`` with a
+    frozen ``last_error``. Because the source has no new data, every subsequent
+    tick is NO_CHANGE and no refresh runs to overwrite the error — so the error
+    is never cleared unless the NO_CHANGE path itself resets it.
+    """
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.introspect import ColumnInfo
+
+    view = setup_state.config.views[0]
+    setup_state.view_statuses["test_view"] = ViewStatus(
+        name="test_view",
+        last_action="error",
+        last_error="failed to execute: [Errno 104] Connection reset by peer",
+        total_errors=1,
+    )
+
+    async def fake_detect(*a, **kw):
+        return ChangeResult(action=RefreshAction.NO_CHANGE, current_snapshot=100)
+
+    async def fake_discover(cursor, query):
+        return [ColumnInfo(name="d", type="DATE"), ColumnInfo(name="a", type="VARCHAR")]
+
+    with (
+        patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+        patch.object(server_mod, "discover_columns", fake_discover),
+        patch.object(server_mod, "detect_changes", fake_detect),
+    ):
+        await server_mod.refresh_view(setup_state, view)
+
+    vs = setup_state.view_statuses["test_view"]
+    assert vs.last_error is None, f"NO_CHANGE left sticky error: {vs.last_error!r}"
+    assert vs.last_action == "skip"
+
+
 async def test_refresh_view_appends_recent_queries(setup_state, client):
     """A successful refresh must surface the MERGE / INSERT query IDs on
     the view's status so the UI can link to the Trino UI.
