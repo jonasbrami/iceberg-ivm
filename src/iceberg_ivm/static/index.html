@@ -1,977 +1,835 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>iceberg-ivm</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 96 96' fill='none' stroke='%233B82F6' stroke-width='7' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M24 50 L41 21 L50 35 L57 27 L72 50'/%3E%3Cpath d='M14 50 H82'/%3E%3Cpath d='M27 50 L36 70 L58 76 L69 50' opacity='.4'/%3E%3C/svg%3E">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&family=Instrument+Mono:wght@300;400;500&display=swap" rel="stylesheet">
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iceberg-ivm</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 96 96' fill='none' stroke='%233B82F6' stroke-width='7' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M24 50 L41 21 L50 35 L57 27 L72 50'/%3E%3Cpath d='M14 50 H82'/%3E%3Cpath d='M27 50 L36 70 L58 76 L69 50' opacity='.4'/%3E%3C/svg%3E">
+<script>
+  // Apply the saved theme before first paint.
+  try { const t = localStorage.getItem('ivm-theme'); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+</script>
+<style>
+:root {
+  --bg: #F6F7F9; --panel: #FFFFFF; --sunk: #F1F3F6; --ink: #14161A; --muted: #565D6B; --label: #646B78;
+  --line: #E3E6EB; --line2: #EEF0F3; --accent: #1D5FD1; --on-accent: #FFFFFF; --acc-bg: #EAF0FB;
+  --ok: #15803D; --ok-bg: #E8F5EC; --warn: #B45309; --warn-bg: #FDF3E6; --err: #B42318; --err-bg: #FCEEEC;
+  --idle: #646B78; --idle-bg: #EEF0F3; --shadow: 0 12px 32px rgba(20, 22, 26, .12);
+  --sans: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0D0F13; --panel: #14171D; --sunk: #101318; --ink: #E8EAEE; --muted: #A6ADBA; --label: #98A0AE;
+    --line: #262A33; --line2: #1C2027; --accent: #7AA7FF; --on-accent: #0B1220; --acc-bg: rgba(122,167,255,.13);
+    --ok: #5DD08A; --ok-bg: rgba(93,208,138,.12); --warn: #F2A65A; --warn-bg: rgba(242,166,90,.12);
+    --err: #FF8577; --err-bg: rgba(255,133,119,.12); --idle: #98A0AE; --idle-bg: rgba(152,160,174,.12);
+    --shadow: 0 12px 32px rgba(0, 0, 0, .5); color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0D0F13; --panel: #14171D; --sunk: #101318; --ink: #E8EAEE; --muted: #A6ADBA; --label: #98A0AE;
+  --line: #262A33; --line2: #1C2027; --accent: #7AA7FF; --on-accent: #0B1220; --acc-bg: rgba(122,167,255,.13);
+  --ok: #5DD08A; --ok-bg: rgba(93,208,138,.12); --warn: #F2A65A; --warn-bg: rgba(242,166,90,.12);
+  --err: #FF8577; --err-bg: rgba(255,133,119,.12); --idle: #98A0AE; --idle-bg: rgba(152,160,174,.12);
+  --shadow: 0 12px 32px rgba(0, 0, 0, .5); color-scheme: dark;
+}
 
-  <script>
-    tailwind.config = {
-      theme: {
-        extend: {
-          fontFamily: {
-            sans: ['"Instrument Sans"', 'system-ui', 'sans-serif'],
-            mono: ['"Instrument Mono"', 'monospace'],
-          },
-        }
-      }
-    }
-  </script>
+* { box-sizing: border-box; }
+[x-cloak] { display: none !important; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 var(--sans); -webkit-font-smoothing: antialiased; }
+a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+code, .mono { font-family: var(--mono); font-size: .92em; }
+button, input, select, textarea { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.wrap { max-width: 1200px; margin: 0 auto; padding: 0 24px 64px; }
+@keyframes pulse { 0%, 100% { opacity: 1 } 50% { opacity: .35 } }
+@keyframes spin { to { transform: rotate(360deg) } }
+.pulse { animation: pulse 1.6s ease-in-out infinite; }
+.spin { animation: spin .9s linear infinite; }
 
-  <style>
-    [x-cloak] { display: none !important; }
+/* buttons */
+.btn { display: inline-flex; align-items: center; gap: 8px; height: 40px; padding: 0 16px; border-radius: 8px; border: 1px solid var(--line);
+       background: var(--panel); color: var(--ink); font-weight: 500; cursor: pointer; white-space: nowrap; text-decoration: none; }
+.btn:hover { background: var(--sunk); text-decoration: none; }
+.btn:disabled { opacity: .55; cursor: not-allowed; }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+.btn-primary:hover { background: var(--accent); filter: brightness(1.08); }
+.btn-danger { color: var(--err); }
+.btn-danger-solid { background: var(--err); border-color: var(--err); color: #fff; font-weight: 600; }
+.btn-danger-solid:hover { background: var(--err); filter: brightness(1.08); }
+.btn-sm { height: 36px; padding: 0 14px; }
+.icon-btn { display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; border: 0; border-radius: 8px;
+            background: none; color: var(--muted); cursor: pointer; }
+.icon-btn:hover { background: var(--sunk); color: var(--ink); }
+.icon-btn:disabled { cursor: default; }
 
-    *, *::before, *::after {
-      font-family: 'Instrument Sans', system-ui, sans-serif;
-    }
-    code, pre, .font-mono, input[class*="font-mono"], textarea[class*="font-mono"] {
-      font-family: 'Instrument Mono', monospace;
-    }
+/* header */
+header.top { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; padding: 28px 0 32px; }
+.brand { display: flex; align-items: center; gap: 12px; color: var(--ink); text-decoration: none; }
+.brand:hover { text-decoration: none; }
+.brand-name { font-size: 17px; font-weight: 650; letter-spacing: -.01em; }
+.brand-sub { font-size: 13px; color: var(--muted); }
+.conn { display: inline-flex; align-items: center; gap: 8px; height: 36px; padding: 0 12px; border: 1px solid var(--line); border-radius: 8px;
+        background: var(--panel); color: var(--muted); font-size: 12px; font-family: var(--mono); max-width: 360px; overflow: hidden; }
+.conn span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dot { width: 8px; height: 8px; border-radius: 99px; flex: none; }
 
-    /* ── Animations ────────────────────────────────────────────── */
-    @keyframes dot-pulse {
-      0%, 100% { opacity: 1; transform: scale(1); }
-      50%       { opacity: 0.45; transform: scale(0.85); }
-    }
-    .dot-pulse { animation: dot-pulse 2s ease-in-out infinite; }
+/* summary */
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin-bottom: 28px; }
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; min-width: 0; }
+.tile-label { font-size: 13px; color: var(--label); }
+.tile-value { display: flex; align-items: baseline; gap: 8px; margin-top: 4px; min-width: 0; }
+.tile-value strong { font-size: 28px; font-weight: 650; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+.tile-value span { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tile.bad { background: var(--err-bg); }
+.tile.bad .tile-label, .tile.bad strong, .tile.bad span { color: var(--err); }
 
-    @keyframes card-in {
-      from { opacity: 0; transform: translateY(7px); }
-      to   { opacity: 1; transform: translateY(0); }
-    }
-    .card-enter { animation: card-in 0.28s cubic-bezier(0.16, 1, 0.3, 1) both; }
+/* toolbar */
+.toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip { display: inline-flex; align-items: center; gap: 6px; height: 36px; padding: 0 14px; border-radius: 8px; border: 1px solid var(--line);
+        background: var(--panel); font-size: 13px; font-weight: 500; cursor: pointer; }
+.chip[aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: var(--bg); }
+.chip .n { opacity: .7; font-variant-numeric: tabular-nums; }
+.search { position: relative; flex: 0 1 280px; }
+.search svg { position: absolute; left: 12px; top: 12px; color: var(--label); }
+.search input { width: 100%; height: 40px; padding: 0 12px 0 36px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
 
-    @keyframes modal-rise {
-      from { opacity: 0; transform: translateY(14px) scale(0.975); }
-      to   { opacity: 1; transform: translateY(0)   scale(1); }
-    }
-    .modal-enter { animation: modal-rise 0.26s cubic-bezier(0.16, 1, 0.3, 1) both; }
+/* table */
+.table { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow-x: auto; }
+.table-inner { min-width: 980px; }
+.cols { display: grid; grid-template-columns: 150px minmax(0, 2.3fr) minmax(0, 1.5fr) minmax(0, 1.5fr) 84px 84px; gap: 16px; align-items: center; }
+.thead { padding: 12px 20px; border-bottom: 1px solid var(--line); font-size: 12px; font-weight: 500; color: var(--label); }
+.item { border-bottom: 1px solid var(--line2); }
+.item:last-child { border-bottom: 0; }
+.row { padding: 14px 20px; min-height: 64px; }
+.row:hover { background: var(--sunk); }
+.status { display: inline-flex; align-items: center; gap: 8px; height: 26px; padding: 0 10px; border-radius: 99px; font-size: 13px; font-weight: 500; white-space: nowrap; }
+.t-healthy { color: var(--ok); background: var(--ok-bg); } .t-healthy .dot { background: var(--ok); }
+.t-running, .t-backfill { color: var(--accent); background: var(--acc-bg); } .t-running .dot, .t-backfill .dot { background: var(--accent); }
+.t-failing { color: var(--err); background: var(--err-bg); } .t-failing .dot { background: var(--err); }
+.t-waiting, .t-new { color: var(--idle); background: var(--idle-bg); } .t-waiting .dot, .t-new .dot { background: var(--idle); }
+.name-btn { display: inline-flex; align-items: center; gap: 6px; padding: 0; border: 0; background: none; font-weight: 600; cursor: pointer;
+            text-align: left; max-width: 100%; }
+.name-btn:hover { color: var(--accent); }
+.name-btn span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chev { flex: none; color: var(--label); transition: transform .15s; }
+.chev.open { transform: rotate(90deg); }
+.tables { display: flex; align-items: center; gap: 6px; margin: 2px 0 0 20px; font-family: var(--mono); font-size: 12px; color: var(--muted);
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sub { font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.num { font-variant-numeric: tabular-nums; }
+.tone-ink { color: var(--ink); } .tone-warn { color: var(--warn); } .tone-err { color: var(--err); } .tone-muted { color: var(--muted); }
+.progress { display: flex; align-items: center; gap: 10px; }
+.bar { flex: 1; height: 6px; border-radius: 99px; background: var(--line); overflow: hidden; }
+.bar > div { height: 100%; border-radius: 99px; background: var(--accent); transition: width .4s; }
+.actions { display: flex; justify-content: flex-end; gap: 4px; position: relative; }
+.menu { position: absolute; right: 0; top: 40px; z-index: 20; min-width: 200px; padding: 6px; border: 1px solid var(--line); border-radius: 10px;
+        background: var(--panel); box-shadow: var(--shadow); }
+.menu button { display: flex; width: 100%; align-items: center; gap: 8px; height: 36px; padding: 0 10px; border: 0; border-radius: 6px;
+               background: none; cursor: pointer; text-align: left; }
+.menu button:hover { background: var(--sunk); }
+.alert { display: flex; gap: 10px; margin: -4px 20px 14px 186px; padding: 10px 12px; border-radius: 8px; background: var(--err-bg); color: var(--err);
+         font-size: 13px; }
+.alert svg { flex: none; margin-top: 2px; }
+.alert .msg { font-weight: 500; overflow-wrap: anywhere; }
+.note { margin: -4px 20px 14px 186px; font-size: 13px; color: var(--muted); }
 
-    /* ── Accent line at page top ────────────────────────────────── */
-    body::before {
-      content: '';
-      position: fixed;
-      top: 0; left: 0; right: 0;
-      height: 1px;
-      background: linear-gradient(
-        90deg,
-        transparent 0%,
-        rgba(99,102,241,0.0) 10%,
-        rgba(99,102,241,0.55) 40%,
-        rgba(139,92,246,0.4) 60%,
-        rgba(99,102,241,0.0) 90%,
-        transparent 100%
-      );
-      pointer-events: none;
-      z-index: 9999;
-    }
+/* detail */
+.detail { display: flex; flex-wrap: wrap; gap: 24px; padding: 4px 20px 22px 40px; }
+.detail-main { flex: 999 1 460px; min-width: 0; }
+.detail-side { flex: 1 1 380px; min-width: 0; }
+.facts { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.fact { display: inline-flex; gap: 6px; padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px; font-size: 12px; }
+.fact > span:first-child { color: var(--label); }
+.fact > span:last-child { font-family: var(--mono); }
+pre.sql { margin: 0; padding: 14px 16px; border-radius: 8px; background: var(--sunk); border: 1px solid var(--line2); font: 12.5px/1.7 var(--mono);
+          overflow-x: auto; white-space: pre; }
+.lineage { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; font-size: 13px; color: var(--muted); }
+.lineage .node { font-family: var(--mono); font-size: 12px; color: var(--ink); }
+.lineage button.node { padding: 0; border: 0; background: none; cursor: pointer; color: var(--accent); }
+.lineage .self { color: var(--accent); font-weight: 600; }
+.h3 { font-size: 13px; font-weight: 600; margin: 0 0 8px; }
+.queries { border: 1px solid var(--line2); border-radius: 8px; }
+.query { display: grid; grid-template-columns: 64px 104px minmax(0, 1fr) 56px 16px; gap: 10px; align-items: center; padding: 9px 12px;
+         border-bottom: 1px solid var(--line2); color: var(--ink); font-size: 13px; text-decoration: none; }
+.query:last-child { border-bottom: 0; }
+a.query:hover { background: var(--sunk); text-decoration: none; }
+.maint { margin-top: 10px; font-size: 13px; color: var(--muted); }
+.btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.empty-row { padding: 48px 20px; text-align: center; color: var(--muted); }
 
-    /* ── Scrollbar ─────────────────────────────────────────────── */
-    ::-webkit-scrollbar       { width: 4px; height: 4px; }
-    ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: rgba(15,15,30,0.10); border-radius: 2px; }
-    ::-webkit-scrollbar-thumb:hover { background: rgba(15,15,30,0.18); }
+/* empty state */
+.hero { max-width: 560px; margin: 48px auto; text-align: center; }
+.hero h2 { margin: 16px 0 6px; font-size: 22px; letter-spacing: -.01em; }
+.hero p { margin: 0 0 20px; color: var(--muted); }
 
-    /* ── Details/summary reset ─────────────────────────────────── */
-    details > summary             { list-style: none; }
-    details > summary::-webkit-details-marker { display: none; }
+/* form */
+.back { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 500; }
+h1.title { margin: 12px 0 4px; font-size: 26px; font-weight: 650; letter-spacing: -.02em; overflow-wrap: anywhere; }
+.lead { margin: 0 0 28px; color: var(--muted); max-width: 640px; }
+.cols2 { display: flex; flex-wrap: wrap; gap: 24px; align-items: flex-start; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+.form-main { flex: 999 1 560px; min-width: 0; }
+.form-side { flex: 1 1 320px; min-width: 0; display: flex; flex-direction: column; gap: 16px; }
+.field { display: flex; flex-direction: column; gap: 6px; }
+.field + .field { margin-top: 16px; }
+.field label { font-weight: 600; }
+.opt { font-weight: 400; color: var(--label); }
+.hint { font-size: 13px; color: var(--muted); }
+.input { width: 100%; height: 40px; padding: 0 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+textarea.input { height: auto; padding: 14px 16px; background: var(--sunk); font: 13px/1.7 var(--mono); resize: vertical; }
+.input:disabled { opacity: .65; cursor: not-allowed; }
+.input.mono { font-family: var(--mono); font-size: 13px; }
+.with-unit { display: flex; align-items: center; gap: 8px; }
+.with-unit span { color: var(--muted); }
+.grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 16px; }
+.grid2 .field + .field { margin-top: 0; }
+.check { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.check input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--accent); }
+.check .input { width: 72px; height: 32px; }
+details.card > summary { cursor: pointer; font-weight: 600; list-style: none; display: flex; align-items: center; gap: 8px; }
+details.card > summary::-webkit-details-marker { display: none; }
+details.card[open] > summary .chev { transform: rotate(90deg); }
+.verdict { margin-top: 14px; padding: 14px 16px; border-radius: 8px; }
+.verdict.ok { background: var(--ok-bg); }
+.verdict.bad { background: var(--err-bg); color: var(--err); }
+.verdict-title { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.verdict.ok .verdict-title { color: var(--ok); }
+.verdict ul { margin: 10px 0 0; padding-left: 20px; line-height: 1.8; }
+.verdict p { margin: 6px 0 0; color: var(--ink); overflow-wrap: anywhere; }
+.form-error { padding: 12px 14px; border-radius: 8px; background: var(--err-bg); color: var(--err); overflow-wrap: anywhere; }
+.form-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
-    /* ── Autofill override ─────────────────────────────────────── */
-    input:-webkit-autofill,
-    input:-webkit-autofill:focus {
-      -webkit-box-shadow: 0 0 0 100px #ffffff inset;
-      -webkit-text-fill-color: #1a1a28;
-    }
+/* dialog, toast, banner, footer */
+.scrim { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(13, 15, 19, .45); }
+.dialog { width: 100%; max-width: 460px; padding: 22px; border-radius: 14px; background: var(--panel); border: 1px solid var(--line); box-shadow: var(--shadow); }
+.dialog h2 { margin: 0 0 8px; font-size: 18px; overflow-wrap: anywhere; }
+.dialog p { margin: 0 0 20px; color: var(--muted); overflow-wrap: anywhere; }
+.toast { position: fixed; right: 24px; bottom: 24px; z-index: 60; max-width: 420px; padding: 12px 16px; border-radius: 10px; border: 1px solid var(--line);
+         background: var(--panel); box-shadow: var(--shadow); font-size: 13px; overflow-wrap: anywhere; }
+.toast.err { border-color: var(--err); color: var(--err); }
+.banner { margin-bottom: 16px; padding: 12px 14px; border-radius: 8px; background: var(--warn-bg); color: var(--warn); }
+footer { margin: 16px 2px 0; font-size: 13px; color: var(--label); }
 
-    /* ── Card left accent bar ─────────────────────────────────── */
-    .card-accent::before {
-      content: '';
-      position: absolute;
-      left: 0;
-      top: 12px;
-      bottom: 12px;
-      width: 2px;
-      border-radius: 0 2px 2px 0;
-      background: rgba(99,102,241,0);
-      transition: background 0.25s ease;
-    }
-    .card-accent:hover::before {
-      background: rgba(99,102,241,0.28);
-    }
-  </style>
+@media (max-width: 640px) {
+  .wrap { padding: 0 16px 48px; }
+  .grid2 { grid-template-columns: 1fr; }
+  .search { flex: 1 1 100%; }
+  h1.title { font-size: 22px; }
+}
+</style>
+<script defer src="/static/alpine.min.js"></script>
 </head>
+<body x-data="app()" x-init="init()" @keydown.escape.window="menu = null; dialog = null">
+<div class="wrap">
 
-<body x-data="app()" x-init="init()" class="bg-[#fafafd] text-[#1a1a28] min-h-screen antialiased font-sans">
-
-<div class="max-w-[880px] mx-auto px-6 py-12">
-
-  <!-- ── Header ──────────────────────────────────────────────── -->
-  <header class="flex items-center justify-between mb-10">
-    <div class="flex items-center gap-3.5">
-      <div class="relative w-8 h-8 shrink-0">
-        <div class="absolute inset-0 rounded-[10px] bg-indigo-500/10 border border-indigo-500/20"></div>
-        <svg class="absolute inset-0 m-auto w-4 h-4 text-indigo-400"
-             fill="none" viewBox="0 0 24 24" stroke-width="1.75" stroke="currentColor">
-          <path stroke-linecap="round" stroke-linejoin="round"
-                d="M20.25 6.375c0 2.278-3.694 4.125-8.25 4.125S3.75 8.653 3.75 6.375
-                   m16.5 0c0-2.278-3.694-4.125-8.25-4.125S3.75 4.097 3.75 6.375
-                   m16.5 0v11.25c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125V6.375
-                   m16.5 5.625c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125" />
-        </svg>
-      </div>
-      <div>
-        <h1 class="text-[15px] font-semibold text-[#0d0d18] tracking-[-0.015em] leading-none">
-          Materialized Views
-        </h1>
-        <p class="text-[11px] text-[#9090a8] mt-[5px] leading-none tracking-[0.04em] uppercase font-mono">
-          Trino · Iceberg · Incremental
-        </p>
-      </div>
+<header class="top">
+  <a class="brand" href="#">
+    <svg aria-hidden="true" width="34" height="34" viewBox="0 0 32 32" fill="none"><rect width="32" height="32" rx="8" fill="var(--acc-bg)"/><path d="M9 17 L14 8 L17 13 L19 10 L23 17" stroke="var(--accent)" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/><path d="M7 17 H25" stroke="var(--accent)" stroke-width="1.8" stroke-linecap="round"/><path d="M10 17 L13 23 L19 24 L22 17" stroke="var(--accent)" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" opacity=".45"/></svg>
+    <div>
+      <div class="brand-name">iceberg-ivm</div>
+      <div class="brand-sub">Incremental materialized views on Trino + Iceberg</div>
     </div>
-
-    <button @click="showForm = true; editingView = null; resetForm()"
-            class="flex items-center gap-2 px-4 py-[9px] rounded-[10px] text-[13px] font-semibold
-                   bg-indigo-600 hover:bg-indigo-500 text-white
-                   shadow-[0_0_0_1px_rgba(99,102,241,0.5),0_4px_16px_rgba(99,102,241,0.22)]
-                   hover:shadow-[0_0_0_1px_rgba(99,102,241,0.7),0_4px_20px_rgba(99,102,241,0.35)]
-                   transition-all duration-150 active:scale-[0.97]">
-      <svg class="w-[13px] h-[13px]" fill="none" viewBox="0 0 24 24" stroke-width="2.8" stroke="currentColor">
-        <path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
-      </svg>
-      New View
+  </a>
+  <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
+    <span class="conn" x-show="info.trino_url" x-cloak :title="'Trino at ' + info.trino_url + ' · default ' + info.catalog + '.' + info.schema">
+      <span class="dot" :style="'background:' + (offline ? 'var(--err)' : 'var(--ok)')"></span>
+      <span x-text="host(info.trino_url)"></span>
+    </span>
+    <button class="icon-btn" type="button" @click="toggleTheme()" :aria-label="dark ? 'Use light theme' : 'Use dark theme'" :title="dark ? 'Light theme' : 'Dark theme'">
+      <svg x-show="!dark" aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg>
+      <svg x-show="dark" x-cloak aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
     </button>
-  </header>
-
-  <!-- ── Meta row ────────────────────────────────────────────── -->
-  <div x-show="views.length > 0"
-       class="flex items-center gap-2 mb-4 pl-0.5">
-    <span class="text-[11px] font-mono text-[#9090a8] tabular-nums"
-          x-text="views.length + (views.length === 1 ? ' view' : ' views')"></span>
-    <span class="text-[11px] text-[#c8c8d8]">·</span>
-    <span class="text-[11px] font-mono text-[#9090a8]">polling every 5s</span>
+    <a class="btn btn-primary" href="#new" x-show="page === 'list'">
+      <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+      New view
+    </a>
   </div>
+</header>
 
-  <!-- ── Views list ───────────────────────────────────────────── -->
-  <div class="space-y-2">
-    <template x-for="(view, idx) in views" :key="view.name">
-      <div class="card-accent relative bg-white border border-[rgba(15,15,30,0.08)]
-                  rounded-xl card-enter overflow-hidden
-                  hover:border-[rgba(15,15,30,0.14)]
-                  transition-[border-color,box-shadow] duration-200
-                  hover:shadow-[0_8px_28px_rgba(15,15,30,0.10)]"
-           :style="`animation-delay:${idx * 45}ms`">
+<div class="banner" x-show="offline" x-cloak role="alert">Can't reach the iceberg-ivm API. Retrying every 5 seconds…</div>
 
-        <div class="px-5 py-[18px]">
-
-          <!-- Row 1: name + badges + actions -->
-          <div class="flex items-start justify-between gap-4">
-            <div class="flex-1 min-w-0">
-
-              <!-- Name + status badges -->
-              <div class="flex items-center gap-2.5 flex-wrap">
-                <h2 class="text-[14px] font-semibold font-mono text-[#0d0d18] tracking-[-0.01em]"
-                    x-text="view.name"></h2>
-
-                <template x-for="b in badges(view)" :key="b.label">
-                  <span class="inline-flex items-center gap-[5px] text-[10px] tracking-[0.06em]
-                               uppercase font-mono px-[7px] py-[2px] rounded-full border"
-                        :class="b.cls">
-                    <span class="w-[5px] h-[5px] rounded-full shrink-0"
-                          :class="b.dotCls + (b.pulse ? ' dot-pulse' : '')"></span>
-                    <span x-text="b.label"></span>
-                  </span>
-                </template>
-              </div>
-
-              <!-- Source → Target -->
-              <div class="flex items-center gap-[6px] mt-[7px]">
-                <span class="text-[11px] font-mono text-[#5c5c7a]" x-text="view.source_table"></span>
-                <svg class="w-3 h-3 text-[#b8b8c8] shrink-0" fill="none" viewBox="0 0 24 24"
-                     stroke-width="2" stroke="currentColor">
-                  <path stroke-linecap="round" stroke-linejoin="round"
-                        d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3" />
-                </svg>
-                <span class="text-[11px] font-mono text-[#5c5c7a]"
-                      x-text="view.target_table"></span>
-              </div>
-            </div>
-
-            <!-- Action buttons -->
-            <div class="flex items-center gap-1 shrink-0">
-              <button @click="triggerRefresh(view.name)"
-                      :disabled="refreshing[view.name] === true"
-                      class="flex items-center gap-[5px] text-[11px] font-semibold
-                             px-[11px] py-[6px] rounded-lg cursor-pointer
-                             bg-indigo-50 hover:bg-indigo-100
-                             text-indigo-700 hover:text-indigo-800
-                             border border-indigo-200 hover:border-indigo-300
-                             transition-all duration-150
-                             disabled:opacity-35 disabled:cursor-not-allowed
-                             active:scale-95">
-                <template x-if="!refreshing[view.name]">
-                  <span>Refresh</span>
-                </template>
-                <template x-if="refreshing[view.name]">
-                  <span class="flex items-center gap-[5px]">
-                    <svg class="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none">
-                      <circle cx="12" cy="12" r="9"
-                              stroke="currentColor" stroke-width="2.5"
-                              stroke-dasharray="56.55" stroke-dashoffset="42"
-                              stroke-linecap="round"/>
-                    </svg>
-                    Running
-                  </span>
-                </template>
-              </button>
-
-              <button @click="editView(view)"
-                      class="text-[11px] font-medium px-[10px] py-[6px] rounded-lg
-                             bg-[rgba(15,15,30,0.03)] hover:bg-[rgba(15,15,30,0.06)]
-                             text-[#666684] hover:text-[#1a1a28]
-                             border border-[rgba(15,15,30,0.10)] hover:border-[rgba(15,15,30,0.18)]
-                             transition-all duration-150 active:scale-95">
-                Edit
-              </button>
-
-              <button @click="deleteView(view.name)"
-                      class="text-[11px] font-medium px-[10px] py-[6px] rounded-lg
-                             bg-[rgba(15,15,30,0.03)] hover:bg-red-500/10
-                             text-[#666684] hover:text-red-600
-                             border border-[rgba(15,15,30,0.10)] hover:border-red-500/35
-                             transition-all duration-150 active:scale-95">
-                Delete
-              </button>
-            </div>
-          </div>
-
-          <!-- Stats row -->
-          <div x-show="view.status"
-               class="flex flex-wrap gap-x-[18px] gap-y-[6px] mt-4 pt-[14px]
-                      border-t border-[rgba(15,15,30,0.06)]">
-
-            <div class="flex items-baseline gap-[6px]">
-              <span class="text-[9.5px] font-mono text-[#9090a8] uppercase tracking-[0.08em]">Refreshes</span>
-              <span class="text-[12px] font-mono tabular-nums text-[#3a3a52]"
-                    x-text="view.status?.total_refreshes ?? 0"></span>
-            </div>
-
-            <div class="flex items-baseline gap-[6px]">
-              <span class="text-[9.5px] font-mono text-[#9090a8] uppercase tracking-[0.08em]">Duration</span>
-              <span class="text-[12px] font-mono tabular-nums text-[#3a3a52]"
-                    x-text="view.status?.last_duration != null ? view.status.last_duration.toFixed(2) + 's' : '—'"></span>
-            </div>
-
-            <!-- Chunked backfill progress: visible only while a chunked refresh is
-                 in flight (chunks_total != null). Completed backfill clears
-                 chunks_total so the chip goes away. -->
-            <div x-show="view.status?.chunks_total != null"
-                 class="flex items-baseline gap-[6px]">
-              <span class="text-[9.5px] font-mono uppercase tracking-[0.08em] text-indigo-600/85">Chunks</span>
-              <span class="text-[12px] font-mono tabular-nums font-semibold text-indigo-700"
-                    x-text="(view.status?.chunks_done ?? 0) + ' / ' + view.status?.chunks_total"></span>
-            </div>
-
-            <div x-show="view.status?.last_range" class="flex items-baseline gap-[6px]">
-              <span class="text-[9.5px] font-mono text-[#9090a8] uppercase tracking-[0.08em]">Range</span>
-              <span class="text-[10.5px] font-mono tabular-nums text-[#5c5c7a]"
-                    x-text="view.status?.last_range"></span>
-            </div>
-
-            <div class="flex items-baseline gap-[6px]">
-              <span class="text-[9.5px] font-mono text-[#9090a8] uppercase tracking-[0.08em]">Interval</span>
-              <span class="text-[12px] font-mono tabular-nums text-[#3a3a52]"
-                    x-text="view.refresh_interval_seconds + 's'"></span>
-            </div>
-
-            <div x-show="view.status?.last_refresh" class="flex items-baseline gap-[6px]">
-              <span class="text-[9.5px] font-mono text-[#9090a8] uppercase tracking-[0.08em]">Last</span>
-              <span class="text-[12px] font-mono tabular-nums text-[#3a3a52]"
-                    x-text="view.status?.last_refresh ? timeAgo(view.status.last_refresh) : '—'"></span>
-            </div>
-
-            <div x-show="view.status?.total_errors > 0" class="flex items-baseline gap-[6px]">
-              <span class="text-[9.5px] font-mono text-[#9090a8] uppercase tracking-[0.08em]">Errors</span>
-              <span class="text-[12px] font-mono tabular-nums font-semibold text-red-600"
-                    x-text="view.status?.total_errors"></span>
-            </div>
-          </div>
-
-          <!-- Error detail -->
-          <div x-show="view.status?.last_error"
-               class="mt-3 text-[11px] font-mono leading-relaxed text-red-700
-                      bg-red-500/[0.07] border border-red-500/[0.22] rounded-lg p-3 break-all">
-            <span x-text="view.status?.last_error"></span>
-          </div>
-
-          <!-- Maintenance: collapsed to the most-recent run across all ops.
-               Per-op breakdowns live in the recent-queries list below
-               (each maintenance query is tagged with its op stage).
-               Title attribute exposes the per-op timestamps on hover.
-               Red-tint when the most-recent run errored. -->
-          <template x-if="lastMaintenance(view)">
-            <div class="flex items-baseline gap-[6px] mt-3 pt-[12px]
-                        border-t border-[rgba(15,15,30,0.06)]"
-                 :class="lastMaintenance(view)?.last_error ? 'text-red-700' : 'text-[#3a3a52]'"
-                 :title="maintenanceTitle(view)">
-              <span class="text-[9.5px] font-mono uppercase tracking-[0.08em]"
-                    :class="lastMaintenance(view)?.last_error ? 'text-red-700/85' : 'text-purple-700/85'">
-                Last Maintenance
-              </span>
-              <span class="text-[12px] font-mono tabular-nums"
-                    x-text="timeAgo(lastMaintenance(view).last_run)"></span>
-            </div>
-          </template>
-
-          <!-- Query (collapsible) -->
-          <details class="group mt-3">
-            <summary class="flex items-center gap-[5px] w-fit cursor-pointer select-none
-                            text-[11px] font-mono text-[#9090a8] hover:text-[#3a3a52]
-                            transition-colors duration-150">
-              <svg class="w-[11px] h-[11px] transition-transform duration-150 group-open:rotate-90 shrink-0"
-                   fill="none" viewBox="0 0 24 24" stroke-width="2.8" stroke="currentColor">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" />
-              </svg>
-              query
-            </summary>
-            <pre class="mt-[9px] text-[11px] font-mono leading-[1.7] text-[#3a3a52]
-                        bg-[#f4f4f9] border border-[rgba(15,15,30,0.06)]
-                        rounded-lg px-4 py-3.5 overflow-x-auto"><code x-text="view.query"></code></pre>
-          </details>
-
-          <!-- Recent refresh queries (collapsible) — links to Trino UI -->
-          <details x-show="view.status?.recent_queries?.length > 0" class="group mt-2">
-            <summary class="flex items-center gap-[5px] w-fit cursor-pointer select-none
-                            text-[11px] font-mono text-[#9090a8] hover:text-[#3a3a52]
-                            transition-colors duration-150">
-              <svg class="w-[11px] h-[11px] transition-transform duration-150 group-open:rotate-90 shrink-0"
-                   fill="none" viewBox="0 0 24 24" stroke-width="2.8" stroke="currentColor">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" />
-              </svg>
-              <span>recent queries</span>
-              <span class="text-[#c0c0d0] font-normal"
-                    x-text="'(' + (view.status?.recent_queries?.length ?? 0) + ')'"></span>
-            </summary>
-
-            <div class="mt-[9px] bg-[#f4f4f9] border border-[rgba(15,15,30,0.06)] rounded-lg
-                        divide-y divide-[rgba(15,15,30,0.05)]">
-              <template x-for="q in view.status.recent_queries" :key="q.query_id">
-                <a :href="q.info_uri || null"
-                   :target="q.info_uri ? '_blank' : null"
-                   rel="noopener"
-                   :class="q.info_uri ? '' : 'pointer-events-none'"
-                   class="flex items-center gap-[10px] px-3 py-[8px] hover:bg-white/60 transition-colors duration-100">
-                  <!-- stage chip -->
-                  <span class="shrink-0 text-[9.5px] uppercase tracking-[0.08em] font-mono font-medium
-                               px-[7px] py-[2px] rounded-md"
-                        :class="(q.stage === 'merge' || q.stage === 'chunk_merge')
-                                  ? 'bg-indigo-500/[0.10] text-indigo-700 border border-indigo-500/[0.25]'
-                                  : q.stage?.startsWith('maintenance_')
-                                    ? 'bg-purple-500/[0.10] text-purple-700 border border-purple-500/[0.25]'
-                                    : 'bg-[rgba(15,15,30,0.05)] text-[#666684] border border-[rgba(15,15,30,0.10)]'"
-                        x-text="q.stage"></span>
-
-                  <!-- query id -->
-                  <span class="font-mono text-[11px] text-[#3a3a52] truncate"
-                        x-text="q.query_id"></span>
-
-                  <!-- elapsed + rows -->
-                  <span class="ml-auto shrink-0 flex items-baseline gap-[10px]">
-                    <span class="text-[10.5px] font-mono tabular-nums text-[#666684]"
-                          x-text="(q.elapsed_ms / 1000).toFixed(2) + 's'"></span>
-                    <span x-show="q.processed_rows > 0"
-                          class="text-[10.5px] font-mono tabular-nums text-[#888ca0]"
-                          x-text="formatRows(q.processed_rows) + ' rows'"></span>
-                  </span>
-
-                  <!-- external-link icon -->
-                  <svg class="w-[11px] h-[11px] text-[#c0c0d0] shrink-0" fill="none"
-                       viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
-                    <path stroke-linecap="round" stroke-linejoin="round"
-                          d="M13.5 6H5.25A2.25 2.25 0 003 8.25v10.5A2.25 2.25 0 005.25 21h10.5A2.25 2.25 0 0018 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25" />
-                  </svg>
-                </a>
-              </template>
-            </div>
-          </details>
-
-        </div>
-      </div>
-    </template>
-
-    <!-- Empty state -->
-    <div x-show="views.length === 0"
-         class="flex flex-col items-center justify-center py-[120px] select-none">
-      <div class="w-14 h-14 rounded-2xl bg-white border border-[rgba(15,15,30,0.08)]
-                  flex items-center justify-center mb-5">
-        <svg class="w-6 h-6 text-[#c0c0d0]" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
-          <path stroke-linecap="round" stroke-linejoin="round"
-                d="M20.25 6.375c0 2.278-3.694 4.125-8.25 4.125S3.75 8.653 3.75 6.375
-                   m16.5 0c0-2.278-3.694-4.125-8.25-4.125S3.75 4.097 3.75 6.375
-                   m16.5 0v11.25c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125V6.375
-                   m16.5 5.625c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125" />
-        </svg>
-      </div>
-      <p class="text-[13px] text-[#3a3a52] font-medium">No views configured</p>
-      <p class="text-[11px] text-[#9090a8] mt-2 font-mono">
-        Click <span class="text-[#5c5c7a] border-b border-[#c0c0d0] pb-px cursor-pointer"
-                    @click="showForm = true; editingView = null; resetForm()">New View</span>
-        to get started
-      </p>
+<!-- ════════════ Views ════════════ -->
+<main x-show="page === 'list'">
+  <template x-if="loaded && !offline && views.length === 0">
+    <div class="hero">
+      <svg aria-hidden="true" width="56" height="56" viewBox="0 0 96 96" fill="none" stroke="var(--accent)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"><path d="M24 50 L41 21 L50 35 L57 27 L72 50"/><path d="M14 50 H82"/><path d="M27 50 L36 70 L58 76 L69 50" opacity=".4"/></svg>
+      <h2>No views yet</h2>
+      <p>A view is a <code>GROUP BY</code> query over an Iceberg table. iceberg-ivm keeps its result table up to date, recomputing only the time buckets that new data touches.</p>
+      <a class="btn btn-primary" href="#new">Create your first view</a>
     </div>
-  </div>
+  </template>
 
-</div>
-
-<!-- ── Toast ───────────────────────────────────────────────────── -->
-<div x-show="toast.message" x-cloak x-transition.opacity
-     class="fixed bottom-6 right-6 z-[60] max-w-[420px] px-4 py-[10px] rounded-xl
-            text-[12px] font-mono leading-snug shadow-[0_10px_30px_rgba(15,15,30,0.15)]
-            border"
-     :class="{
-       'bg-white text-[#3a3a52] border-[rgba(15,15,30,0.10)]': toast.kind === 'muted',
-       'bg-emerald-50 text-emerald-800 border-emerald-500/[0.35]': toast.kind === 'success',
-       'bg-red-50 text-red-700 border-red-500/[0.35]': toast.kind === 'error',
-     }"
-     x-text="toast.message"></div>
-
-<!-- ── Modal overlay ────────────────────────────────────────────── -->
-<div x-show="showForm" x-cloak
-     class="fixed inset-0 z-50 flex items-center justify-center p-4"
-     @keydown.escape.window="showForm = false">
-
-  <!-- Backdrop -->
-  <div class="absolute inset-0 bg-[rgba(15,15,30,0.35)] backdrop-blur-[10px]"
-       @click="showForm = false"></div>
-
-  <!-- Panel -->
-  <div class="relative bg-white border border-[rgba(15,15,30,0.10)]
-              rounded-2xl w-full max-w-[680px] max-h-[92vh] overflow-y-auto
-              shadow-[0_0_0_1px_rgba(99,102,241,0.10),0_40px_80px_rgba(15,15,30,0.18)]
-              modal-enter">
-
-    <!-- Modal header -->
-    <div class="flex items-start justify-between px-6 py-5
-                border-b border-[rgba(15,15,30,0.08)]">
-      <div>
-        <h2 class="text-[14px] font-semibold text-[#0d0d18] tracking-[-0.01em]"
-            x-text="editingView ? 'Edit View' : 'New View'"></h2>
-        <p class="text-[11px] font-mono text-[#666684] mt-1"
-           x-text="editingView ? 'Update configuration for ' + editingView : 'Configure a new incremental materialized view'"></p>
+  <div x-show="views.length > 0" x-cloak>
+    <section class="tiles" aria-label="Summary">
+      <div class="tile">
+        <div class="tile-label">Healthy</div>
+        <div class="tile-value"><strong x-text="counts.healthy"></strong><span x-text="'of ' + views.length + (views.length === 1 ? ' view' : ' views')"></span></div>
       </div>
-      <button @click="showForm = false"
-              class="w-7 h-7 rounded-lg bg-[rgba(15,15,30,0.04)] hover:bg-[rgba(15,15,30,0.08)]
-                     flex items-center justify-center shrink-0 ml-4
-                     text-[#666684] hover:text-[#1a1a28]
-                     border border-[rgba(15,15,30,0.08)]
-                     transition-all duration-150 active:scale-90">
-        <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor">
-          <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
-        </svg>
-      </button>
+      <div class="tile">
+        <div class="tile-label">Running now</div>
+        <div class="tile-value"><strong x-text="counts.running"></strong><span x-text="counts.runningNames || 'idle'"></span></div>
+      </div>
+      <div class="tile" :class="counts.failing && 'bad'">
+        <div class="tile-label">Failing</div>
+        <div class="tile-value"><strong x-text="counts.failing"></strong><span x-text="counts.failingNames || 'none'"></span></div>
+      </div>
+      <div class="tile">
+        <div class="tile-label">Most behind</div>
+        <div class="tile-value"><strong x-text="counts.worst ? dur(counts.worst.lag) : '—'"></strong><span x-text="counts.worst ? counts.worst.name : 'all up to date'"></span></div>
+      </div>
+    </section>
+
+    <div class="toolbar">
+      <div class="chips" role="group" aria-label="Filter views">
+        <template x-for="c in chips" :key="c.id">
+          <button type="button" class="chip" :aria-pressed="filter === c.id" @click="filter = c.id"><span x-text="c.label"></span> <span class="n" x-text="c.n"></span></button>
+        </template>
+      </div>
+      <div class="search">
+        <label for="q" class="sr">Search views</label>
+        <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+        <input id="q" type="search" placeholder="Search views or tables" x-model="q">
+      </div>
     </div>
 
-    <!-- Form body — dynamically rendered from /api/views/schema -->
-    <div class="px-6 py-5 space-y-[18px]">
+    <div class="table">
+      <div class="table-inner">
+        <div class="cols thead"><div>Status</div><div>View</div><div>Freshness</div><div>Last refresh</div><div>Every</div><div></div></div>
 
-      <template x-for="(row, idx) in schemaRows" :key="idx">
-        <div>
-
-          <!-- Section divider before the maintenance group, so refresh
-               config and Iceberg housekeeping read as separate concerns. -->
-          <template x-if="row[0]?.group === 'maintenance'">
-            <div class="flex items-center gap-3 pt-3 pb-1">
-              <div class="h-px flex-1 bg-[rgba(15,15,30,0.10)]"></div>
-              <span class="text-[10px] font-mono font-medium text-[#888ca0]
-                           uppercase tracking-[0.08em] shrink-0">
-                Iceberg Maintenance
-              </span>
-              <div class="h-px flex-1 bg-[rgba(15,15,30,0.10)]"></div>
-            </div>
-          </template>
-
-          <div :class="row.length > 1 ? 'grid grid-cols-2 gap-3' : ''">
-
-          <template x-for="field in row" :key="field.name">
-            <div>
-
-              <!-- Label -->
-              <label class="block text-[10.5px] font-mono font-medium text-[#666684]
-                            uppercase tracking-[0.08em] mb-[7px]">
-                <span x-text="field.label"></span>
-                <template x-if="field.help">
-                  <span class="normal-case text-[#9090a8] font-normal ml-1.5 tracking-normal">
-                    — <span x-text="field.help"></span>
-                  </span>
+        <template x-for="r in rows" :key="r.v.name">
+          <div class="item">
+            <div class="cols row">
+              <div><span class="status" :class="'t-' + r.state.key"><span class="dot" :class="r.state.pulse && 'pulse'"></span><span x-text="r.state.label"></span></span></div>
+              <div style="min-width: 0">
+                <button type="button" class="name-btn" @click="toggle(r.v.name)" :aria-expanded="open === r.v.name">
+                  <svg class="chev" :class="open === r.v.name && 'open'" aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
+                  <span x-text="r.v.name"></span>
+                </button>
+                <div class="tables" :title="r.v.source_table + ' → ' + r.v.target_table"><span x-text="short(r.v.source_table)"></span><span aria-hidden="true">→</span><span x-text="short(r.v.target_table)"></span></div>
+              </div>
+              <div style="min-width: 0" :title="r.fresh.title">
+                <template x-if="r.fresh.progress">
+                  <div class="progress"><div class="bar"><div :style="'width:' + r.fresh.progress"></div></div><span class="num" x-text="r.fresh.text"></span></div>
                 </template>
-                <template x-if="!field.required && !field.help">
-                  <span class="text-[#a8a8c0] font-normal normal-case tracking-normal">(optional)</span>
-                </template>
-              </label>
-
-              <!-- text (multi-line) -->
-              <template x-if="field.type === 'text'">
-                <div>
-                  <textarea
-                    x-model="form[field.name]"
-                    @input="field.name === 'query' && scheduleParse()"
-                    :rows="field.rows || 6"
-                    :placeholder="field.placeholder"
-                    :disabled="field.disabled_on_edit && editingView !== null"
-                    class="w-full bg-white border border-[rgba(15,15,30,0.12)] rounded-[10px]
-                           px-3 py-[10px] text-[12px] font-mono text-[#1a1a28] placeholder-[#b8b8c8]
-                           leading-[1.75] resize-y
-                           focus:outline-none focus:border-indigo-500/55
-                           focus:ring-2 focus:ring-indigo-500/[0.14]
-                           disabled:opacity-40 disabled:cursor-not-allowed
-                           transition-[border-color,box-shadow] duration-150"></textarea>
-
-                  <!-- Live parse panel — only shown for the query field -->
-                  <template x-if="field.name === 'query'">
-                    <div class="mt-2">
-                      <!-- error state -->
-                      <div x-show="parseError && !parsing"
-                           class="text-[11px] font-mono text-red-700 leading-relaxed
-                                  bg-red-500/[0.06] border border-red-500/[0.22] rounded-lg px-3 py-[8px]">
-                        <span class="font-medium uppercase tracking-[0.06em] text-[10px]">parse error</span>
-                        <span class="block mt-[2px]" x-text="parseError"></span>
-                      </div>
-
-                      <!-- parsed attributes -->
-                      <div x-show="parsed && !parseError"
-                           class="flex flex-wrap items-center gap-[6px] text-[11px] font-mono
-                                  bg-emerald-500/[0.05] border border-emerald-500/[0.22]
-                                  rounded-lg px-3 py-[8px]">
-                        <span class="uppercase tracking-[0.06em] text-[10px] text-emerald-800/85 font-medium mr-1">
-                          derived
-                        </span>
-                        <template x-for="chip in [
-                          { label: 'source', value: parsed && parsed.source_table },
-                          { label: 'filter col', value: parsed && parsed.filter_column },
-                          { label: 'granularity', value: parsed && parsed.granularity },
-                          { label: 'merge keys', value: parsed && (parsed.merge_keys || []).join(', ') },
-                        ]" :key="chip.label">
-                          <span class="inline-flex items-baseline gap-[5px]
-                                       px-[8px] py-[3px] rounded-md
-                                       bg-white/70 border border-[rgba(15,15,30,0.10)]">
-                            <span class="text-[9.5px] uppercase tracking-[0.08em] text-[#666684]"
-                                  x-text="chip.label"></span>
-                            <span class="text-[#1a1a28]" x-text="chip.value"></span>
-                          </span>
-                        </template>
-                      </div>
-
-                      <!-- subtle in-flight hint -->
-                      <div x-show="parsing"
-                           class="text-[10.5px] font-mono text-[#888ca0] mt-[4px] ml-[2px]">
-                        parsing…
-                      </div>
-                    </div>
-                  </template>
+                <template x-if="!r.fresh.progress"><div style="font-weight: 500" :class="'tone-' + r.fresh.tone" x-text="r.fresh.text"></div></template>
+                <div class="sub" x-text="r.fresh.sub" :title="r.fresh.sub"></div>
+              </div>
+              <div style="min-width: 0">
+                <div x-text="r.last.text"></div>
+                <div class="sub" x-text="r.last.sub" :title="r.last.sub"></div>
+              </div>
+              <div class="num" style="color: var(--muted)" x-text="every(r.v.refresh_interval_seconds)"></div>
+              <div class="actions" @click.outside="menu === r.v.name && (menu = null)">
+                <button type="button" class="icon-btn" :aria-label="'Refresh ' + r.v.name + ' now'" title="Refresh now" @click="refresh(r.v.name)" :disabled="!!busy[r.v.name]">
+                  <svg :class="busy[r.v.name] && 'spin'" aria-hidden="true" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg>
+                </button>
+                <button type="button" class="icon-btn" :aria-label="'More actions for ' + r.v.name" :aria-expanded="menu === r.v.name" @click="menu = menu === r.v.name ? null : r.v.name">
+                  <svg aria-hidden="true" width="17" height="17" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>
+                </button>
+                <div class="menu" x-show="menu === r.v.name" x-cloak x-transition.opacity>
+                  <button type="button" @click="menu = null; edit(r.v.name)">Edit settings</button>
+                  <button type="button" @click="menu = null; askRebuild(r.v)">Rebuild from scratch…</button>
+                  <button type="button" style="color: var(--err)" @click="menu = null; askDelete(r.v)">Delete view…</button>
                 </div>
-              </template>
-
-              <!-- number -->
-              <template x-if="field.type === 'number'">
-                <div class="flex items-center gap-2">
-                  <input
-                    x-model.number="form[field.name]"
-                    type="number"
-                    :min="field.min"
-                    :placeholder="field.placeholder"
-                    class="w-28 bg-white border border-[rgba(15,15,30,0.12)] rounded-[10px]
-                           px-3 py-[10px] text-[13px] font-mono tabular-nums text-[#1a1a28]
-                           focus:outline-none focus:border-indigo-500/55
-                           focus:ring-2 focus:ring-indigo-500/[0.14]
-                           transition-[border-color,box-shadow] duration-150">
-                  <span x-show="field.suffix" x-text="field.suffix"
-                        class="text-[11px] font-mono text-[#888ca0]"></span>
-                </div>
-              </template>
-
-              <!-- string (single-line input) -->
-              <template x-if="field.type === 'string'">
-                <input
-                  x-model="form[field.name]"
-                  type="text"
-                  :placeholder="field.placeholder"
-                  :disabled="field.disabled_on_edit && editingView !== null"
-                  class="w-full bg-white border border-[rgba(15,15,30,0.12)] rounded-[10px]
-                         px-3 py-[10px] text-[13px] font-mono text-[#1a1a28] placeholder-[#b8b8c8]
-                         focus:outline-none focus:border-indigo-500/55
-                         focus:ring-2 focus:ring-indigo-500/[0.14]
-                         disabled:opacity-40 disabled:cursor-not-allowed
-                         transition-[border-color,box-shadow] duration-150">
-              </template>
-
-              <!-- boolean (checkbox) -->
-              <template x-if="field.type === 'boolean'">
-                <label class="inline-flex items-center gap-2 cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    x-model="form[field.name]"
-                    class="w-4 h-4 accent-indigo-600 cursor-pointer">
-                  <span class="text-[12px] font-mono text-[#1a1a28]"
-                        x-text="form[field.name] ? 'enabled' : 'disabled'"></span>
-                </label>
-              </template>
-
-              <!-- select (dropdown) -->
-              <template x-if="field.type === 'select'">
-                <select
-                  x-model="form[field.name]"
-                  :disabled="field.disabled_on_edit && editingView !== null"
-                  class="w-full bg-white border border-[rgba(15,15,30,0.12)] rounded-[10px]
-                         px-3 py-[10px] text-[13px] font-mono text-[#1a1a28]
-                         focus:outline-none focus:border-indigo-500/55
-                         focus:ring-2 focus:ring-indigo-500/[0.14]
-                         disabled:opacity-40 disabled:cursor-not-allowed
-                         transition-[border-color,box-shadow] duration-150">
-                  <template x-for="opt in field.options" :key="opt.value">
-                    <option :value="opt.value" x-text="opt.label"></option>
-                  </template>
-                </select>
-              </template>
-
+              </div>
             </div>
-          </template>
 
+            <template x-if="r.v.status && r.v.status.last_error">
+              <div class="alert" role="alert">
+                <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5M12 16.5v.01"/></svg>
+                <div><div class="msg" x-text="r.v.status.last_error"></div><div style="margin-top: 2px; opacity: .85" x-text="r.failingSince"></div></div>
+              </div>
+            </template>
+            <template x-if="r.v.status && r.v.status.note && !r.v.status.last_error">
+              <div class="note" x-text="r.v.status.note"></div>
+            </template>
+
+            <template x-if="open === r.v.name">
+              <div class="detail">
+                <div class="detail-main">
+                  <div class="facts">
+                    <template x-for="f in facts(r.v)" :key="f[0]"><span class="fact"><span x-text="f[0]"></span><span x-text="f[1]"></span></span></template>
+                  </div>
+                  <pre class="sql" x-text="r.v.query.trim()"></pre>
+                  <div class="lineage">
+                    <span>Lineage</span>
+                    <template x-if="r.up"><span style="display: contents"><button type="button" class="node" @click="toggle(r.up.name)" x-text="r.up.name"></button><span aria-hidden="true">→</span></span></template>
+                    <template x-if="!r.up"><span style="display: contents"><span class="node" x-text="short(r.v.source_table)"></span><span aria-hidden="true">→</span></span></template>
+                    <span class="node self" x-text="r.v.name"></span>
+                    <template x-for="d in r.down" :key="d.name"><span style="display: contents"><span aria-hidden="true">→</span><button type="button" class="node" @click="toggle(d.name)" x-text="d.name"></button></span></template>
+                  </div>
+                </div>
+                <div class="detail-side">
+                  <div class="h3">Recent queries</div>
+                  <div class="queries">
+                    <template x-for="qi in (r.v.status?.recent_queries || []).slice(0, 6)" :key="qi.query_id">
+                      <a class="query" :href="qi.info_uri || null" target="_blank" rel="noopener" :title="qi.query_id">
+                        <span class="num" style="color: var(--muted)" x-text="clock(qi.started_at)"></span>
+                        <span style="font-size: 12px; font-weight: 500" :style="'color:' + (qi.stage.startsWith('maintenance') ? 'var(--muted)' : 'var(--accent)')" x-text="stageLabel(qi.stage)"></span>
+                        <span class="num sub" x-text="queryWhat(qi)" :title="queryWhat(qi)"></span>
+                        <span class="num" style="text-align: right" x-text="secs(qi.elapsed_ms / 1000)"></span>
+                        <svg x-show="qi.info_uri" aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--label)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg>
+                      </a>
+                    </template>
+                    <div class="query" x-show="!(r.v.status?.recent_queries || []).length"><span class="sub" style="grid-column: 1 / -1">No queries yet.</span></div>
+                  </div>
+                  <div class="maint" x-show="maintenance(r.v)" x-text="maintenance(r.v)"></div>
+                  <div class="btns">
+                    <button type="button" class="btn btn-sm" @click="edit(r.v.name)">Edit settings</button>
+                    <button type="button" class="btn btn-sm" @click="askRebuild(r.v)">Rebuild…</button>
+                    <button type="button" class="btn btn-sm btn-danger" @click="askDelete(r.v)">Delete view…</button>
+                  </div>
+                </div>
+              </div>
+            </template>
           </div>
+        </template>
+        <div class="empty-row" x-show="rows.length === 0">No views match this filter.</div>
+      </div>
+    </div>
+  </div>
+  <p class="sub" x-show="!loaded">Loading…</p>
+</main>
+
+<!-- ════════════ New / edit view ════════════ -->
+<main x-show="page === 'form'" x-cloak>
+  <a class="back" href="#"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg>All views</a>
+  <h1 class="title" x-text="editing ? 'Edit ' + editing : 'New view'"></h1>
+  <p class="lead" x-show="!editing">Write the query you would put after <code>CREATE MATERIALIZED VIEW … AS</code>. iceberg-ivm works out the rest and keeps the target table up to date.</p>
+  <p class="lead" x-show="editing">A view's query and table can't change. To change them, create a new view.</p>
+
+  <form class="cols2" @submit.prevent="save()" novalidate>
+    <section class="card form-main">
+      <div class="field">
+        <label for="f-query">Query</label>
+        <textarea id="f-query" class="input" rows="11" spellcheck="false" x-model="form.query" @input="checkQuery()" :disabled="!!editing"
+                  placeholder="SELECT date_trunc('minute', ts) AS minute,&#10;       symbol,&#10;       min_by(price, ts) AS open,&#10;       max(price)        AS high,&#10;       min(price)        AS low,&#10;       max_by(price, ts) AS close&#10;FROM iceberg.market_data.trades&#10;GROUP BY 1, 2"></textarea>
+      </div>
+      <template x-if="parsed && !parseError">
+        <div class="verdict ok" role="status">
+          <div class="verdict-title"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg><span x-text="editing ? 'Maintained incrementally' : 'Ready to create'"></span></div>
+          <ul>
+            <li>Watches <code x-text="parsed.source_table"></code> for new snapshots</li>
+            <li>Recomputes only the <strong x-text="parsed.granularity"></strong> buckets that new rows of <code x-text="parsed.filter_column"></code> fall into</li>
+            <li>Writes them with one atomic <code>MERGE</code> keyed on <code x-text="parsed.merge_keys.join(', ')"></code></li>
+          </ul>
         </div>
       </template>
+      <template x-if="parseError">
+        <div class="verdict bad" role="alert">
+          <div class="verdict-title"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5M12 16.5v.01"/></svg>This query can't be maintained incrementally</div>
+          <p x-text="parseError"></p>
+        </div>
+      </template>
+      <details style="margin-top: 18px; border-top: 1px solid var(--line2); padding-top: 14px">
+        <summary class="hint" style="cursor: pointer; font-weight: 500">What queries are supported?</summary>
+        <p class="hint" style="margin: 8px 0 0">One Iceberg source table, no joins or subqueries, and a <code>date_trunc('&lt;unit&gt;', col)</code> bucket that is selected and in the <code>GROUP BY</code>. Any aggregate works, including <code>min_by</code>, <code>max_by</code>, <code>approx_percentile</code> and <code>count(DISTINCT …)</code>. <code>LIMIT</code> and window functions aren't supported.</p>
+      </details>
+    </section>
 
+    <section class="form-side">
+      <div class="card">
+        <div class="field">
+          <label for="f-target">Target table</label>
+          <input id="f-target" class="input mono" x-model="form.target_table" placeholder="iceberg.analytics.ohlcv_1m" :disabled="!!editing" autocomplete="off">
+          <span class="hint">Created on the first refresh if it doesn't exist.</span>
+        </div>
+        <div class="field">
+          <label for="f-name">Name <span class="opt">optional</span></label>
+          <input id="f-name" class="input" x-model="form.name" :placeholder="form.target_table || 'defaults to the target table'" :disabled="!!editing" autocomplete="off">
+        </div>
+        <div class="grid2">
+          <div class="field">
+            <label for="f-every">Check every</label>
+            <div class="with-unit"><input id="f-every" class="input" type="number" min="1" x-model="form.refresh_interval_seconds"><span>sec</span></div>
+          </div>
+          <div class="field">
+            <label for="f-chunk">Backfill in</label>
+            <select id="f-chunk" class="input" x-model="form.full_refresh_chunk">
+              <option value="">one query</option>
+              <template x-for="c in chunkSizes" :key="c"><option :value="c" x-text="chunkLabel(c)" :selected="form.full_refresh_chunk === c"></option></template>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <details class="card">
+        <summary><svg class="chev" aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>Advanced</summary>
+        <div style="margin-top: 14px">
+          <div class="field">
+            <label for="f-part">Target partitioning</label>
+            <input id="f-part" class="input mono" x-model="form.target_partitioning" :placeholder="'ARRAY[\'day(' + (parsed?.bucket_alias || 'bucket') + ')\']'" :disabled="!!editing">
+            <span class="hint">Used when the table is created. Partitioning by the bucket keeps refreshes fast.</span>
+          </div>
+          <div class="field">
+            <label for="f-timeout">Timeout per refresh</label>
+            <div class="with-unit"><input id="f-timeout" class="input" type="number" min="1" placeholder="none" x-model="form.query_timeout_seconds"><span>sec</span></div>
+          </div>
+        </div>
+      </details>
+
+      <details class="card" :open="form.maintenance">
+        <summary><svg class="chev" aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>Table maintenance <span class="opt" x-text="form.maintenance ? 'every ' + form.maintenance_hours + ' h' : 'off'"></span></summary>
+        <div style="margin-top: 14px; display: flex; flex-direction: column; gap: 12px">
+          <label class="check"><input type="checkbox" x-model="form.maintenance">Maintain the target table</label>
+          <template x-if="form.maintenance">
+            <div style="display: flex; flex-direction: column; gap: 12px">
+              <div class="field">
+                <label for="f-mh">Run at most every</label>
+                <div class="with-unit"><input id="f-mh" class="input" type="number" min="1" x-model="form.maintenance_hours"><span>hours</span></div>
+              </div>
+              <label class="check"><input type="checkbox" x-model="form.optimize">Compact small files (optimize)</label>
+              <label class="check"><input type="checkbox" x-model="form.expire_snapshots">Expire snapshots older than <input class="input" x-model="form.expire_snapshots_retention" aria-label="Snapshot retention"></label>
+              <label class="check"><input type="checkbox" x-model="form.remove_orphan_files">Remove orphan files older than <input class="input" x-model="form.remove_orphan_files_retention" aria-label="Orphan file retention"></label>
+            </div>
+          </template>
+        </div>
+      </details>
+
+      <div class="form-error" x-show="formError" x-text="formError" role="alert"></div>
+      <div class="form-actions">
+        <a class="btn" href="#">Cancel</a>
+        <button type="submit" class="btn btn-primary" :disabled="saving || (!editing && (!parsed || !!parseError))" x-text="saving ? 'Saving…' : (editing ? 'Save changes' : 'Create view')"></button>
+      </div>
+    </section>
+  </form>
+</main>
+
+<footer>
+  <span x-text="'iceberg-ivm ' + (info.version || '')"></span> · Times in UTC · Updates every 5 seconds ·
+  <a href="/metrics">Prometheus metrics</a> · <a href="https://github.com/jonasbrami/iceberg-ivm#readme" target="_blank" rel="noopener">Docs</a>
+</footer>
+</div>
+
+<div class="scrim" x-show="dialog" x-cloak @click.self="dialog = null" x-transition.opacity>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dlg-title">
+    <h2 id="dlg-title" x-text="dialog?.title"></h2>
+    <p x-text="dialog?.body"></p>
+    <div class="form-actions">
+      <button type="button" class="btn" @click="dialog = null">Cancel</button>
+      <button type="button" class="btn" :class="dialog?.danger ? 'btn-danger-solid' : 'btn-primary'" x-text="dialog?.confirm" @click="const run = dialog.run; dialog = null; run()"></button>
     </div>
-
-    <!-- Form error -->
-    <div x-show="formError"
-         class="mx-6 -mt-1 mb-1 text-[11px] font-mono text-red-700 leading-relaxed
-                bg-red-500/[0.08] border border-red-500/[0.22] rounded-lg px-4 py-3"
-         x-text="formError"></div>
-
-    <!-- Modal footer -->
-    <div class="flex justify-end items-center gap-2.5 px-6 py-[18px]
-                border-t border-[rgba(15,15,30,0.08)]">
-      <button @click="showForm = false"
-              class="px-4 py-[8px] text-[13px] font-medium text-[#666684] hover:text-[#1a1a28]
-                     hover:bg-[rgba(15,15,30,0.04)] rounded-lg
-                     transition-all duration-150">
-        Cancel
-      </button>
-      <button @click="submitForm()"
-              class="px-5 py-[8px] bg-indigo-600 hover:bg-indigo-500 text-[13px] font-semibold text-white
-                     rounded-lg transition-colors duration-150 active:scale-[0.97]
-                     shadow-[0_0_0_1px_rgba(99,102,241,0.4),0_4px_14px_rgba(99,102,241,0.2)]">
-        <span x-text="editingView ? 'Save Changes' : 'Create View'"></span>
-      </button>
-    </div>
-
   </div>
 </div>
 
-<!-- ── Alpine.js logic ──────────────────────────────────────────── -->
+<div class="toast" x-show="toast" x-cloak x-transition.opacity :class="toast?.error && 'err'" role="status" aria-live="polite" x-text="toast?.text"></div>
+
 <script>
+const CHUNK_LABELS = { minute: 'minute chunks', hour: 'hourly chunks', day: 'daily chunks', week: 'weekly chunks',
+                       month: 'monthly chunks', quarter: 'quarterly chunks', year: 'yearly chunks' };
+const STAGES = { merge: 'Merge', chunk_merge: 'Chunk merge', maintenance_optimize: 'Optimize',
+                 maintenance_expire_snapshots: 'Expire snapshots', maintenance_remove_orphan_files: 'Remove orphans' };
+
 function app() {
   return {
-    views: [],
-    showForm: false,
-    editingView: null,
-    formError: '',
-    refreshing: {},
-    schema: [],
-    form: {},
-
-    // ── live query parsing (populates as the operator types) ──
-    parsed: null,          // { source_table, filter_column, granularity, merge_keys }
-    parseError: '',        // human-readable error from /api/views/parse
-    parsing: false,        // in-flight indicator
-    _parseTimer: null,     // debounce handle
-
-    // Status badges for one view. Rendered via <template x-for>.
-    badges(view) {
-      const st = view.status;
-      const out = [];
-      const action = st?.last_action || 'pending';
-      const tbl = {
-        pending:      {label: 'pending',     cls: 'bg-[#f0f0f6] text-[#888ca0] border-[rgba(15,15,30,0.06)]', dotCls: 'bg-[#c0c0d0]', pulse: false},
-        skip:         {label: 'idle',        cls: 'bg-[#f0f0f6] text-[#666684] border-[rgba(15,15,30,0.06)]', dotCls: 'bg-[#a8a8c0]', pulse: false},
-        incremental:  {label: 'incremental', cls: 'bg-emerald-500/[0.10] text-emerald-700 border-emerald-500/[0.3]', dotCls: 'bg-emerald-500', pulse: true},
-        full:         {label: 'full',        cls: 'bg-amber-500/[0.12] text-amber-700 border-amber-500/[0.3]',     dotCls: 'bg-amber-500',   pulse: true},
-        chunked_full: {label: 'backfill',    cls: 'bg-amber-500/[0.12] text-amber-700 border-amber-500/[0.3]',     dotCls: 'bg-amber-500',   pulse: true},
-        chunked_incremental: {label: 'catch-up', cls: 'bg-emerald-500/[0.10] text-emerald-700 border-emerald-500/[0.3]', dotCls: 'bg-emerald-500', pulse: true},
-        waiting:      {label: 'waiting',     cls: 'bg-[#f0f0f6] text-[#666684] border-[rgba(15,15,30,0.06)]', dotCls: 'bg-[#a8a8c0]', pulse: false},
-      };
-      if (tbl[action]) out.push(tbl[action]);
-      if (st?.last_error) {
-        out.push({label: 'error', cls: 'bg-red-500/[0.10] text-red-700 border-red-500/[0.3]', dotCls: 'bg-red-500', pulse: false});
-      }
-      return out;
-    },
-
-    get schemaRows() {
-      // Group consecutive fields sharing the same non-null `group` into a single row.
-      const rows = [];
-      let current = null;
-      for (const f of this.schema) {
-        if (f.group && current && current[0].group === f.group) {
-          current.push(f);
-        } else {
-          current = [f];
-          rows.push(current);
-        }
-      }
-      return rows;
-    },
+    views: [], info: {}, loaded: false, offline: false, now: Date.now(),
+    page: 'list', editing: null, open: null, filter: 'all', q: '', menu: null, dialog: null, toast: null,
+    busy: {}, dark: false,
+    form: {}, parsed: null, parseError: '', formError: '', saving: false, _parseTimer: null, _toastTimer: null,
 
     async init() {
-      await this.loadSchema();
-      this.resetForm();
-      await this.loadViews();
-      setInterval(() => this.loadViews(), 5000);
+      const set = document.documentElement.dataset.theme;
+      this.dark = set ? set === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+      window.addEventListener('hashchange', () => this.route());
+      await Promise.all([this.load(), this.loadInfo()]);
+      this.route();
+      setInterval(() => this.load(), 5000);
+      setInterval(() => { this.now = Date.now(); }, 1000);
     },
 
-    async loadSchema() {
-      try {
-        const res = await fetch('/api/views/schema');
-        this.schema = await res.json();
-      } catch (e) {
-        console.error('Failed to load form schema:', e);
-      }
-    },
-
-    async loadViews() {
+    async load() {
       try {
         const res = await fetch('/api/views');
+        if (!res.ok) throw new Error(res.statusText);
         this.views = await res.json();
+        this.offline = false;
       } catch (e) {
-        console.error('Failed to load views:', e);
+        this.offline = true;
       }
+      this.loaded = true;
+    },
+    async loadInfo() {
+      try { this.info = await (await fetch('/api/info')).json(); } catch (e) { /* the header just stays empty */ }
     },
 
-    resetForm() {
-      const fresh = {};
-      for (const f of this.schema) {
-        fresh[f.name] = f.default !== undefined ? f.default
-                      : f.type === 'number' ? null
-                      : '';
-      }
-      this.form = fresh;
-      this.formError = '';
-      this.parsed = null;
-      this.parseError = '';
-      this.parsing = false;
-      if (this._parseTimer) { clearTimeout(this._parseTimer); this._parseTimer = null; }
+    route() {
+      const h = decodeURIComponent(location.hash.slice(1));
+      if (h === 'new') this.startForm(null);
+      else if (h.startsWith('edit/')) this.startForm(h.slice(5));
+      else { this.page = 'list'; this.editing = null; }
+      window.scrollTo(0, 0);
+    },
+    toggle(name) { this.open = this.open === name ? null : name; },
+    edit(name) { location.hash = 'edit/' + encodeURIComponent(name); },
+    toggleTheme() {
+      this.dark = !this.dark;
+      const t = this.dark ? 'dark' : 'light';
+      document.documentElement.dataset.theme = t;
+      try { localStorage.setItem('ivm-theme', t); } catch (e) {}
+    },
+    notify(text, error = false) {
+      this.toast = { text, error };
+      clearTimeout(this._toastTimer);
+      this._toastTimer = setTimeout(() => { this.toast = null; }, error ? 8000 : 4000);
     },
 
-    // Debounce-parse the current query. Called from the textarea's @input.
-    scheduleParse() {
-      if (this._parseTimer) clearTimeout(this._parseTimer);
-      const q = (this.form.query || '').trim();
-      if (!q) {
-        this.parsed = null;
-        this.parseError = '';
-        this.parsing = false;
-        return;
+    // ── what each row shows ──
+    state(v) {
+      const st = v.status || {};
+      if (st.last_error) return { key: 'failing', label: 'Failing' };
+      if (st.running && st.chunks_total) return { key: 'backfill', label: st.last_action === 'chunked_incremental' ? 'Catching up' : 'Backfilling', pulse: true };
+      if (st.running || this.busy[v.name]) return { key: 'running', label: 'Refreshing', pulse: true };
+      if (st.last_action === 'waiting') return { key: 'waiting', label: 'Waiting' };
+      if (!st.last_checked && !st.total_refreshes) return { key: 'new', label: 'Not started' };
+      return { key: 'healthy', label: 'Healthy' };
+    },
+    lag(v) {
+      const st = v.status || {};
+      if (st.data_as_of == null) return null;
+      return Math.max(0, (st.source_committed_at ?? st.data_as_of) - st.data_as_of);
+    },
+    freshness(v, state) {
+      const st = v.status || {};
+      const title = st.last_checked ? 'Last checked ' + this.ago(st.last_checked) : 'Not checked yet';
+      if (state.key === 'backfill') {
+        return { progress: Math.round(100 * st.chunks_done / st.chunks_total) + '%', text: st.chunks_done + ' / ' + st.chunks_total, title,
+                 sub: (st.last_action === 'chunked_incremental' ? 'catching up' : 'backfilling') + ' in ' + this.chunkLabel(v.full_refresh_chunk) };
       }
-      this._parseTimer = setTimeout(() => this.runParse(q), 350);
+      const lag = this.lag(v);
+      if (lag == null) {
+        const why = st.last_error ? 'no successful refresh yet' : st.note ? 'source table missing'
+          : !st.last_checked ? 'waiting for the first check' : st.source_committed_at == null ? 'the source table is empty' : 'first refresh pending';
+        return { text: 'No data yet', tone: 'muted', title, sub: why };
+      }
+      const sub = 'data as of ' + this.clock(st.data_as_of);
+      const silent = st.last_checked ? this.now / 1000 - st.last_checked : 0;
+      if (silent > 3 * v.refresh_interval_seconds + 30 && !st.running) return { text: 'Not checked for ' + this.dur(silent), tone: 'warn', sub, title };
+      if (lag < 1) return { text: 'Up to date', tone: 'ink', sub, title };
+      const tone = st.last_error ? 'err' : lag > 2 * v.refresh_interval_seconds ? 'warn' : 'ink';
+      return { text: this.dur(lag) + ' behind', tone, sub, title };
+    },
+    lastRefresh(v) {
+      const st = v.status || {};
+      if (!st.last_refresh) return { text: '—', sub: st.last_error ? 'no successful refresh yet' : 'no refresh yet' };
+      const q = (st.recent_queries || []).find((x) => x.stage.endsWith('merge'));
+      const parts = [st.last_duration != null ? this.secs(st.last_duration) : null, q && q.range_start ? this.range(q.range_start, q.range_end) : null];
+      return { text: this.ago(st.last_refresh), sub: parts.filter(Boolean).join(' · ') };
+    },
+    get decorated() {
+      return this.views.map((v) => {
+        const state = this.state(v);
+        const st = v.status || {};
+        return {
+          v, state, fresh: this.freshness(v, state), last: this.lastRefresh(v), lag: this.lag(v),
+          up: this.views.find((x) => x.target_table === v.source_table) || null,
+          down: this.views.filter((x) => x.source_table === v.target_table),
+          failingSince: st.total_errors
+            ? 'Retrying every ' + this.every(v.refresh_interval_seconds) + ' (' + st.total_errors + (st.total_errors === 1 ? ' failure' : ' failures') +
+              ' so far). The bookmark only moves after a successful refresh, so no data is skipped.'
+            : '',
+        };
+      });
+    },
+    get rows() {
+      const q = this.q.trim().toLowerCase();
+      return this.decorated.filter((r) => {
+        if (this.filter === 'running' && !['running', 'backfill'].includes(r.state.key)) return false;
+        if (this.filter === 'failing' && r.state.key !== 'failing') return false;
+        return !q || [r.v.name, r.v.source_table, r.v.target_table].some((s) => s.toLowerCase().includes(q));
+      });
+    },
+    get counts() {
+      const d = this.decorated;
+      const running = d.filter((r) => ['running', 'backfill'].includes(r.state.key));
+      const failing = d.filter((r) => r.state.key === 'failing');
+      const behind = d.filter((r) => r.lag > 0).sort((a, b) => b.lag - a.lag)[0];
+      return {
+        healthy: d.filter((r) => r.state.key === 'healthy').length,
+        running: running.length, runningNames: running.map((r) => r.v.name).join(', '),
+        failing: failing.length, failingNames: failing.map((r) => r.v.name).join(', '),
+        worst: behind ? { name: behind.v.name, lag: behind.lag } : null,
+      };
+    },
+    get chips() {
+      const c = this.counts;
+      return [{ id: 'all', label: 'All', n: this.views.length }, { id: 'running', label: 'Running', n: c.running }, { id: 'failing', label: 'Failing', n: c.failing }];
+    },
+    facts(v) {
+      const f = [['Time column', v.filter_column], ['Bucket', v.granularity], ['Merge keys', v.merge_keys.join(', ')],
+                 ['Partitioned by', v.target_partitioning || 'none']];
+      if (v.full_refresh_chunk) f.push(['Backfill', this.chunkLabel(v.full_refresh_chunk)]);
+      if (v.query_timeout_seconds) f.push(['Timeout', this.every(v.query_timeout_seconds)]);
+      return f;
+    },
+    maintenance(v) {
+      const ops = Object.entries(v.status?.maintenance || {}).filter(([, s]) => s.last_run);
+      if (!ops.length) return v.maintenance_interval_seconds ? 'Maintenance every ' + this.every(v.maintenance_interval_seconds) + ', not run yet' : '';
+      return 'Maintenance: ' + ops.map(([op, s]) => op.replaceAll('_', ' ') + ' ' + this.ago(s.last_run) + (s.last_error ? ' (failed)' : '')).join(' · ');
+    },
+    stageLabel(stage) { return STAGES[stage] || stage; },
+    queryWhat(qi) {
+      const parts = [];
+      if (qi.range_start) parts.push(this.range(qi.range_start, qi.range_end));
+      if (qi.processed_rows) parts.push(this.rowsFmt(qi.processed_rows) + ' rows');
+      return parts.join(' · ') || 'table maintenance';
     },
 
-    async runParse(q) {
-      this.parsing = true;
-      try {
-        const res = await fetch('/api/views/parse', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ query: q }),
-        });
-        if (res.ok) {
-          this.parsed = await res.json();
-          this.parseError = '';
-        } else {
-          const body = await res.json().catch(() => ({ detail: 'parse failed' }));
-          this.parsed = null;
-          this.parseError = body.detail || 'parse failed';
-        }
-      } catch (e) {
-        this.parsed = null;
-        this.parseError = e.message || 'network error';
-      } finally {
-        this.parsing = false;
-      }
-    },
-
-    editView(view) {
-      // Cancel any debounced parse from the previous form session so a stale
-      // timer can't fire after we've already populated the panel below.
-      if (this._parseTimer) { clearTimeout(this._parseTimer); this._parseTimer = null; }
-      this.editingView = view.name;
-      const populated = {};
-      for (const f of this.schema) {
-        const v = view[f.name];
-        populated[f.name] = v != null ? v : '';
-      }
-      this.form = populated;
-      this.formError = '';
-      this.parsed = null;
-      this.parseError = '';
-      this.showForm = true;
-      // Populate the parsed panel immediately so the user sees the
-      // current derivation without the 350ms debounce.
-      const q = (this.form.query || '').trim();
-      if (q) this.runParse(q);
-    },
-
-    buildBody() {
-      const body = {};
-      for (const f of this.schema) {
-        const raw = this.form[f.name];
-        if (f.type === 'boolean') {
-          body[f.name] = !!raw;
-        } else if (f.type === 'number') {
-          // Alpine's `x-model.number` turns empty inputs into `null`, which
-          // Pydantic rejects with a 422 on int fields like
-          // `maintenance_interval_seconds: int = 0`. Omit the field entirely
-          // so the server-side default kicks in. Required numeric fields are
-          // already guarded by validateForm() before we get here.
-          if (raw === null || raw === undefined || raw === '') continue;
-          body[f.name] = raw;
-        } else if (f.required) {
-          body[f.name] = raw;
-        } else {
-          body[f.name] = raw || null;
-        }
-      }
+    // ── actions ──
+    async call(method, url) {
+      const res = await fetch(url, { method });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.detail || res.statusText);
       return body;
     },
-
-    validateForm() {
-      for (const f of this.schema) {
-        if (!f.required) continue;
-        const v = this.form[f.name];
-        if (v === '' || v == null) return `${f.label} is required.`;
-      }
-      return null;
+    setBusy(name, value) {
+      const next = { ...this.busy };
+      if (value) next[name] = value; else delete next[name];
+      this.busy = next;
+    },
+    async refresh(name) {
+      this.setBusy(name, 'refresh');
+      try {
+        const r = await this.call('POST', '/api/views/' + encodeURIComponent(name) + '/refresh');
+        if (r.last_error) this.notify(name + ': ' + r.last_error, true);
+        else this.notify(name + ': ' + ({ skip: 'no new data', waiting: 'waiting for its source' }[r.last_action] || 'refreshed'));
+      } catch (e) { this.notify(name + ': ' + e.message, true); }
+      this.setBusy(name, null);
+      this.load();
+    },
+    askRebuild(v) {
+      this.dialog = {
+        title: 'Rebuild ' + v.name + '?', confirm: 'Rebuild',
+        body: 'Every bucket is recomputed from ' + v.source_table + '. The target table stays readable while it runs; on a large source this can take a while.',
+        run: async () => {
+          this.setBusy(v.name, 'rebuild');
+          this.notify('Rebuilding ' + v.name + '…');
+          try {
+            const r = await this.call('POST', '/api/views/' + encodeURIComponent(v.name) + '/rebuild');
+            this.notify(r.last_error ? v.name + ': ' + r.last_error : v.name + ' rebuilt', !!r.last_error);
+          } catch (e) { this.notify(v.name + ': ' + e.message, true); }
+          this.setBusy(v.name, null);
+          this.load();
+        },
+      };
+    },
+    askDelete(v) {
+      this.dialog = {
+        title: 'Delete ' + v.name + '?', confirm: 'Delete view', danger: true,
+        body: 'iceberg-ivm stops maintaining it. The table ' + v.target_table + ' and its data are kept; drop it in Trino if you want them gone.',
+        run: async () => {
+          try {
+            await this.call('DELETE', '/api/views/' + encodeURIComponent(v.name));
+            if (this.open === v.name) this.open = null;
+            this.notify('Deleted ' + v.name);
+          } catch (e) { this.notify(e.message, true); }
+          this.load();
+        },
+      };
     },
 
-    async submitForm() {
+    // ── form ──
+    get chunkSizes() { return this.parsed?.chunk_sizes || Object.keys(CHUNK_LABELS); },
+    chunkLabel(c) { return CHUNK_LABELS[c] || c; },
+    startForm(name) {
+      const v = name ? this.views.find((x) => x.name === name) : null;
+      if (name && !v) { location.hash = ''; return; }
+      this.editing = v ? v.name : null;
+      this.formError = ''; this.parseError = ''; this.parsed = null; this.saving = false;
+      this.form = {
+        query: v?.query || '', target_table: v?.target_table || '', name: v && v.name !== v.target_table ? v.name : '',
+        refresh_interval_seconds: v?.refresh_interval_seconds ?? 60, full_refresh_chunk: v?.full_refresh_chunk || '',
+        target_partitioning: v?.target_partitioning || '', query_timeout_seconds: v?.query_timeout_seconds ?? '',
+        maintenance: !!v?.maintenance_interval_seconds,
+        maintenance_hours: v?.maintenance_interval_seconds ? +(v.maintenance_interval_seconds / 3600).toFixed(2) : 24,
+        optimize: v?.optimize ?? true, expire_snapshots: v?.expire_snapshots ?? true, remove_orphan_files: v?.remove_orphan_files ?? true,
+        expire_snapshots_retention: v?.expire_snapshots_retention || '7d', remove_orphan_files_retention: v?.remove_orphan_files_retention || '7d',
+        optimize_file_size_threshold: v?.optimize_file_size_threshold || null,
+      };
+      this.page = 'form';
+      if (v) this.checkQuery(0);
+      this.$nextTick(() => document.getElementById(v ? 'f-every' : 'f-query')?.focus());
+    },
+    checkQuery(delay = 300) {
+      clearTimeout(this._parseTimer);
+      const query = this.form.query;
+      if (!query.trim()) { this.parsed = null; this.parseError = ''; return; }
+      this._parseTimer = setTimeout(async () => {
+        try {
+          const res = await fetch('/api/views/parse', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query }) });
+          const body = await res.json();
+          if (query !== this.form.query) return;
+          const detail = String(body.detail || 'invalid query');
+          if (res.ok) { this.parsed = body; this.parseError = ''; } else { this.parsed = null; this.parseError = detail[0].toUpperCase() + detail.slice(1) + '.'; }
+          if (this.parsed && this.form.full_refresh_chunk && !this.parsed.chunk_sizes.includes(this.form.full_refresh_chunk)) this.form.full_refresh_chunk = '';
+        } catch (e) { this.parseError = 'Could not check the query: ' + e.message; }
+      }, delay);
+    },
+    body() {
+      const f = this.form;
+      const num = (x) => (x === '' || x == null ? null : Number(x));
+      return {
+        name: f.name.trim() || null, query: f.query, target_table: f.target_table.trim(),
+        target_partitioning: f.target_partitioning.trim() || null,
+        refresh_interval_seconds: num(f.refresh_interval_seconds) ?? 60,
+        query_timeout_seconds: num(f.query_timeout_seconds),
+        full_refresh_chunk: f.full_refresh_chunk || null,
+        maintenance_interval_seconds: f.maintenance ? Math.round((num(f.maintenance_hours) || 0) * 3600) : 0,
+        optimize: f.optimize, expire_snapshots: f.expire_snapshots, remove_orphan_files: f.remove_orphan_files,
+        expire_snapshots_retention: f.expire_snapshots_retention || '7d', remove_orphan_files_retention: f.remove_orphan_files_retention || '7d',
+        optimize_file_size_threshold: f.optimize_file_size_threshold,
+      };
+    },
+    async save() {
       this.formError = '';
-      const err = this.validateForm();
-      if (err) { this.formError = err; return; }
-      if (this.parseError) { this.formError = this.parseError; return; }
-
-      const body = this.buildBody();
-
+      if (!this.form.query.trim()) { this.formError = 'Write a query first.'; return; }
+      if (!this.form.target_table.trim()) { this.formError = 'Enter the target table, like iceberg.analytics.ohlcv_1m.'; return; }
+      this.saving = true;
       try {
-        const url = this.editingView ? `/api/views/${this.editingView}` : '/api/views';
-        const method = this.editingView ? 'PUT' : 'POST';
-        const res = await fetch(url, {
-          method,
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-        });
-        if (!res.ok) {
-          const e = await res.json().catch(() => ({}));
-          throw new Error(this._formatErrorDetail(e.detail, res.statusText));
-        }
-        this.showForm = false;
-        await this.loadViews();
-      } catch (e) {
-        this.formError = e.message;
-      }
-    },
-
-    _formatErrorDetail(detail, fallback) {
-      // FastAPI returns either a plain string (HTTPException) or an array of
-      // {loc, msg, type, ctx} (Pydantic validation). new Error([obj]) would
-      // render as "[object Object]" — flatten to a human-readable string.
-      if (!detail) return fallback || 'request failed';
-      if (typeof detail === 'string') return detail;
-      if (Array.isArray(detail)) {
-        return detail
-          .map(d => {
-            const loc = Array.isArray(d.loc) ? d.loc.slice(1).join('.') : '';
-            return loc ? `${loc}: ${d.msg}` : (d.msg || JSON.stringify(d));
-          })
-          .join('; ');
-      }
-      return JSON.stringify(detail);
-    },
-
-    async deleteView(name) {
-      if (!confirm(`Delete view "${name}"?`)) return;
-      await fetch(`/api/views/${name}`, { method: 'DELETE' });
-      await this.loadViews();
-    },
-
-    async triggerRefresh(name) {
-      this.refreshing = { ...this.refreshing, [name]: true };
-      try {
-        const res = await fetch(`/api/views/${name}/refresh`, { method: 'POST' });
+        const url = this.editing ? '/api/views/' + encodeURIComponent(this.editing) : '/api/views';
+        const res = await fetch(url, { method: this.editing ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(this.body()) });
         const body = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          this.showToast(`${name}: refresh failed — ${body.detail || res.statusText}`, 'error');
-        } else if (body.last_error) {
-          this.showToast(`${name}: ${body.last_error}`, 'error');
-        } else {
-          const action = body.last_action || 'done';
-          const label = { skip: 'no changes', full: 'full refresh', incremental: 'incremental refresh' }[action] || action;
-          this.showToast(`${name}: ${label}`, action === 'skip' ? 'muted' : 'success');
-        }
-        await this.loadViews();
-      } catch (e) {
-        this.showToast(`${name}: ${e.message || 'network error'}`, 'error');
-      } finally {
-        this.refreshing = { ...this.refreshing, [name]: false };
-      }
+        if (!res.ok) throw new Error(typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail || res.statusText));
+        this.notify((this.editing ? 'Saved ' : 'Created ') + body.name);
+        await this.load();
+        this.open = body.name;
+        location.hash = '';
+      } catch (e) { this.formError = e.message; }
+      this.saving = false;
     },
 
-    // ── toast ──
-    toast: { message: '', kind: 'muted' },
-    _toastTimer: null,
-    showToast(message, kind = 'muted') {
-      this.toast = { message, kind };
-      if (this._toastTimer) clearTimeout(this._toastTimer);
-      this._toastTimer = setTimeout(() => { this.toast = { message: '', kind }; }, 3500);
+    // ── formatting ──
+    host(url) { return (url || '').replace(/^https?:\/\//, '').replace(/\/$/, ''); },
+    short(table) { return table.split('.').pop(); },
+    secs(s) { return s < 10 ? s.toFixed(2) + 's' : s < 60 ? s.toFixed(1) + 's' : this.dur(s); },
+    dur(s) {
+      s = Math.round(s);
+      if (s < 60) return s + 's';
+      if (s < 3600) return Math.floor(s / 60) + 'm' + (s % 60 ? ' ' + String(s % 60).padStart(2, '0') + 's' : '');
+      if (s < 86400) return Math.floor(s / 3600) + 'h' + (Math.floor(s / 60) % 60 ? ' ' + (Math.floor(s / 60) % 60) + 'm' : '');
+      return Math.floor(s / 86400) + 'd' + (Math.floor(s / 3600) % 24 ? ' ' + (Math.floor(s / 3600) % 24) + 'h' : '');
     },
-
-    timeAgo(ts) {
-      const diff = Math.floor(Date.now() / 1000 - ts);
-      if (diff < 60)   return diff + 's ago';
-      if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
-      return Math.floor(diff / 3600) + 'h ago';
+    every(s) { return s % 3600 === 0 ? s / 3600 + 'h' : s % 60 === 0 ? s / 60 + 'm' : s + 's'; },
+    ago(epoch) {
+      const s = Math.max(0, this.now / 1000 - epoch);
+      return s < 5 ? 'just now' : this.dur(s) + ' ago';
     },
-
-    lastMaintenance(view) {
-      const ms = view.status?.maintenance;
-      if (!ms) return null;
-      let best = null;
-      for (const s of Object.values(ms)) {
-        if (s?.last_run && (!best || s.last_run > best.last_run)) best = s;
-      }
-      return best;
+    // Buckets are UTC (Trino sessions run in UTC), so every time is shown in UTC.
+    clock(epoch) { return new Date(epoch * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23', timeZone: 'UTC' }); },
+    range(a, b) {
+      const s = new Date(a), e = new Date(b), DAY = 86400000;
+      const day = (d) => d.toLocaleDateString([], { month: 'short', day: 'numeric', timeZone: 'UTC' });
+      const hm = (d) => d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hourCycle: 'h23', timeZone: 'UTC' });
+      if (s % DAY === 0 && e % DAY === 0) return e - s === DAY ? day(s) : day(s) + ' → ' + day(new Date(e - DAY));
+      return day(s) === day(new Date(e - 1)) ? day(s) + ' ' + hm(s) + '–' + hm(e) : day(s) + ' ' + hm(s) + ' → ' + day(e) + ' ' + hm(e);
     },
-
-    maintenanceTitle(view) {
-      const ms = view.status?.maintenance ?? {};
-      return Object.entries(ms)
-        .filter(([, s]) => s?.last_run)
-        .map(([op, s]) => `${op.replace(/_/g, ' ')}: ${this.timeAgo(s.last_run)}${s.last_error ? ' — ' + s.last_error : ''}`)
-        .join('\n');
-    },
-
-    formatRows(n) {
-      if (n == null) return '';
-      if (n < 1000) return String(n);
-      if (n < 1e6)  return (n / 1e3).toFixed(1).replace(/\.0$/, '') + 'K';
-      return (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M';
-    },
+    rowsFmt(n) { return n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : String(n); },
   };
 }
 </script>
-
 </body>
 </html>
