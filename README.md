@@ -5,9 +5,9 @@
 <h1 align="center">iceberg-ivm</h1>
 
 <p align="center">
-  <b>Incremental materialized views for Trino on Apache Iceberg.</b><br>
-  Write a <code>GROUP BY</code> query. iceberg-ivm keeps its result table up to date<br>
-  by recomputing only the time buckets that new data touched.
+  <b>Incremental materialized views on Apache Iceberg.</b><br>
+  Write a <code>GROUP BY</code> query over an Iceberg table. iceberg-ivm keeps its result,<br>
+  another Iceberg table, up to date by recomputing only the time buckets that new data touched.
 </p>
 
 <p align="center">
@@ -26,13 +26,13 @@
 
 ---
 
-Trino can refresh a materialized view incrementally only when the query doesn't aggregate. Add a `GROUP BY` and every refresh recomputes the whole table ([trinodb/trino#18673](https://github.com/trinodb/trino/issues/18673), still open in Trino 484). iceberg-ivm fills that gap without a new engine:
+Keeping an aggregate over a growing Iceberg table fresh usually means recomputing it from scratch on a schedule, or hand-writing incremental logic that misses late data. iceberg-ivm reads Iceberg's own metadata to see exactly which rows are new, and recomputes only the buckets they fall into ([how it compares](#how-it-compares)):
 
 - **Any aggregate.** It recomputes whole buckets from source rows, so `min_by`, `max_by`, `approx_percentile` and `count(DISTINCT …)` work, not only sums and counts.
 - **Exact.** Each refresh makes the affected time range of the target equal to the query, in one atomic `MERGE`: new groups are inserted, changed groups updated, and vanished groups deleted.
 - **Driven by Iceberg metadata.** It notices new snapshots and reads the min/max of the time column from file statistics, so it never scans data to find out what changed. Compaction costs nothing.
 - **Chainable.** A view's target is a plain Iceberg table, so it can be the source of the next view: trades → 1-minute bars → 1-hour bars.
-- **Small.** One Python service that sends SQL to Trino. Trino does all the work; the service keeps a bookmark per view in SQLite.
+- **Small, and not tied to one engine.** One Python service that reads Iceberg metadata and hands SQL to a query engine, which does all the work; the service only keeps a bookmark per view in SQLite. Today that engine is Trino. The method needs nothing more than Iceberg's metadata tables, time travel and `MERGE`, so other engines such as Spark could do the same job.
 
 ## Try it in two minutes
 
@@ -93,7 +93,9 @@ The rules:
 
 You can also create views from the UI. It checks the query as you type and shows what it derived. The UI works offline (no CDNs) and follows your system's light or dark theme.
 
-## Run it on your Trino
+## Run it
+
+iceberg-ivm currently runs its SQL on Trino (with the Iceberg connector). Point it at your cluster:
 
 ```yaml
 # docker-compose.yml
@@ -171,19 +173,33 @@ The Trino user needs `SELECT` on sources, `CREATE TABLE` in the target schema, a
 
 Other endpoints: `GET /api/views` (views with status), `POST /api/views` (create), `POST /api/views/parse` (check a query), `GET /health`.
 
-## When to use something else
+## How it compares
 
-| If you… | Consider |
-|---|---|
-| …only filter and project, without `GROUP BY` | Trino's own materialized views, which refresh those incrementally |
-| …already use dbt, batch hourly or coarser, and can bound late data with a lookback window | dbt-trino's `microbatch` strategy: same engine and whole-bucket recompute, run on a schedule rather than on new snapshots |
-| …can add another engine, and your sources are append-only with sum/count/min/max-style aggregates | StarRocks 4.1 incremental materialized views over Iceberg (results live in StarRocks) |
-| …are on Snowflake or Databricks-managed Iceberg | Dynamic tables, or Databricks materialized views |
+Only tools whose sources **and** results are Iceberg tables are listed. That's the setting iceberg-ivm is built for.
 
-iceberg-ivm fits when **Trino is your engine, Iceberg is your storage, and you need aggregates kept fresh within seconds or minutes of each commit**, including the ones that can't be added up from partial results.
+| | Runs on | Refreshes when | Aggregates refreshed incrementally | Late-arriving rows |
+|---|---|---|---|---|
+| **iceberg-ivm** | Trino | a new snapshot lands (checked every few seconds) | ✅ any aggregate: the touched buckets are recomputed | ✅ any age, found from file statistics |
+| Trino materialized views | Trino | you run `REFRESH MATERIALIZED VIEW` | ❌ a `GROUP BY` means a full refresh | — |
+| dbt-trino `microbatch` | Trino | the next scheduled run | ✅ any aggregate: whole batches (an hour or more) are recomputed | ⚠️ only within the lookback window |
+| SQLMesh `INCREMENTAL_BY_TIME_RANGE` | Trino, Spark, … | its cron schedule | ✅ any aggregate: whole intervals are recomputed | ⚠️ only intervals not yet processed, unless you restate them |
+| Hive 4 materialized views | Hive | `ALTER MATERIALIZED VIEW … REBUILD` | ⚠️ only SUM, COUNT, MIN, MAX and AVG over inserts | ✅ for those aggregates |
+| AWS Glue materialized views | Spark on Glue | a schedule (10 minutes at best) | ⚠️ partly; the supported functions aren't documented | — |
+| Snowflake dynamic tables | Snowflake | the target lag you set | ✅ broadly, including MIN_BY / MAX_BY | ✅ |
+
+As of November 2026.
+
+**iceberg-ivm or dbt `microbatch`?** Both run on Trino and recompute whole time buckets, so any aggregate stays correct. The difference is in what drives them:
+
+- iceberg-ivm reacts to each Iceberg commit and recomputes exactly the buckets it touched, however old they are. When nothing changed it does nothing, and each range is replaced in one atomic `MERGE`. Buckets can be as small as a second, and compaction never triggers work.
+- `microbatch` runs on your schedule and recomputes every batch in its lookback window, changed or not. Rows older than the window are missed until you backfill by hand. Batches are an hour or longer, and each is replaced with a delete and an insert.
+- dbt does far more than maintain aggregates: joins and multiple sources, Jinja, tests, docs, and lineage across your whole project, with no extra service to run.
+
+They work well together: a dbt model can read an iceberg-ivm target like any other Iceberg table.
 
 ## Limitations
 
+- Trino is the only supported query engine today.
 - One source table per view.
 - Sources need min/max statistics on the time column. Trino and Spark write them by default. If they're missing, the view falls back to a full refresh and reports an error rather than skip data.
 - A source `DELETE` triggers a full refresh. An `UPDATE` must not move a row to a different time bucket.

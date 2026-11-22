@@ -1,6 +1,6 @@
 # How iceberg-ivm works
 
-iceberg-ivm keeps an aggregating query's result in an Iceberg table, up to date as its source table changes. It never reads source data to find out what changed. It reads Iceberg metadata, works out which time buckets the new rows fall into, and has Trino recompute exactly those buckets from complete source data.
+iceberg-ivm keeps an aggregating query's result in an Iceberg table, up to date as its source table changes. It never reads source data to find out what changed. It reads Iceberg metadata, works out which time buckets the new rows fall into, and has the query engine (Trino, today) recompute exactly those buckets from complete source data.
 
 This page explains each step, the guarantees it gives, and the assumptions it relies on.
 
