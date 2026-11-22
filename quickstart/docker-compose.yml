@@ -1,29 +1,4 @@
 services:
-  minio:
-    image: minio/minio:latest
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    ports:
-      # Bind to loopback only — the quickstart is a local demo with admin/admin
-      # credentials, no auth on the console; exposing it on every interface
-      # would put the warehouse bucket on the host's LAN.
-      - "127.0.0.1:19001:9001"
-    healthcheck:
-      test: mc ready local
-      interval: 2s
-      retries: 10
-
-  minio-init:
-    image: minio/mc:latest
-    depends_on:
-      minio:
-        condition: service_healthy
-    entrypoint: >
-      sh -c "mc alias set local http://minio:9000 minioadmin minioadmin &&
-             mc mb --ignore-existing local/warehouse"
-
   postgres:
     image: postgres:16-alpine
     environment:
@@ -31,6 +6,7 @@ services:
       POSTGRES_DB: iceberg
     volumes:
       - ./trino-config/init-iceberg-catalog.sql:/docker-entrypoint-initdb.d/init.sql
+      - catalog:/var/lib/postgresql/data
     healthcheck:
       test: pg_isready -U postgres
       interval: 2s
@@ -41,10 +17,10 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      minio-init:
-        condition: service_completed_successfully
     volumes:
       - ./trino-config/iceberg.properties:/etc/trino/catalog/iceberg.properties
+      # Iceberg data and metadata files live here (Trino's local filesystem).
+      - warehouse:/data/trino
     ports:
       # Loopback-only: Trino has no auth in the quickstart and the host port
       # must stay in sync with TRINO_PUBLIC_URL below (28080).
@@ -68,7 +44,7 @@ services:
     restart: "no"
 
   iceberg-ivm:
-    image: ghcr.io/jonasbrami/iceberg-ivm:0.6.3
+    image: ghcr.io/jonasbrami/iceberg-ivm:latest
     depends_on:
       seed:
         condition: service_completed_successfully
@@ -92,4 +68,6 @@ services:
       - "127.0.0.1:8001:8000"
 
 volumes:
+  catalog:
+  warehouse:
   ivm-state:

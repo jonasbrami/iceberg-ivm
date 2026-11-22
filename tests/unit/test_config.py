@@ -14,8 +14,16 @@ from iceberg_ivm.config import (
     load_config,
     load_views,
     save_views,
-    validate_maintenance_config,
 )
+
+_BASE_VIEW = {
+    "query": "SELECT date_trunc('day', ts) AS d, count(*) AS n FROM iceberg.db.t GROUP BY 1",
+    "target_table": "iceberg.analytics.v",
+}
+
+
+def validate_maintenance_config(fields: dict) -> None:
+    ViewConfig(**_BASE_VIEW, **fields)
 
 
 def write_config(tmp_path: Path, content: str) -> Path:
@@ -187,19 +195,18 @@ def test_missing_query(tmp_path):
         "    query: |\n      SELECT symbol,\n             date_trunc('minute', ts) AS minute,\n             sum(qty) AS volume\n      FROM iceberg.market_data.trades\n      GROUP BY 1, 2\n",
         "",
     )
-    with pytest.raises(ValueError, match="missing required fields"):
+    with pytest.raises(ValueError, match="Field required"):
         load_views(write_views(tmp_path, bad))
 
 
-def test_missing_name(tmp_path):
-    bad = VALID_VIEWS.replace("  - name: ohlcv_1m\n", "  - \n")
-    with pytest.raises(ValueError, match="missing required fields"):
-        load_views(write_views(tmp_path, bad))
+def test_missing_name_defaults_to_target_table(tmp_path):
+    views = load_views(write_views(tmp_path, VALID_VIEWS.replace("  - name: ohlcv_1m\n", "  - \n")))
+    assert views[0].name == views[0].target_table
 
 
 def test_invalid_view_name(tmp_path):
     bad = VALID_VIEWS.replace("name: ohlcv_1m", "name: drop-table")
-    with pytest.raises(ValueError, match="valid view name"):
+    with pytest.raises(ValueError, match="must be a SQL identifier"):
         load_views(write_views(tmp_path, bad))
 
 
@@ -216,7 +223,7 @@ def test_invalid_target_table(tmp_path):
         "    refresh_interval_seconds: 30\n",
         "    target_table: x;DROP\n",
     )
-    with pytest.raises(ValueError, match="valid qualified table name"):
+    with pytest.raises(ValueError, match="must be a SQL identifier"):
         load_views(write_views(tmp_path, bad))
 
 
@@ -299,7 +306,7 @@ def test_full_refresh_chunk_valid(tmp_path):
 
 
 def test_full_refresh_chunk_rejects_invalid_granularity(tmp_path):
-    with pytest.raises(ValueError, match="not a valid chunk granularity"):
+    with pytest.raises(ValueError, match="doesn't hold whole"):
         load_views(write_views(tmp_path, _views_yaml_with_chunk("day", "fortnight")))
 
 
@@ -318,7 +325,7 @@ def test_full_refresh_chunk_rejects_invalid_granularity(tmp_path):
     ],
 )
 def test_full_refresh_chunk_rejects_incompatible(tmp_path, view_g, chunk_g):
-    with pytest.raises(ValueError, match="not compatible"):
+    with pytest.raises(ValueError, match="doesn't hold whole"):
         load_views(write_views(tmp_path, _views_yaml_with_chunk(view_g, chunk_g)))
 
 
@@ -336,7 +343,7 @@ def test_full_refresh_chunk_rejects_incompatible(tmp_path, view_g, chunk_g):
     ],
 )
 def test_full_refresh_chunk_rejects_subsecond_chunk(tmp_path, view_g, chunk_g):
-    with pytest.raises(ValueError, match="not a valid chunk granularity"):
+    with pytest.raises(ValueError, match="doesn't hold whole"):
         load_views(write_views(tmp_path, _views_yaml_with_chunk(view_g, chunk_g)))
 
 
@@ -430,33 +437,6 @@ def test_query_timeout_seconds_rejects_non_positive_int(tmp_path, bad):
     )
     with pytest.raises(ValueError, match="query_timeout_seconds"):
         load_views(write_views(tmp_path, raw))
-
-
-def test_full_refresh_chunk_rejects_view_without_direct_bucket_projection(tmp_path):
-    """``full_refresh_chunk`` requires a direct ``date_trunc(g, col) AS <alias>``
-    projection so the target has a column the executor can read as the
-    resume point. A wrapped expression is rejected only when chunking is
-    enabled."""
-    wrapped = (
-        "views:\n  - name: v\n"
-        "    query: \"SELECT from_iso8601_date(CAST(date_trunc('day', ts) AS varchar)) AS d FROM t GROUP BY 1\"\n"
-        "    target_table: iceberg.analytics.v\n"
-        "    full_refresh_chunk: day\n"
-    )
-    with pytest.raises(ValueError, match="aliased projection"):
-        load_views(write_views(tmp_path, wrapped))
-
-
-def test_wrapped_date_trunc_accepted_without_chunk(tmp_path):
-    """A view whose date_trunc is wrapped is accepted when chunking is OFF
-    (it just can't use the chunked-backfill path)."""
-    wrapped = (
-        "views:\n  - name: v\n"
-        "    query: \"SELECT from_iso8601_date(CAST(date_trunc('day', ts) AS varchar)) AS d FROM t GROUP BY 1\"\n"
-        "    target_table: iceberg.analytics.v\n"
-    )
-    views = load_views(write_views(tmp_path, wrapped))
-    assert views[0].full_refresh_chunk is None
 
 
 # ── Iceberg maintenance config ──
@@ -570,7 +550,7 @@ def test_save_views_emits_disabled_op_toggle(tmp_path):
 
 
 def test_maintenance_rejects_negative_interval():
-    with pytest.raises(ValueError, match=">= 0"):
+    with pytest.raises(ValueError, match="greater than or equal to 0"):
         validate_maintenance_config({"maintenance_interval_seconds": -1})
 
 
@@ -584,13 +564,13 @@ def test_maintenance_rejects_negative_interval():
     ],
 )
 def test_maintenance_rejects_bad_retention(field, value):
-    with pytest.raises(ValueError, match="valid Trino duration"):
+    with pytest.raises(ValueError, match="Trino duration"):
         validate_maintenance_config({field: value})
 
 
 @pytest.mark.parametrize("value", ["128", "128m", "128 MB", "big"])
 def test_maintenance_rejects_bad_file_size_threshold(value):
-    with pytest.raises(ValueError, match="valid data size"):
+    with pytest.raises(ValueError, match="data size"):
         validate_maintenance_config({"optimize_file_size_threshold": value})
 
 

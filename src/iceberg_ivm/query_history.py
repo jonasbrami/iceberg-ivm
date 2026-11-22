@@ -1,14 +1,15 @@
-"""Persistent ring buffer for refresh QueryInfo rows, backed by SQLite.
+"""The service's only state, in one SQLite file (``state.db``).
 
-The UI surfaces the last few MERGE / INSERT / DELETE queries per view so an
-operator can jump to the Trino UI. Before this module that buffer lived on
-``ViewStatus`` in memory and was wiped on restart. Here we keep the same
-shape (newest-first, capped per view) but back it with a SQLite file so
-history survives process restarts.
+* ``view_status``: per view, the bookmark (last source snapshot merged), the
+  in-flight run (pinned snapshot + last committed chunk), and the counters
+  the UI shows.
+* ``query_history``: the last few Trino queries per view (newest first),
+  for the UI's links to the Trino query page.
+* ``maintenance_state``: when each maintenance op last ran, so restarts
+  keep the schedule.
 
-SQLite's single-writer model is fine for our write rate (a handful of
-inserts per refresh, seconds apart). ``aiosqlite`` runs each call on a
-dedicated background thread so the event loop stays unblocked.
+The write rate is a handful of rows per refresh, so SQLite's single writer
+is plenty; ``aiosqlite`` keeps the calls off the event loop.
 """
 
 from __future__ import annotations
@@ -53,12 +54,7 @@ CREATE TABLE IF NOT EXISTS maintenance_state (
     PRIMARY KEY (view, op)
 );
 
--- Per-view ViewStatus snapshot. Persisted on every mutation in the refresh
--- path so the UI shows the last-known state immediately after a restart
--- (otherwise total_refreshes / chunks_done / last_refresh all reset to
--- their initial values until the first post-restart tick — see issue #40).
--- ``recent_queries`` and ``maintenance`` live in their own tables and are
--- intentionally NOT mirrored here.
+-- Per-view status, written on every change so a restart shows the last state.
 CREATE TABLE IF NOT EXISTS view_status (
     view                  TEXT    PRIMARY KEY,
     last_refresh          REAL,
@@ -71,12 +67,14 @@ CREATE TABLE IF NOT EXISTS view_status (
     chunks_done           INTEGER NOT NULL DEFAULT 0,
     chunks_total          INTEGER,
     last_source_snapshot  INTEGER,
-    -- In-flight run (#61/#62): work_max_snapshot = the pinned snapshot M (reused
-    -- verbatim on resume → frozen window, no drift/mixing); work_last_merged_chunk
-    -- = ISO-8601 range_end of the last committed chunk (the resume point). NULL
-    -- when idle, set/cleared together. INVARIANT: the bookmark advances only on
-    -- completion (which clears current_work), so while current_work is set the run's
-    -- MIN bound is implied (bookmark+1, or source start) and needs no column.
+    -- Freshness (epoch seconds): last successful check of the source, commit
+    -- time of the source's current snapshot, commit time the view reflects.
+    last_checked           REAL,
+    source_committed_at    REAL,
+    data_as_of             REAL,
+    -- In-flight run: the snapshot it is pinned to, and the end of its last
+    -- committed chunk (the resume point). NULL when idle. The bookmark only
+    -- moves when a run completes, so the run's lower bound is the bookmark.
     work_max_snapshot      INTEGER,
     work_last_merged_chunk TEXT
 );
@@ -95,6 +93,9 @@ _VIEW_STATUS_COLS: tuple[str, ...] = (
     "total_errors",
     "chunks_done",
     "chunks_total",
+    "last_checked",
+    "source_committed_at",
+    "data_as_of",
 )
 
 
@@ -132,17 +133,19 @@ class QueryHistory:
 
     async def _migrate(self) -> None:
         """Add columns introduced after a DB was first created (``CREATE TABLE
-        IF NOT EXISTS`` won't). Idempotent via the column-presence check (SQLite
-        has no ``ADD COLUMN IF NOT EXISTS``), so a released DB carrying only
-        ``last_source_snapshot`` + counters gains the ``current_work`` columns
-        cleanly.
-        """
+        IF NOT EXISTS`` won't, and SQLite has no ``ADD COLUMN IF NOT EXISTS``)."""
+        added = {
+            "work_max_snapshot": "INTEGER",
+            "work_last_merged_chunk": "TEXT",
+            "last_checked": "REAL",
+            "source_committed_at": "REAL",
+            "data_as_of": "REAL",
+        }
         async with self._db.execute("PRAGMA table_info(view_status)") as cur:
             cols = {row[1] for row in await cur.fetchall()}
-        if "work_max_snapshot" not in cols:
-            await self._db.execute("ALTER TABLE view_status ADD COLUMN work_max_snapshot INTEGER")
-        if "work_last_merged_chunk" not in cols:
-            await self._db.execute("ALTER TABLE view_status ADD COLUMN work_last_merged_chunk TEXT")
+        for column, type_ in added.items():
+            if column not in cols:
+                await self._db.execute(f"ALTER TABLE view_status ADD COLUMN {column} {type_}")
 
     async def close(self) -> None:
         if self._db is not None:
@@ -285,7 +288,7 @@ class QueryHistory:
             row = await cur.fetchone()
         return row[0] if row and row[0] is not None else None
 
-    async def set_last_source_snapshot(self, view: str, snapshot_id: int) -> None:
+    async def set_last_source_snapshot(self, view: str, snapshot_id: int | None) -> None:
         await self._db.execute(
             "INSERT INTO view_status (view, last_source_snapshot) VALUES (?, ?) "
             "ON CONFLICT(view) DO UPDATE SET "
@@ -294,10 +297,8 @@ class QueryHistory:
         )
         await self._db.commit()
 
-    # ── current_work ──────────────────────────────────────────────────
-    # The unified in-flight run record (#61/#62); see _SCHEMA for the pin
-    # rationale and invariant. Kept out of _VIEW_STATUS_COLS so the ViewStatus
-    # mirror can't clobber it; set/cleared together with the bookmark write.
+    # ── current_work: the in-flight run (see _SCHEMA) ─────────────────
+    # Not in _VIEW_STATUS_COLS, so persisting ViewStatus can't overwrite it.
 
     async def get_current_work(self, view: str) -> tuple[int | None, datetime | None]:
         """``(work_max_snapshot, work_last_merged_chunk)``; ``(None, None)`` =
@@ -362,12 +363,7 @@ class QueryHistory:
         )
 
     async def all_maintenance(self, view: str) -> dict[str, dict]:
-        """Return ``{op: {col: value, ...}}`` for every op recorded against ``view``.
-
-        Shape changed in #40: previously this returned ``dict[str, float]``
-        (just ``op → last_run``). Callers that only need ``last_run`` should
-        read ``[op]["last_run"]`` from the new dict.
-        """
+        """``{op: {column: value}}`` for every maintenance op recorded for ``view``."""
         col_list = ", ".join(_MAINTENANCE_COLS)
         async with self._db.execute(
             f"SELECT op, {col_list} FROM maintenance_state WHERE view = ?",

@@ -1,165 +1,105 @@
-"""AST-based parser for materialized view definitions.
+"""Parse a view query and rewrite it for one refresh.
 
-Extracts the source table, filter column, granularity, and merge keys from a
-standalone `SELECT … FROM … [WHERE …] GROUP BY …` query so operators can write
-exactly what they would put after ``CREATE MATERIALIZED VIEW … AS``.
+A view query is what you would write after ``CREATE MATERIALIZED VIEW … AS``:
+one SELECT over one Iceberg table, grouped by a ``date_trunc('<unit>', <col>)``
+time bucket (plus any other keys). Everything a refresh needs is derived from
+it: the source table, the time column, the bucket unit, and the merge keys.
 
-Uses sqlparse for tokenization/grouping.  It is a token-tree library, not a
-full parser, but the structural node types (``Function``, ``Operation``,
-``Where``, ``IdentifierList``, ``Identifier``) are sufficient for the handful
-of decisions we need to make.
+Parsing and rewriting use sqlglot's Trino dialect, so the time-range filter
+and the snapshot pin are added to the syntax tree rather than spliced into
+SQL text.
 """
 
 from __future__ import annotations
 
-import logging
+import functools
 import re
-from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-import sqlparse
-from sqlparse.sql import (
-    Function,
-    Identifier,
-    IdentifierList,
-    Operation,
-    Parenthesis,
-    Statement,
-    Token,
-    Where,
-)
-from sqlparse.tokens import (
-    CTE,
-    DML,
-    Keyword,
-    Literal,
-    Name,
-    Punctuation,
-)
+import sqlglot
+from sqlglot import exp
+from sqlglot.errors import ParseError
 
-log = logging.getLogger(__name__)
+DIALECT = "trino"
 
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 QUALIFIED_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
-_DATE_TRUNC_RE = re.compile(
-    r"^\s*date_trunc\s*\(\s*'([^']+)'\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*$",
-    re.IGNORECASE,
-)
 
 VALID_GRANULARITIES = frozenset(("millisecond", "second", "minute", "hour", "day", "week", "month", "quarter", "year"))
+
+_DATE_TRUNC = (exp.TimestampTrunc, exp.DateTrunc)
 
 
 @dataclass(frozen=True)
 class ParsedView:
-    source_table: str
-    filter_column: str
-    granularity: str
-    merge_keys: tuple[str, ...]
-    # Alias of the ``date_trunc(granularity, filter_column)`` projection
-    # item, if one exists as a direct projection. ``None`` if the
-    # expression appears only nested inside another function (rare but
-    # accepted). Required by the chunked full-refresh path, which reads
-    # ``max(bucket_alias)`` from the target; the config validator
-    # enforces presence when ``full_refresh_chunk`` is set.
-    bucket_alias: str | None
+    source_table: str  # [catalog.][schema.]table, as written
+    filter_column: str  # the time column inside the bucket's date_trunc
+    granularity: str  # the bucket's date_trunc unit, lower case
+    bucket_alias: str  # output column that holds the bucket
+    merge_keys: tuple[str, ...]  # GROUP BY keys as output column names (bucket included)
+    _tree: exp.Select = field(repr=False, compare=False)
+    _time_column: exp.Column = field(repr=False, compare=False)
+
+    def range_query(self, start: datetime, end: datetime, snapshot_id: int) -> str:
+        """The view query restricted to ``start <= time column < end``, reading
+        the source as of ``snapshot_id``."""
+        query = self._tree.copy()
+        query.find(exp.Table).set(
+            "version",
+            exp.Version(this="VERSION", kind="AS OF", expression=exp.Literal.number(snapshot_id)),
+        )
+        in_range = exp.and_(
+            exp.GTE(this=self._time_column.copy(), expression=timestamp_literal(start)),
+            exp.LT(this=self._time_column.copy(), expression=timestamp_literal(end)),
+        )
+        return query.where(in_range, append=True, copy=False).sql(dialect=DIALECT)
 
 
+def timestamp_literal(value: datetime) -> exp.Expression:
+    """A Trino timestamp literal for ``value``. Aware values are written in UTC
+    as ``TIMESTAMP WITH TIME ZONE`` so they denote the same instant."""
+    if value.tzinfo is not None:
+        text = value.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S.%f") + " UTC"
+        type_ = "timestamp(6) with time zone"
+    else:
+        text = value.strftime("%Y-%m-%d %H:%M:%S.%f")
+        type_ = "timestamp(6)"
+    return exp.cast(exp.Literal.string(text), exp.DataType.build(type_, dialect=DIALECT))
+
+
+@functools.lru_cache(maxsize=256)
 def parse_view_query(sql: str) -> ParsedView:
-    """Validate the query shape and derive all view metadata.
+    """Validate a view query and derive its metadata.
 
-    Raises ``ValueError`` on any violation with a message that names the field
-    the user needs to fix.
+    Raises ``ValueError`` with a message that tells the user what to change.
     """
-    stmt = _single_statement(sql)
-    _reject_unsupported_shapes(stmt)
-    source_table = _extract_source_table(stmt)
-    granularity, filter_column = _extract_date_trunc(stmt)
-    merge_keys = _extract_merge_keys(stmt)
-    bucket_alias = _extract_bucket_alias(stmt, granularity, filter_column)
+    query = _single_select(sql)
+    source_table = _source_table(query)
+
+    group = query.args.get("group")
+    if group is None or not group.expressions:
+        raise ValueError("query must have a GROUP BY clause; the merge keys are derived from it")
+    if any(group.args.get(k) for k in ("all", "rollup", "cube", "grouping_sets")):
+        raise ValueError("GROUP BY ALL / ROLLUP / CUBE / GROUPING SETS are not supported; list the keys")
+
+    projections = list(query.expressions)
+    names = [_output_name(p) for p in projections]
+    duplicates = sorted({n for n in names if names.count(n) > 1})
+    if duplicates:
+        raise ValueError(f"duplicate output column names: {duplicates}")
+    merge_keys = tuple(dict.fromkeys(_resolve_group_item(g, projections, names) for g in group.expressions))
+
+    bucket_alias, bucket = _time_bucket(query, projections, names, merge_keys)
     return ParsedView(
         source_table=source_table,
-        filter_column=filter_column,
-        granularity=granularity,
-        merge_keys=merge_keys,
+        filter_column=bucket.this.name,
+        granularity=bucket.text("unit").lower(),
         bucket_alias=bucket_alias,
+        merge_keys=merge_keys,
+        _tree=query,
+        _time_column=bucket.this,
     )
-
-
-_TRAILING_CLAUSES = ("GROUP BY", "HAVING", "ORDER BY", "LIMIT", "OFFSET", "FETCH")
-_WHERE_BODY_RE = re.compile(r"^(\s*WHERE\s+)(.*)$", re.IGNORECASE | re.DOTALL)
-
-
-def inject_range_filter(sql: str, filter_column: str, start: datetime, end: datetime) -> str:
-    """AND-append a ``col >= TIMESTAMP 'start' AND col < TIMESTAMP 'end'``
-    predicate to the query's WHERE clause, inserting one if absent.
-
-    Returns the resulting SQL as a string.  The query is never executed here;
-    Trino parses the emitted string at refresh time.
-    """
-    # Strip comments first so a trailing `-- …` in the WHERE clause can't
-    # swallow the appended ` AND <predicate>` (Trino's lexer treats `--`
-    # as comment-to-end-of-line; the wrapped body would silently neutralise
-    # the time filter and force a full-source rebuild every refresh).
-    sql = sqlparse.format(sql, strip_comments=True)
-    stmt = _single_statement(sql)
-    predicate = _build_range_predicate(filter_column, start, end)
-
-    where = next((t for t in stmt.tokens if isinstance(t, Where)), None)
-    if where is not None:
-        # Wrap the existing WHERE body in parens before AND-appending the
-        # range predicate. AND binds tighter than OR, so an unparenthesised
-        # `WHERE A OR B` would become `A OR (B AND ts in range)` — leaving
-        # A-rows unfiltered by time and silently corrupting the target.
-        original = str(where)
-        stripped = original.rstrip()
-        trailing = original[len(stripped) :] or " "
-        m = _WHERE_BODY_RE.match(stripped)
-        if not m:
-            raise ValueError(f"could not parse WHERE clause: {stripped!r}")
-        prefix, body = m.group(1), m.group(2).strip()
-        where.tokens = [Token(None, f"{prefix}({body}) AND {predicate}{trailing}")]
-        return str(stmt)
-
-    # No WHERE: insert one before the first trailing clause, else at end.
-    insert_idx = next(
-        (i for i, t in enumerate(stmt.tokens) if t.ttype is Keyword and t.normalized.upper() in _TRAILING_CLAUSES),
-        len(stmt.tokens),
-    )
-    stmt.tokens.insert(insert_idx, Token(None, f"WHERE {predicate} "))
-    return str(stmt)
-
-
-def inject_version_pin(sql: str, source_table: str, snapshot_id: int) -> str:
-    """Rewrite ``FROM <source_table>`` → ``FROM <source_table> FOR VERSION AS OF
-    <snapshot_id> [alias]`` (the clause binds before any alias). Composed with
-    ``inject_range_filter`` so every chunk reads the identical immutable snapshot
-    — no source mixing (#62). Single-source is guaranteed (joins rejected at
-    parse time).
-    """
-    stmt = _single_statement(sql)
-    from_idx = next(
-        (i for i, t in enumerate(stmt.tokens) if t.ttype is Keyword and t.normalized.upper() == "FROM"),
-        None,
-    )
-    if from_idx is None:
-        raise ValueError("FROM clause missing")
-    tref_idx, tref = stmt.token_next(from_idx, skip_ws=True, skip_cm=True)
-    if tref is None:
-        raise ValueError("could not locate table reference after FROM to pin")
-    # Splice the pin after the qualified name, keeping any trailing alias text.
-    original = str(tref)
-    lead = original[: len(original) - len(original.lstrip())]
-    body = original.lstrip()
-    if body.startswith(source_table):
-        rest = body[len(source_table) :]
-        pinned = f"{lead}{source_table} FOR VERSION AS OF {snapshot_id}{rest}"
-    else:
-        # Defensive fallback for a quoted/odd reference shape: string-replace the
-        # first occurrence so the pin still lands.
-        pinned = original.replace(source_table, f"{source_table} FOR VERSION AS OF {snapshot_id}", 1)
-    stmt.tokens[tref_idx] = Token(None, pinned)
-    return str(stmt)
 
 
 # ---------------------------------------------------------------------------
@@ -167,298 +107,109 @@ def inject_version_pin(sql: str, source_table: str, snapshot_id: int) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _single_statement(sql: str) -> Statement:
-    stmts = [s for s in sqlparse.parse(sql) if str(s).strip()]
-    if not stmts:
-        raise ValueError("query is empty")
-    if len(stmts) > 1:
-        raise ValueError("query must contain a single SELECT statement; multiple statements found")
-    return stmts[0]
-
-
-def _reject_unsupported_shapes(stmt: Statement) -> None:
-    """Reject queries whose shape the parser can't handle."""
-    if "{range_filter}" in str(stmt):
+def _single_select(sql: str) -> exp.Select:
+    if "{range_filter}" in sql:
         raise ValueError(
             "query contains the legacy {range_filter} placeholder; remove it — "
-            "iceberg-ivm injects the time-range WHERE automatically"
+            "iceberg-ivm adds the time-range filter itself"
         )
-    select_count = 0
-    saw_group_by = False
-    for tok in stmt.tokens:
-        if tok.ttype not in (Keyword, DML, CTE):
-            continue
-        kw = tok.normalized.upper()
-        if kw == "WITH":
-            raise ValueError("CTEs (WITH clauses) are not supported")
-        if kw in ("UNION", "INTERSECT", "EXCEPT"):
-            raise ValueError("set operations (UNION/INTERSECT/EXCEPT) are not supported")
-        if "JOIN" in kw:
-            raise ValueError("joins are not supported; query must reference a single source table")
-        if kw == "SELECT":
-            select_count += 1
-            if select_count > 1:
-                raise ValueError("subqueries are not supported")
-        elif kw == "GROUP BY":
-            saw_group_by = True
-    if not saw_group_by:
-        raise ValueError("query must have a GROUP BY clause; merge keys are derived from it")
+    try:
+        statements = [s for s in sqlglot.parse(sql, read=DIALECT) if s is not None]
+    except ParseError as e:
+        detail = e.errors[0]["description"] if e.errors else str(e)
+        raise ValueError(f"could not parse query: {detail}") from None
+    if not statements:
+        raise ValueError("query is empty")
+    if len(statements) > 1:
+        raise ValueError("query must be a single SELECT statement; found several")
+    query = statements[0]
+    if isinstance(query, exp.SetOperation):
+        raise ValueError("set operations (UNION/INTERSECT/EXCEPT) are not supported")
+    if not isinstance(query, exp.Select):
+        raise ValueError("query must be a SELECT")
+    if query.args.get("with_") or query.args.get("with"):
+        raise ValueError("CTEs (WITH clauses) are not supported")
+    if query.args.get("joins"):
+        raise ValueError("joins are not supported; the query must read from a single source table")
+    if any(s is not query for s in query.find_all(exp.Select)):
+        raise ValueError("subqueries are not supported")
+    # Both would be evaluated over each refreshed range, not the whole table.
+    if any(query.args.get(k) for k in ("limit", "offset", "fetch")):
+        raise ValueError("LIMIT / OFFSET / FETCH are not supported; a refresh recomputes one time range at a time")
+    if query.find(exp.Window):
+        raise ValueError("window functions (OVER …) are not supported; a refresh recomputes one time range at a time")
+    return query
 
 
-def _extract_source_table(stmt: Statement) -> str:
-    """Return the qualified name following FROM, stripping any alias."""
-    from_idx = next(
-        (i for i, t in enumerate(stmt.tokens) if t.ttype is Keyword and t.normalized.upper() == "FROM"),
-        None,
-    )
-    if from_idx is None:
-        raise ValueError("FROM clause missing")
-    _, t = stmt.token_next(from_idx, skip_ws=True, skip_cm=True)
-    if isinstance(t, Parenthesis):
-        raise ValueError("subqueries in FROM are not supported")
-    if isinstance(t, Identifier):
-        # Subquery-with-alias (e.g. `(SELECT …) x`) wraps as an Identifier
-        # whose text starts with `(`.
-        if str(t).lstrip().startswith("("):
-            raise ValueError("subqueries in FROM are not supported")
-        # The qualified table name is the leading run of Name + `.` tokens;
-        # everything after (whitespace, `AS`, alias) is dropped so a FROM
-        # like `iceberg.x.y t` doesn't leak the alias into source_table.
-        parts: list[str] = []
-        for child in t.tokens:
-            if child.ttype is Name:
-                parts.append(str(child))
-            elif child.ttype is Punctuation and str(child) == ".":
-                parts.append(".")
-            else:
-                break
-        if parts:
-            return "".join(parts)
-        # Fallback for Identifier shapes whose first child isn't a Name —
-        # e.g. quoted identifiers (`"cat"."tbl"`) tokenise as String.Symbol
-        # children. Returning the raw text preserves the qualified name but
-        # may carry a trailing alias; QUALIFIED_NAME_RE downstream rejects
-        # quoted forms anyway.
-        return str(t).strip()
-    if t is not None and t.ttype is Name:
-        return str(t).strip()
-    raise ValueError(f"could not parse table reference after FROM: {str(t)!r}")
+def _source_table(query: exp.Select) -> str:
+    tables = list(query.find_all(exp.Table))
+    if len(tables) != 1:
+        raise ValueError("query must read from exactly one table")
+    table = tables[0]
+    if table.args.get("version"):
+        raise ValueError("remove FOR VERSION/TIMESTAMP AS OF; iceberg-ivm pins the snapshot itself")
+    name = ".".join(part.name for part in table.parts)
+    if not QUALIFIED_NAME_RE.match(name):
+        raise ValueError(f"source table {name!r} must be a plain [catalog.][schema.]table name")
+    return name
 
 
-def _iter_tokens(node) -> Iterator[object]:
-    """Yield every descendant token of ``node`` (pre-order)."""
-    for t in getattr(node, "tokens", []):
-        yield t
-        yield from _iter_tokens(t)
-
-
-def _in_arithmetic(tok) -> bool:
-    """True if ``tok`` is nested inside an ``Operation`` node."""
-    cur = tok.parent
-    while cur is not None:
-        if isinstance(cur, Operation):
-            return True
-        cur = cur.parent
-    return False
-
-
-def _extract_date_trunc(stmt: Statement) -> tuple[str, str]:
-    """Return (granularity, column_name) from date_trunc('X', col)."""
-    calls = [
-        tok
-        for tok in _iter_tokens(stmt)
-        if isinstance(tok, Function) and (tok.get_real_name() or "").lower() == "date_trunc"
-    ]
-    if not calls:
-        raise ValueError(
-            "query must contain a date_trunc('X', col) expression; granularity and filter column are derived from it"
-        )
-
-    granularities: set[str] = set()
-    column: str | None = None
-    for call in calls:
-        if _in_arithmetic(call):
-            raise ValueError(
-                "date_trunc(...) must not be wrapped in arithmetic; "
-                "use date_trunc('X', col) directly in SELECT / GROUP BY"
-            )
-        g, col = _read_date_trunc_args(call)
-        if g not in VALID_GRANULARITIES:
-            raise ValueError(f"date_trunc granularity must be one of {sorted(VALID_GRANULARITIES)}; got {g!r}")
-        granularities.add(g)
-        if column is None:
-            column = col
-        elif column != col:
-            raise ValueError(
-                f"date_trunc is used on multiple columns ({column!r} and {col!r}); "
-                "a view may only have a single filter column"
-            )
-
-    if len(granularities) > 1:
-        raise ValueError(f"query has multiple distinct granularities: {sorted(granularities)}")
-    return granularities.pop(), column
-
-
-def _read_date_trunc_args(fn: Function) -> tuple[str, str]:
-    """Return (granularity_literal, column_name) from a date_trunc Function.
-
-    sqlparse has already identified this token as a function call named
-    ``date_trunc``; we just pull the two arguments out of its source text.
-    The regex requires a string-literal first arg and a bare-identifier
-    second arg — the same shape the old token-walker accepted — which
-    also admits Trino reserved words (``minute``, ``hour``, …) as
-    unquoted column names.
-    """
-    m = _DATE_TRUNC_RE.fullmatch(str(fn))
-    if not m:
-        raise ValueError(f"malformed date_trunc call {str(fn)!r}; expected date_trunc('<granularity>', <column>)")
-    return m.group(1).lower(), m.group(2)
-
-
-def _clause_items(tokens: list, start_idx: int, stop_keywords: frozenset[str]) -> list:
-    """Collect items after ``tokens[start_idx]`` up to a stop keyword (or end).
-
-    Flattens a single trailing ``IdentifierList`` into its children so the
-    caller gets a uniform list regardless of whether sqlparse chose to group
-    comma-separated items.
-    """
-    items = []
-    for t in tokens[start_idx + 1 :]:
-        if t.is_whitespace or not str(t).strip():
-            continue
-        if t.ttype is Keyword and t.normalized.upper() in stop_keywords:
-            break
-        items.append(t)
-    if len(items) == 1 and isinstance(items[0], IdentifierList):
-        return [
-            it for it in items[0].tokens if not it.is_whitespace and it.ttype is not Punctuation and str(it).strip()
-        ]
-    return items
-
-
-def _projection_list(stmt: Statement) -> list:
-    """Return the list of projection items (between SELECT and FROM)."""
-    tokens = list(stmt.tokens)
-    select_idx = next(
-        (i for i, t in enumerate(tokens) if t.ttype is DML and t.normalized.upper() == "SELECT"),
-        None,
-    )
-    if select_idx is None:
-        raise ValueError("query must be of the form SELECT ... FROM ...")
-    items = _clause_items(tokens, select_idx, frozenset({"FROM"}))
-    if not items:
-        raise ValueError("SELECT list is empty")
-    return items
-
-
-def _projection_alias(item) -> str:
-    """Return the column name this projection item becomes in the output.
-
-    Bare column → its name. Aliased expression → the alias. Computed
-    expression without alias → raises.
-    """
-    if isinstance(item, Identifier):
-        alias = item.get_alias()
-        if alias is not None:
-            return alias
-        real = item.get_real_name()
-        if real and not isinstance(item.token_first(skip_cm=True), Function):
-            return real
-    elif item.ttype is Name:
-        return str(item)
-    elif not isinstance(item, Function):
-        raise ValueError(f"cannot determine output name for projection item {str(item)!r}")
+def _output_name(projection: exp.Expression) -> str:
+    if isinstance(projection, exp.Star) or (isinstance(projection, exp.Column) and projection.is_star):
+        raise ValueError("SELECT * is not supported; list the output columns")
+    if isinstance(projection, (exp.Alias, exp.Column)):
+        return projection.alias_or_name.lower()
     raise ValueError(
-        f"projection item {str(item)!r} has no alias; add `AS <name>` so the target table has a stable column name"
+        f"projection {projection.sql(dialect=DIALECT)!r} has no alias; add `AS <name>` "
+        "so the target table has a stable column name"
     )
 
 
-_AFTER_GROUP_BY = frozenset({"HAVING", "ORDER BY", "LIMIT", "OFFSET", "FETCH"})
+def _resolve_group_item(item: exp.Expression, projections: list, names: list[str]) -> str:
+    """Map a GROUP BY item (ordinal, expression or alias) to an output column name."""
+    if isinstance(item, exp.Literal) and item.is_int:
+        position = int(item.this)
+        if not 1 <= position <= len(projections):
+            raise ValueError(f"GROUP BY position {position} is out of range (the SELECT list has {len(projections)})")
+        return names[position - 1]
+    for projection, name in zip(projections, names, strict=True):
+        if projection.unalias() == item:
+            return name
+    if isinstance(item, exp.Column) and not item.table and item.name.lower() in names:
+        return item.name.lower()
+    raise ValueError(f"GROUP BY item {item.sql(dialect=DIALECT)!r} must also appear in the SELECT list")
 
 
-def _extract_merge_keys(stmt: Statement) -> tuple[str, ...]:
-    """Resolve GROUP BY items against the projection; return aliases."""
-    tokens = list(stmt.tokens)
-    gb_idx = next(
-        (i for i, t in enumerate(tokens) if t.ttype is Keyword and t.normalized.upper() == "GROUP BY"),
-        None,
-    )
-    if gb_idx is None:
-        raise ValueError("GROUP BY clause missing")
-    items = _clause_items(tokens, gb_idx, _AFTER_GROUP_BY)
+def _time_bucket(query: exp.Select, projections: list, names: list[str], merge_keys: tuple[str, ...]):
+    """Return ``(alias, date_trunc node)`` of the single time bucket that is
+    both selected and grouped by.
 
-    projection = _projection_list(stmt)
-    proj_aliases = [_projection_alias(p) for p in projection]
-    proj_canonical = [_canonical(p) for p in projection]
-
-    keys: list[str] = []
-    for it in items:
-        if it.ttype is Literal.Number.Integer:
-            idx = int(str(it)) - 1
-            if idx < 0 or idx >= len(projection):
-                raise ValueError(f"GROUP BY position {str(it)} out of range (projection has {len(projection)} items)")
-            keys.append(proj_aliases[idx])
-            continue
-
-        # Match by alias first (e.g. `GROUP BY d` referencing `… AS d`),
-        # then by canonical expression (e.g. `GROUP BY date_trunc('week', ts)`).
-        canon = _canonical(it)
-        if canon in proj_aliases:
-            keys.append(canon)
-            continue
-        try:
-            pos = proj_canonical.index(canon)
-        except ValueError:
-            raise ValueError(f"GROUP BY expression {str(it)!r} does not match any projection item") from None
-        keys.append(proj_aliases[pos])
-
-    if not keys:
-        raise ValueError("GROUP BY is empty")
-    return tuple(keys)
-
-
-def _extract_bucket_alias(stmt: Statement, granularity: str, filter_column: str) -> str | None:
-    """Return the projection alias for ``date_trunc(granularity, filter_column)``,
-    or ``None`` if the expression appears only nested inside another function
-    (e.g. ``foo(date_trunc('day', ts))``) and has no direct projection.
+    Recomputing a time range is only correct when every group lives inside one
+    bucket of that range. Without the bucket among the merge keys, a refresh
+    would overwrite all-time totals with totals for just the new rows.
     """
-    for item in _projection_list(stmt):
-        fn = item if isinstance(item, Function) else None
-        if fn is None and isinstance(item, Identifier):
-            first = item.token_first(skip_cm=True)
-            if isinstance(first, Function):
-                fn = first
-        if fn is None or (fn.get_real_name() or "").lower() != "date_trunc":
-            continue
-        g, col = _read_date_trunc_args(fn)
-        if g == granularity and col == filter_column:
-            return _projection_alias(item)
-    return None
-
-
-def _canonical(tok) -> str:
-    """Normalize a projection / group-by item for equality comparison.
-
-    Strips whitespace and any trailing ``AS alias`` clause.
-    """
-    if isinstance(tok, Identifier):
-        first = tok.token_first(skip_cm=True)
-        if first is not None:
-            return str(first).strip().lower()
-    return str(tok).strip().lower()
-
-
-def _build_range_predicate(col: str, start: datetime, end: datetime) -> str:
-    """Emit ``col >= TIMESTAMP '…' AND col < TIMESTAMP '…'``.
-
-    Tz-aware inputs are first converted to UTC and suffixed with ' UTC' so
-    Trino (running with session timezone=UTC) reads them as the correct instant.
-    """
-    if start.tzinfo is not None:
-        start = start.astimezone(UTC)
-        end = end.astimezone(UTC)
-        suffix = " UTC"
-    else:
-        suffix = ""
-    fmt = "%Y-%m-%d %H:%M:%S.%f"
-    return f"{col} >= TIMESTAMP '{start.strftime(fmt)}{suffix}' AND {col} < TIMESTAMP '{end.strftime(fmt)}{suffix}'"
+    buckets = [
+        (name, projection.unalias())
+        for projection, name in zip(projections, names, strict=True)
+        if isinstance(projection.unalias(), _DATE_TRUNC) and name in merge_keys
+    ]
+    if not buckets:
+        example = next(query.find_all(*_DATE_TRUNC), None)
+        hint = (
+            f"date_trunc('{example.text('unit').lower()}', {example.this.sql(dialect=DIALECT)})"
+            if example is not None
+            else "date_trunc('<unit>', <time column>)"
+        )
+        raise ValueError(
+            f"the GROUP BY must include a time bucket: select {hint} AS <name> and group by it. "
+            "Without it, each refresh would overwrite all-time totals with totals for just the new rows"
+        )
+    if len(buckets) > 1:
+        raise ValueError(f"the GROUP BY has more than one time bucket ({', '.join(n for n, _ in buckets)}); keep one")
+    name, bucket = buckets[0]
+    unit = bucket.text("unit").lower()
+    if unit not in VALID_GRANULARITIES:
+        raise ValueError(f"date_trunc granularity must be one of {sorted(VALID_GRANULARITIES)}; got {unit!r}")
+    if not isinstance(bucket.this, exp.Column):
+        raise ValueError(f"date_trunc must be applied directly to a column, not {bucket.this.sql(dialect=DIALECT)!r}")
+    return name, bucket

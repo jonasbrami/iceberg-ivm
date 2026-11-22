@@ -1,21 +1,16 @@
-"""Tests for the AST-based query parser."""
+"""Tests for parsing a view query and rewriting it for a refresh."""
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
+import sqlglot
 
-from iceberg_ivm.query_parser import (
-    VALID_GRANULARITIES,
-    ParsedView,
-    inject_range_filter,
-    inject_version_pin,
-    parse_view_query,
-)
+from iceberg_ivm.query_parser import VALID_GRANULARITIES, parse_view_query
 
 # ---------------------------------------------------------------------------
-# Happy path
+# Accepted queries
 # ---------------------------------------------------------------------------
 
 
@@ -28,12 +23,12 @@ class TestParseViewQuery:
             GROUP BY 1, 2
         """
         p = parse_view_query(sql)
-        assert p == ParsedView(
-            source_table="iceberg.md.trades",
-            filter_column="ts",
-            granularity="week",
-            merge_keys=("symbol", "week"),
-            bucket_alias="week",
+        assert (p.source_table, p.filter_column, p.granularity, p.merge_keys, p.bucket_alias) == (
+            "iceberg.md.trades",
+            "ts",
+            "week",
+            ("symbol", "week"),
+            "week",
         )
 
     @pytest.mark.parametrize("granularity", sorted(VALID_GRANULARITIES))
@@ -78,18 +73,10 @@ class TestParseViewQuery:
             "month",
             "quarter",
             "year",
-            # Other SQL reserved words Trino accepts as unquoted column names.
-            "order",
-            "group",
-            "desc",
-            "asc",
-            "by",
         ],
     )
     def test_accepts_reserved_word_column(self, col):
-        """date_trunc's second arg can be any valid Trino identifier, including
-        SQL reserved words. sqlparse tokenizes those as Keyword, not Name,
-        so the parser must accept Keyword tokens as column references too."""
+        """Granularity keywords are common column names in chained views."""
         sql = f"SELECT date_trunc('hour', {col}) AS h FROM t GROUP BY 1"
         p = parse_view_query(sql)
         assert p.filter_column == col
@@ -138,302 +125,156 @@ class TestParseViewQuery:
         p = parse_view_query(sql)
         assert p.source_table == "iceberg.market.trades"
 
+    # ---------------------------------------------------------------------------
+    # Rejection cases
+    # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Rejection cases
-# ---------------------------------------------------------------------------
+    def test_bucket_grouped_by_alias(self):
+        p = parse_view_query("SELECT sym, date_trunc('day', ts) AS d, count(*) AS n FROM t GROUP BY sym, d")
+        assert (p.merge_keys, p.bucket_alias) == (("sym", "d"), "d")
 
+    def test_output_names_are_lower_case(self):
+        p = parse_view_query("SELECT Sym, date_trunc('day', ts) AS Day FROM t GROUP BY 1, 2")
+        assert p.merge_keys == ("sym", "day")
 
-class TestRejections:
-    def test_no_date_trunc(self):
-        with pytest.raises(ValueError, match="date_trunc"):
-            parse_view_query("SELECT a FROM t GROUP BY 1")
+    def test_date_trunc_elsewhere_is_allowed(self):
+        """Only the grouped bucket matters; other date_trunc calls are ordinary expressions."""
+        p = parse_view_query(
+            "SELECT date_trunc('hour', ts) AS h, max(date_trunc('minute', ts)) AS last_minute FROM t "
+            "WHERE date_trunc('day', created) > DATE '2026-01-01' GROUP BY 1"
+        )
+        assert (p.granularity, p.filter_column) == ("hour", "ts")
 
-    def test_date_trunc_in_arithmetic(self):
-        with pytest.raises(ValueError, match="arithmetic"):
-            parse_view_query("SELECT date_trunc('day', ts) - INTERVAL '1' DAY AS x FROM t GROUP BY 1")
-
-    def test_date_trunc_multiplied(self):
-        with pytest.raises(ValueError, match="arithmetic"):
-            parse_view_query("SELECT 2 * date_trunc('day', ts) AS x FROM t GROUP BY 1")
-
-    def test_multiple_granularities(self):
-        with pytest.raises(ValueError, match="multiple distinct granularities"):
-            parse_view_query("SELECT date_trunc('day', ts) AS d, date_trunc('hour', ts) AS h FROM t GROUP BY 1, 2")
-
-    def test_date_trunc_on_different_columns(self):
-        with pytest.raises(ValueError, match="multiple columns"):
-            parse_view_query("SELECT date_trunc('day', a) AS a_d, date_trunc('day', b) AS b_d FROM t GROUP BY 1, 2")
-
-    def test_date_trunc_inside_string_literal_is_not_matched(self):
-        # The regex-based predecessor would falsely match.
-        with pytest.raises(ValueError, match="date_trunc"):
-            parse_view_query("SELECT 'date_trunc(''week'', ts)' AS s FROM t GROUP BY 1")
-
-    def test_date_trunc_inside_line_comment_is_not_matched(self):
-        with pytest.raises(ValueError, match="date_trunc"):
-            parse_view_query("SELECT a FROM t -- date_trunc('hour', ts)\nGROUP BY 1")
-
-    def test_date_trunc_inside_block_comment_is_not_matched(self):
-        with pytest.raises(ValueError, match="date_trunc"):
-            parse_view_query("SELECT a FROM t /* date_trunc('hour', ts) */ GROUP BY 1")
-
-    def test_join_rejected(self):
-        with pytest.raises(ValueError, match="join"):
-            parse_view_query("SELECT a FROM t1 JOIN t2 ON t1.x = t2.x GROUP BY 1")
-
-    def test_union_rejected(self):
-        with pytest.raises(ValueError, match="set operations"):
-            parse_view_query(
-                "SELECT date_trunc('day', ts) AS d FROM t1 UNION SELECT date_trunc('day', ts) AS d FROM t2"
-            )
-
-    def test_with_cte_rejected(self):
-        with pytest.raises(ValueError, match="CTE"):
-            parse_view_query("WITH x AS (SELECT 1) SELECT date_trunc('day', ts) AS d FROM x GROUP BY 1")
-
-    def test_subquery_in_from_rejected(self):
-        with pytest.raises(ValueError, match="subqueries"):
-            parse_view_query("SELECT date_trunc('day', ts) AS d FROM (SELECT ts FROM t) x GROUP BY 1")
-
-    def test_no_group_by_rejected(self):
-        with pytest.raises(ValueError, match="GROUP BY"):
-            parse_view_query("SELECT date_trunc('day', ts) AS d FROM t")
-
-    def test_legacy_range_filter_placeholder_rejected(self):
-        with pytest.raises(ValueError, match="range_filter"):
-            parse_view_query("SELECT date_trunc('day', ts) AS d FROM t WHERE {range_filter} GROUP BY 1")
-
-    def test_projection_function_without_alias_rejected(self):
-        with pytest.raises(ValueError, match="alias"):
-            parse_view_query("SELECT date_trunc('day', ts), symbol FROM t GROUP BY 1, 2")
-
-    def test_multi_statement_rejected(self):
-        with pytest.raises(ValueError, match="single"):
-            parse_view_query("SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1; SELECT 1")
-
-    def test_empty_query_rejected(self):
-        with pytest.raises(ValueError, match="empty"):
-            parse_view_query("")
-
-    def test_invalid_granularity_rejected(self):
-        with pytest.raises(ValueError, match="granularity"):
-            parse_view_query("SELECT date_trunc('millennium', ts) AS m FROM t GROUP BY 1")
+    def test_any_aggregate(self):
+        p = parse_view_query(
+            "SELECT date_trunc('minute', ts) AS m, approx_percentile(px, 0.5) AS p50, count(DISTINCT u) AS users, "
+            "sum(x) FILTER (WHERE y > 0) AS pos FROM t GROUP BY 1"
+        )
+        assert p.merge_keys == ("m",)
 
 
 # ---------------------------------------------------------------------------
-# bucket_alias
+# Rejected queries
 # ---------------------------------------------------------------------------
 
 
-class TestBucketAlias:
-    def test_simple(self):
-        p = parse_view_query("SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1")
-        assert p.bucket_alias == "d"
+@pytest.mark.parametrize(
+    ("sql", "message"),
+    [
+        # The time bucket must be selected and grouped by — else totals get overwritten.
+        (
+            "SELECT sym, count(*) AS n FROM t WHERE date_trunc('day', ts) > DATE '2026-01-01' GROUP BY sym",
+            "time bucket",
+        ),
+        ("SELECT sym, count(*) AS n, max(date_trunc('day', ts)) AS d FROM t GROUP BY sym", "time bucket"),
+        ("SELECT date_trunc('day', ts) + INTERVAL '1' HOUR AS d, count(*) AS n FROM t GROUP BY 1", "time bucket"),
+        ("SELECT sym, count(*) AS n FROM t GROUP BY sym", "time bucket"),
+        (
+            "SELECT date_trunc('hour', ts) AS h, date_trunc('day', ts) AS d FROM t GROUP BY 1, 2",
+            "more than one time bucket",
+        ),
+        ("SELECT date_trunc('fortnight', ts) AS d FROM t GROUP BY 1", "granularity"),
+        ("SELECT date_trunc('day', ts + INTERVAL '1' HOUR) AS d FROM t GROUP BY 1", "directly to a column"),
+        # Shape
+        ("SELECT date_trunc('day', ts) AS d FROM t", "GROUP BY"),
+        ("SELECT date_trunc('day', a.ts) AS d FROM a JOIN b ON a.id = b.id GROUP BY 1", "join"),
+        (
+            "SELECT date_trunc('day', ts) AS d FROM a GROUP BY 1 UNION SELECT date_trunc('day', ts) AS d FROM b GROUP BY 1",
+            "set operations",
+        ),
+        ("WITH x AS (SELECT * FROM t) SELECT date_trunc('day', ts) AS d FROM x GROUP BY 1", "CTE"),
+        ("SELECT date_trunc('day', ts) AS d FROM (SELECT * FROM t) GROUP BY 1", "subqueries"),
+        ("SELECT date_trunc('day', ts) AS d FROM t WHERE x IN (SELECT x FROM u) GROUP BY 1", "subqueries"),
+        ("SELECT date_trunc('day', ts) AS d, count(*) FROM t GROUP BY 1", "alias"),
+        ("SELECT * FROM t GROUP BY 1", "SELECT \\*"),
+        ("SELECT date_trunc('day', ts) AS d, x AS d FROM t GROUP BY 1, 2", "duplicate"),
+        ("SELECT date_trunc('day', ts) AS d FROM t GROUP BY 3", "out of range"),
+        ("SELECT date_trunc('day', ts) AS d FROM t GROUP BY d, other", "must also appear"),
+        ("SELECT date_trunc('day', ts) AS d FROM t GROUP BY ROLLUP (d)", "ROLLUP"),
+        ("SELECT date_trunc('day', ts) AS d FROM t FOR VERSION AS OF 1 GROUP BY 1", "FOR VERSION"),
+        ("SELECT date_trunc('day', ts) AS d FROM t {range_filter} GROUP BY 1", "range_filter"),
+        ("SELECT date_trunc('day', ts) AS d, count(*) AS n FROM t GROUP BY 1 LIMIT 10", "LIMIT"),
+        ("SELECT date_trunc('day', ts) AS d, count(*) AS n FROM t GROUP BY 1 OFFSET 5", "OFFSET"),
+        (
+            "SELECT date_trunc('day', ts) AS d, rank() OVER (ORDER BY count(*)) AS r FROM t GROUP BY 1",
+            "window functions",
+        ),
+        ("SELECT 1; SELECT 2", "single"),
+        ("   ", "empty"),
+        ("SELEC date_trunc('day', ts) FROM", "could not parse"),
+    ],
+)
+def test_rejected(sql, message):
+    with pytest.raises(ValueError, match=message):
+        parse_view_query(sql)
 
-    def test_among_other_projections(self):
-        p = parse_view_query("SELECT symbol, date_trunc('hour', ts) AS bucket, sum(x) AS s FROM t GROUP BY 1, 2")
-        assert p.bucket_alias == "bucket"
 
-    def test_reserved_word_alias(self):
-        """A Trino reserved word as alias still becomes a string."""
-        p = parse_view_query("SELECT date_trunc('minute', time) AS minute FROM t GROUP BY 1")
-        assert p.bucket_alias == "minute"
-
-    def test_chained_mv(self):
-        """date_trunc('hour', minute) AS hour — alias, not the source column."""
-        p = parse_view_query("SELECT date_trunc('hour', minute) AS hour FROM t GROUP BY 1")
-        assert p.bucket_alias == "hour"
-
-    def test_none_when_nested_inside_another_function(self):
-        """If ``date_trunc`` only appears inside another function, there is
-        no direct projection to alias, so ``bucket_alias`` is ``None``.
-        Config validation rejects such views only when ``full_refresh_chunk``
-        is set (see test_config.py); they remain valid otherwise."""
-        p = parse_view_query("SELECT from_iso8601_date(CAST(date_trunc('day', ts) AS varchar)) AS d FROM t GROUP BY 1")
-        # date_trunc still detected by _extract_date_trunc, but no direct
-        # projection item equals date_trunc('day', ts) so bucket_alias is None.
-        assert p.granularity == "day"
-        assert p.filter_column == "ts"
-        assert p.bucket_alias is None
+@pytest.mark.parametrize(
+    "where",
+    ["-- date_trunc('day', ts)", "/* date_trunc('day', ts) */", "AND y = 'date_trunc(''day'', ts)'"],
+)
+def test_date_trunc_in_comments_or_strings_does_not_count(where):
+    with pytest.raises(ValueError, match="time bucket"):
+        parse_view_query(f"SELECT sym, count(*) AS n FROM t WHERE x = 1 {where}\nGROUP BY sym")
 
 
 # ---------------------------------------------------------------------------
-# inject_range_filter
+# range_query
 # ---------------------------------------------------------------------------
 
-
-class TestInjectRangeFilter:
-    START = datetime(2026, 4, 6, tzinfo=UTC)
-    END = datetime(2026, 4, 13, tzinfo=UTC)
-
-    def _predicate(self):
-        return "ts >= TIMESTAMP '2026-04-06 00:00:00.000000 UTC' AND ts < TIMESTAMP '2026-04-13 00:00:00.000000 UTC'"
-
-    def test_appends_onto_existing_where(self):
-        sql = "SELECT date_trunc('day', ts) AS d FROM t WHERE color = 'red' GROUP BY 1"
-        out = inject_range_filter(sql, "ts", self.START, self.END)
-        # Original predicate still there, AND-joined with the new one,
-        # and GROUP BY still present.
-        assert "color = 'red'" in out
-        assert self._predicate() in out
-        assert out.count("WHERE") == 1
-        assert "GROUP BY 1" in out
-
-    def test_inserts_new_where_when_absent(self):
-        sql = "SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1"
-        out = inject_range_filter(sql, "ts", self.START, self.END)
-        assert "WHERE" in out
-        assert self._predicate() in out
-        assert "GROUP BY 1" in out
-        # Ordering: WHERE comes before GROUP BY
-        assert out.index("WHERE") < out.index("GROUP BY")
-
-    def test_places_before_having(self):
-        sql = "SELECT date_trunc('day', ts) AS d, count(*) AS c FROM t GROUP BY 1 HAVING c > 5"
-        out = inject_range_filter(sql, "ts", self.START, self.END)
-        assert out.index("WHERE") < out.index("GROUP BY") < out.index("HAVING")
-
-    def test_places_before_order_by(self):
-        sql = "SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1 ORDER BY d"
-        out = inject_range_filter(sql, "ts", self.START, self.END)
-        assert out.index("WHERE") < out.index("GROUP BY") < out.index("ORDER BY")
-
-    def test_places_before_limit(self):
-        sql = "SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1 LIMIT 10"
-        out = inject_range_filter(sql, "ts", self.START, self.END)
-        assert out.index("WHERE") < out.index("LIMIT")
-
-    def test_naive_datetime_omits_utc_suffix(self):
-        sql = "SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1"
-        start = datetime(2026, 4, 6)
-        end = datetime(2026, 4, 13)
-        out = inject_range_filter(sql, "ts", start, end)
-        assert "UTC" not in out
-        assert "TIMESTAMP '2026-04-06 00:00:00.000000'" in out
-
-    def test_tz_aware_non_utc_converted_to_utc(self):
-        from datetime import timedelta
-
-        tz = timezone(timedelta(hours=5))
-        start = datetime(2026, 4, 6, 5, 0, 0, tzinfo=tz)  # 00:00 UTC
-        end = datetime(2026, 4, 13, 5, 0, 0, tzinfo=tz)  # 00:00 UTC
-        sql = "SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1"
-        out = inject_range_filter(sql, "ts", start, end)
-        assert "TIMESTAMP '2026-04-06 00:00:00.000000 UTC'" in out
-        assert "TIMESTAMP '2026-04-13 00:00:00.000000 UTC'" in out
-
-    def test_existing_where_with_string_literal_containing_where(self):
-        # Regex paranoia: a string literal whose value contains the word
-        # 'WHERE' must land inside the parens, not split the body.
-        sql = "SELECT date_trunc('day', ts) AS d FROM t WHERE label = 'WHERE clause' GROUP BY 1"
-        out = inject_range_filter(sql, "ts", self.START, self.END)
-        body = out.split("WHERE", 1)[1].split("GROUP BY", 1)[0]
-        assert "(label = 'WHERE clause')" in body
-        assert self._predicate() in out
-
-    def test_existing_where_multiline_with_or(self):
-        sql = "SELECT date_trunc('day', ts) AS d FROM t\nWHERE region = 'US'\n   OR region = 'EU'\nGROUP BY 1"
-        out = inject_range_filter(sql, "ts", self.START, self.END)
-        body = out.split("WHERE", 1)[1].split("GROUP BY", 1)[0]
-        assert "(" in body and ")" in body
-        assert "region = 'US'" in body and "region = 'EU'" in body
-        assert self._predicate() in out
-
-    def test_existing_where_with_or_is_parenthesised(self):
-        # Regression: AND binds tighter than OR, so AND-appending the time
-        # predicate onto `WHERE A OR B` used to yield `A OR (B AND ts in range)`,
-        # leaving A-rows unfiltered by time and silently corrupting the target.
-        sql = "SELECT date_trunc('day', ts) AS d FROM t WHERE region = 'US' OR region = 'EU' GROUP BY 1"
-        out = inject_range_filter(sql, "ts", self.START, self.END)
-        # The injected SQL must filter every branch of the OR.
-        # Re-parsing as a simple precedence check: the OR must be inside parens
-        # so the trailing AND-chain applies to the whole disjunction.
-        where_body = out.split("WHERE", 1)[1].split("GROUP BY", 1)[0]
-        assert "(region = 'US' OR region = 'EU')" in where_body
-        assert self._predicate() in out
-
-    def test_result_parses_as_valid_query(self):
-        """Round-trip: inject, re-parse, extract same fields."""
-        sql = "SELECT symbol, date_trunc('week', ts) AS week, sum(qty) AS v FROM t WHERE color = 'red' GROUP BY 1, 2"
-        out = inject_range_filter(sql, "ts", self.START, self.END)
-        p = parse_view_query(out)
-        assert p.granularity == "week"
-        assert p.filter_column == "ts"
-        assert p.merge_keys == ("symbol", "week")
-
-    def test_line_comment_in_where_does_not_swallow_predicate(self):
-        # A `--` line comment in the WHERE clause must not consume the
-        # appended `AND ts >= ...` — that would silently drop the time
-        # filter and force a full-source rebuild on every refresh. The
-        # predicate must survive comment stripping (i.e., it's not shadowed
-        # by a `--` that runs through end-of-line).
-        import sqlparse
-
-        sql = "SELECT date_trunc('day', ts) AS d FROM t\nWHERE color = 'red' -- restrict to red rows\nGROUP BY 1"
-        out = inject_range_filter(sql, "ts", self.START, self.END)
-        stripped = sqlparse.format(out, strip_comments=True)
-        assert "ts >= TIMESTAMP" in stripped
-        assert "ts < TIMESTAMP" in stripped
-
-    def test_block_comment_in_where_does_not_break_injection(self):
-        import sqlparse
-
-        sql = "SELECT date_trunc('day', ts) AS d FROM t WHERE color = 'red' /* note */ GROUP BY 1"
-        out = inject_range_filter(sql, "ts", self.START, self.END)
-        stripped = sqlparse.format(out, strip_comments=True)
-        assert "ts >= TIMESTAMP" in stripped
-        assert "ts < TIMESTAMP" in stripped
+START = datetime(2026, 4, 6, tzinfo=UTC)
+END = datetime(2026, 4, 13, tzinfo=UTC)
 
 
-class TestInjectVersionPin:
-    """Pin the source-table read to an immutable snapshot id (issue #62 Bug 2).
-
-    Every chunk of a run must read the source ``FOR VERSION AS OF <M>`` so a
-    long run can't mix data from different source snapshots.
-    """
-
-    def test_pins_bare_table(self):
-        sql = "SELECT date_trunc('day', ts) AS d FROM iceberg.md.trades GROUP BY 1"
-        out = inject_version_pin(sql, "iceberg.md.trades", 42)
-        assert "iceberg.md.trades FOR VERSION AS OF 42" in out
-        # Re-parses cleanly and preserves the rest of the query.
-        assert "GROUP BY 1" in out
-        assert out.count("FOR VERSION AS OF") == 1
-
-    def test_pins_table_with_existing_where(self):
-        sql = "SELECT date_trunc('day', ts) AS d FROM iceberg.md.trades WHERE color = 'red' GROUP BY 1"
-        out = inject_version_pin(sql, "iceberg.md.trades", 7)
-        assert "iceberg.md.trades FOR VERSION AS OF 7" in out
-        assert "color = 'red'" in out
-
-    def test_composes_with_inject_range_filter(self):
-        # The executor pins THEN range-filters; the result must carry both the
-        # version pin and the time predicate, and re-parse to the same view.
-        sql = "SELECT symbol, date_trunc('day', ts) AS d, sum(q) AS v FROM iceberg.md.trades GROUP BY 1, 2"
-        pinned = inject_version_pin(sql, "iceberg.md.trades", 99)
-        ranged = inject_range_filter(pinned, "ts", datetime(2026, 4, 6, tzinfo=UTC), datetime(2026, 4, 13, tzinfo=UTC))
-        assert "iceberg.md.trades FOR VERSION AS OF 99" in ranged
-        assert "ts >= TIMESTAMP '2026-04-06 00:00:00.000000 UTC'" in ranged
-        assert "ts < TIMESTAMP '2026-04-13 00:00:00.000000 UTC'" in ranged
-        p = parse_view_query(ranged)
-        assert p.source_table == "iceberg.md.trades"
-        assert p.merge_keys == ("symbol", "d")
-
-    def test_pins_table_with_alias(self):
-        # A FROM with a table alias must keep the alias after the pin so the
-        # rest of the query (which may reference it) still resolves.
-        sql = "SELECT date_trunc('day', t.ts) AS d FROM iceberg.md.trades t GROUP BY 1"
-        out = inject_version_pin(sql, "iceberg.md.trades", 5)
-        assert "iceberg.md.trades FOR VERSION AS OF 5" in out
+def where_of(sql: str) -> str:
+    return sqlglot.parse_one(sql, read="trino").args["where"].sql(dialect="trino")
 
 
-class TestSingleSourceEnforced:
-    """A view query that references more than one base table cannot be pinned
-    to a single snapshot consistently (issue #62 Bug 2), so it must be rejected
-    at parse/validation time. Joins are the way to reference two tables."""
+def test_range_query_adds_filter_and_pin():
+    p = parse_view_query("SELECT date_trunc('day', ts) AS d, sum(x) AS s FROM iceberg.md.trades GROUP BY 1")
+    out = p.range_query(START, END, 42)
+    assert "FROM iceberg.md.trades FOR VERSION AS OF 42" in out
+    assert where_of(out) == (
+        "WHERE ts >= CAST('2026-04-06 00:00:00.000000 UTC' AS TIMESTAMP(6) WITH TIME ZONE) "
+        "AND ts < CAST('2026-04-13 00:00:00.000000 UTC' AS TIMESTAMP(6) WITH TIME ZONE)"
+    )
 
-    def test_join_rejected(self):
-        sql = "SELECT date_trunc('day', a.ts) AS d FROM iceberg.md.a a JOIN iceberg.md.b b ON a.id = b.id GROUP BY 1"
-        with pytest.raises(ValueError, match="single source table|join"):
-            parse_view_query(sql)
+
+def test_range_query_parenthesises_an_existing_or():
+    """``A OR B AND range`` would leave A-rows unfiltered by time."""
+    p = parse_view_query("SELECT date_trunc('day', ts) AS d FROM t WHERE a = 1 OR b = 2 GROUP BY 1")
+    assert where_of(p.range_query(START, END, 1)).startswith("WHERE (a = 1 OR b = 2) AND (ts >= ")
+
+
+def test_range_query_keeps_comments_from_swallowing_the_filter():
+    p = parse_view_query("SELECT date_trunc('day', ts) AS d FROM t WHERE a = 1 -- trailing\nGROUP BY 1")
+    out = p.range_query(START, END, 1)
+    assert "--" not in out
+    assert "ts >= " in where_of(out)
+
+
+def test_range_query_keeps_the_table_alias_and_qualifier():
+    p = parse_view_query("SELECT date_trunc('day', t.ts) AS d FROM iceberg.md.trades AS t GROUP BY 1")
+    out = p.range_query(START, END, 5)
+    assert "FROM iceberg.md.trades FOR VERSION AS OF 5 AS t" in out
+    assert "t.ts >= " in out
+
+
+def test_range_query_naive_timestamps_stay_naive():
+    p = parse_view_query("SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1")
+    out = p.range_query(datetime(2026, 4, 6), datetime(2026, 4, 7), 1)
+    assert "CAST('2026-04-06 00:00:00.000000' AS TIMESTAMP(6))" in out
+
+
+def test_range_query_converts_other_zones_to_utc():
+    p = parse_view_query("SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1")
+    plus4 = timezone(timedelta(hours=4))
+    out = p.range_query(datetime(2026, 4, 6, 4, tzinfo=plus4), datetime(2026, 4, 7, 4, tzinfo=plus4), 1)
+    assert "'2026-04-06 00:00:00.000000 UTC'" in out
+
+
+def test_range_query_does_not_mutate_the_parsed_view():
+    p = parse_view_query("SELECT date_trunc('day', ts) AS d FROM t GROUP BY 1")
+    first = p.range_query(START, END, 1)
+    assert p.range_query(START, END, 1) == first
+    assert first.count("FOR VERSION AS OF") == 1

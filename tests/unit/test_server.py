@@ -1983,7 +1983,7 @@ async def test_refresh_view_respects_query_timeout(setup_state, tmp_path):
     from iceberg_ivm.detector import ChangeResult, RefreshAction
     from iceberg_ivm.introspect import ColumnInfo
 
-    view = dataclasses.replace(setup_state.config.views[0], query_timeout_seconds=1)
+    view = setup_state.config.views[0].model_copy(update={"query_timeout_seconds": 1})
     setup_state.config = dataclasses.replace(setup_state.config, views=[view])
     setup_state.view_statuses[view.name] = ViewStatus(name=view.name)
     h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
@@ -2061,7 +2061,7 @@ async def test_refresh_external_cancel_propagates_past_timeout_handler(setup_sta
     from iceberg_ivm.introspect import ColumnInfo
 
     # Budget set generously so the timeout itself cannot plausibly fire.
-    view = dataclasses.replace(setup_state.config.views[0], query_timeout_seconds=3600)
+    view = setup_state.config.views[0].model_copy(update={"query_timeout_seconds": 3600})
     setup_state.config = dataclasses.replace(setup_state.config, views=[view])
     setup_state.view_statuses[view.name] = ViewStatus(name=view.name)
     h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
@@ -2312,7 +2312,7 @@ def test_create_view_fails_on_arithmetic(client, setup_state):
         },
     )
     assert r.status_code == 422
-    assert "arithmetic" in r.json()["detail"]
+    assert "time bucket" in r.json()["detail"]
 
 
 # ── /api/views/parse — live validation for the UI ──
@@ -2343,7 +2343,7 @@ def test_parse_query_rejects_invalid(client):
         },
     )
     assert r.status_code == 422
-    assert "arithmetic" in r.json()["detail"]
+    assert "time bucket" in r.json()["detail"]
 
 
 def test_parse_query_rejects_legacy_placeholder(client):
@@ -2574,7 +2574,7 @@ async def test_refresh_view_chunked_full_completes_clears_current_work(setup_sta
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=42)
 
     async def fake_execute_refresh(*a, **kw):
-        seen["max_snapshot"] = kw.get("max_snapshot")
+        seen["max_snapshot"] = kw.get("snapshot")
         seen["resume_from"] = kw.get("resume_from")
         for i in range(1, 4):
             yield QueryInfo(
@@ -2633,7 +2633,7 @@ async def test_refresh_view_full_resume_reads_current_work(setup_state, tmp_path
         raise AssertionError("detect_changes must not be called when resuming current_work")
 
     async def fake_execute_refresh(*a, **kw):
-        seen["max_snapshot"] = kw.get("max_snapshot")
+        seen["max_snapshot"] = kw.get("snapshot")
         seen["resume_from"] = kw.get("resume_from")
         yield QueryInfo(
             query_id="q1",
@@ -2754,7 +2754,7 @@ async def test_refresh_view_incremental_interrupt_persists_current_work(setup_st
     async def fake_execute_refresh(*a, **kw):
         # Fresh run → no resume point threaded.
         assert kw.get("resume_from") is None
-        assert kw.get("max_snapshot") == 42  # pinned for the whole run
+        assert kw.get("snapshot") == 42  # pinned for the whole run
         yield QueryInfo(
             query_id="q1",
             info_uri="http://trino/q1",
@@ -2830,7 +2830,7 @@ async def test_refresh_view_incremental_resume_reuses_pinned_snapshot(setup_stat
         return (datetime(2026, 5, 16, tzinfo=UTC), datetime(2026, 5, 19, tzinfo=UTC))
 
     async def fake_execute_refresh(*a, **kw):
-        seen["exec_max_snapshot"] = kw.get("max_snapshot")
+        seen["exec_max_snapshot"] = kw.get("snapshot")
         seen["resume_from"] = kw.get("resume_from")
         yield QueryInfo(
             query_id="q1",
@@ -2896,7 +2896,7 @@ async def test_refresh_view_expired_bookmark_discards_current_work(setup_state, 
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=200)
 
     async def fake_execute_refresh(*a, **kw):
-        seen["max_snapshot"] = kw.get("max_snapshot")
+        seen["max_snapshot"] = kw.get("snapshot")
         seen["resume_from"] = kw.get("resume_from")
         yield QueryInfo(
             query_id="q1",
@@ -2960,7 +2960,7 @@ async def test_refresh_view_full_backfill_resume_recovers_when_pinned_snapshot_e
         return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=200)
 
     async def fake_execute_refresh(*a, **kw):
-        seen["max_snapshot"] = kw.get("max_snapshot")
+        seen["max_snapshot"] = kw.get("snapshot")
         seen["resume_from"] = kw.get("resume_from")
         yield QueryInfo(
             query_id="q1",
@@ -2994,17 +2994,15 @@ async def test_refresh_view_full_backfill_resume_recovers_when_pinned_snapshot_e
         await h.close()
 
 
-async def test_refresh_view_resumed_incremental_empty_window_does_not_advance_bookmark(setup_state, tmp_path):
-    """Resume guard: if a resumed incremental's frozen window comes back empty
-    even though chunks were already committed (an INTERIOR change snapshot
-    expired — the endpoint snapshot_exists probes can't catch that), the
-    bookmark must NOT advance to M (that would orphan the un-merged chunks
-    above the resume point). current_work is discarded and the bookmark left
-    unchanged so the next tick re-derives a fresh window and re-covers them."""
+async def test_refresh_view_resume_with_broken_lineage_discards_run_and_redetects(setup_state, tmp_path):
+    """If the pinned window can no longer be derived (an interior snapshot
+    expired, so the bookmark is no longer an ancestor of the pin), the run is
+    discarded and the tick falls back to fresh detection — never advancing the
+    bookmark past chunks that were not merged."""
     from datetime import datetime
 
     from iceberg_ivm import server as server_mod
-    from iceberg_ivm.executor import QueryInfo
+    from iceberg_ivm.detector import ChangeResult, FullRefreshNeeded, RefreshAction
 
     view = _install_chunked_view(setup_state)
     setup_state.view_statuses["test_view"] = ViewStatus(name="test_view", total_refreshes=0)
@@ -3013,30 +3011,23 @@ async def test_refresh_view_resumed_incremental_empty_window_does_not_advance_bo
     h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
     await h.open()
     setup_state.history = h
-    await h.set_last_source_snapshot(view.name, 10)  # bookmark present → incremental resume
-    await h.set_current_work(view.name, 42, datetime(2026, 5, 17, tzinfo=UTC))  # committed up to chunk end
+    await h.set_last_source_snapshot(view.name, 10)
+    await h.set_current_work(view.name, 42, datetime(2026, 5, 17, tzinfo=UTC))
 
     executed = {"ran": False}
 
     async def fake_detect(*a, **kw):
-        raise AssertionError("detect_changes must not be called on resume")
+        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=50)
 
     async def fake_range_since(*a, **kw):
-        return None  # interior snapshot expired → window now empty
+        raise FullRefreshNeeded("bookmark 10 is not an ancestor of 42")
 
     async def fake_execute_refresh(*a, **kw):
         executed["ran"] = True
-        yield QueryInfo(
-            query_id="q",
-            info_uri="u",
-            stage="chunk_merge",
-            started_at=1.0,
-            elapsed_ms=1.0,
-            range_start=datetime(2026, 5, 17, tzinfo=UTC),
-            range_end=datetime(2026, 5, 18, tzinfo=UTC),
-            chunks_done=1,
-            chunks_total=1,
-        )
+        executed["snapshot"] = kw.get("snapshot")
+        executed["resume_from"] = kw.get("resume_from")
+        return
+        yield
 
     try:
         with (
@@ -3049,10 +3040,9 @@ async def test_refresh_view_resumed_incremental_empty_window_does_not_advance_bo
         ):
             await server_mod.refresh_view(setup_state, view)
 
-        # No merge ran; bookmark UNCHANGED (not advanced to 42); current_work cleared
-        # so the next tick re-derives a fresh window from bookmark 10.
-        assert executed["ran"] is False
-        assert await h.get_last_source_snapshot(view.name) == 10
+        # The interrupted run was discarded and a fresh full refresh ran at 50.
+        assert executed == {"ran": True, "snapshot": 50, "resume_from": None}
+        assert await h.get_last_source_snapshot(view.name) == 50
         assert await h.get_current_work(view.name) == (None, None)
     finally:
         await h.close()
@@ -3074,3 +3064,198 @@ def test_chunk_metrics_defined():
     assert "mv_chunks_completed_total" in text
     assert "mv_chunk_duration_seconds" in text
     assert "mv_chunk_rows_written_total" in text
+
+
+# ── Idle ticks, forced full refreshes, query cancellation, auth ──
+
+
+async def test_idle_tick_does_not_touch_the_target(setup_state):
+    """Detection runs first; column discovery and CREATE TABLE only when there is work."""
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+
+    discover = AsyncMock()
+    with (
+        patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+        patch.object(server_mod, "discover_columns", discover),
+        patch.object(
+            server_mod,
+            "detect_changes",
+            AsyncMock(return_value=ChangeResult(RefreshAction.NO_CHANGE, current_snapshot=7)),
+        ),
+    ):
+        await server_mod.refresh_view(setup_state, setup_state.config.views[0])
+    discover.assert_not_awaited()
+    assert setup_state.view_statuses["test_view"].last_action == "skip"
+
+
+async def test_forced_full_refresh_clears_the_bookmark_before_running(setup_state, tmp_path):
+    """So that a restart mid-run resumes it as a full refresh, not an incremental one."""
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+    view = setup_state.config.views[0]
+    await h.set_last_source_snapshot(view.name, 10)
+    seen = {}
+
+    async def interrupted_refresh(*a, **kw):
+        seen["bookmark_during_run"] = await h.get_last_source_snapshot(view.name)
+        raise RuntimeError("worker died")
+        yield
+
+    try:
+        with (
+            patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+            patch.object(server_mod, "discover_columns", _fake_discover),
+            patch.object(
+                server_mod,
+                "detect_changes",
+                AsyncMock(return_value=ChangeResult(RefreshAction.FULL_REFRESH, current_snapshot=50)),
+            ),
+            patch.object(server_mod, "execute_refresh", interrupted_refresh),
+        ):
+            await server_mod.refresh_view(setup_state, view)
+        assert seen["bookmark_during_run"] is None
+        assert await h.get_current_work(view.name) == (50, None)
+    finally:
+        await h.close()
+
+
+async def test_closing_the_connection_cancels_running_queries():
+    from iceberg_ivm.server import _Connection
+
+    cursors = [AsyncMock(), AsyncMock()]
+    raw = AsyncMock()
+    raw.cursor.side_effect = cursors
+    conn = _Connection(raw)
+    await conn.cursor()
+    await conn.cursor()
+    cursors[0].cancel.side_effect = RuntimeError("already gone")  # must not stop the others
+    await conn.close()
+    for c in cursors:
+        c.cancel.assert_awaited_once()
+    raw.close.assert_awaited_once()
+
+
+def test_password_protects_ui_and_api_but_not_probes(client, monkeypatch):
+    import base64
+
+    monkeypatch.setenv("IVM_PASSWORD", "s3cret")
+    assert client.get("/api/views").status_code == 401
+    assert client.get("/").headers["www-authenticate"].startswith("Basic")
+    assert client.get("/health").status_code == 200
+    assert client.get("/metrics").status_code == 200
+    wrong = base64.b64encode(b"admin:nope").decode()
+    assert client.get("/api/views", headers={"Authorization": f"Basic {wrong}"}).status_code == 401
+    right = base64.b64encode(b"anyone:s3cret").decode()
+    assert client.get("/api/views", headers={"Authorization": f"Basic {right}"}).status_code == 200
+
+
+def test_no_password_means_open_access(client, monkeypatch):
+    monkeypatch.delenv("IVM_PASSWORD", raising=False)
+    assert client.get("/api/views").status_code == 200
+
+
+async def test_missing_source_table_is_waiting_not_an_error(setup_state):
+    """A chained view's upstream target may not exist yet on the first tick."""
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import SourceNotFound
+
+    vs = setup_state.view_statuses["test_view"]
+    errors_before = vs.total_errors
+    with (
+        patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+        patch.object(server_mod, "detect_changes", AsyncMock(side_effect=SourceNotFound("waiting for x to exist"))),
+    ):
+        await server_mod.refresh_view(setup_state, setup_state.config.views[0])
+    assert (vs.last_action, vs.last_error, vs.note) == ("waiting", None, "waiting for x to exist")
+    assert vs.total_errors == errors_before
+
+
+async def test_source_not_found_is_raised_for_missing_tables_only():
+    from iceberg_ivm.detector import SourceNotFound, get_current_snapshot
+
+    class Missing(Exception):
+        error_name = "TABLE_NOT_FOUND"
+
+    class Broken(Exception):
+        error_name = "GENERIC_INTERNAL_ERROR"
+
+    for exc, expected in ((Missing("gone"), SourceNotFound), (Broken("boom"), Broken)):
+        cursor = AsyncMock()
+        cursor.execute.side_effect = exc
+        with pytest.raises(expected):
+            await get_current_snapshot(cursor, "iceberg.a.b")
+
+
+async def test_rebuild_clears_the_bookmark_at_the_next_tick(setup_state, tmp_path):
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+    view = setup_state.config.views[0]
+    await h.set_last_source_snapshot(view.name, 10)
+    setup_state.view_runtimes["test_view"] = server_mod.ViewRuntime(rebuild_requested=True)
+    seen = {}
+
+    async def detect(cursor, source, column, granularity, bookmark):
+        seen["bookmark"] = bookmark
+        return ChangeResult(RefreshAction.NO_CHANGE, current_snapshot=None)
+
+    try:
+        with (
+            patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+            patch.object(server_mod, "detect_changes", detect),
+        ):
+            await server_mod.refresh_view(setup_state, view)
+        assert seen["bookmark"] is None  # → detection answers FULL_REFRESH
+        assert setup_state.view_runtimes["test_view"].rebuild_requested is False
+    finally:
+        await h.close()
+
+
+def test_rebuild_unknown_view_is_404(client):
+    assert client.post("/api/views/nope/rebuild").status_code == 404
+
+
+async def test_freshness_is_recorded_on_refresh_and_on_idle_ticks(setup_state):
+    from datetime import datetime
+
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.executor import QueryInfo
+
+    view = setup_state.config.views[0]
+    vs = setup_state.view_statuses["test_view"]
+    setup_state.stop_event.clear()
+    at_100 = datetime.fromtimestamp(100, tz=UTC)
+    at_200 = datetime.fromtimestamp(200, tz=UTC)
+
+    async def one_merge(*a, **kw):
+        yield QueryInfo(query_id="q", info_uri="", stage="merge", started_at=0, elapsed_ms=1)
+
+    def run(result):
+        return (
+            patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+            patch.object(server_mod, "discover_columns", _fake_discover),
+            patch.object(server_mod, "detect_changes", AsyncMock(return_value=result)),
+            patch.object(server_mod, "execute_refresh", one_merge),
+        )
+
+    with contextlib.ExitStack() as stack:
+        for p in run(ChangeResult(RefreshAction.FULL_REFRESH, 1, committed_at=at_100)):
+            stack.enter_context(p)
+        await server_mod.refresh_view(setup_state, view)
+    assert (vs.source_committed_at, vs.data_as_of) == (100, 100)
+    assert vs.last_checked is not None
+
+    with contextlib.ExitStack() as stack:
+        for p in run(ChangeResult(RefreshAction.NO_CHANGE, 2, committed_at=at_200)):
+            stack.enter_context(p)
+        await server_mod.refresh_view(setup_state, view)
+    assert (vs.source_committed_at, vs.data_as_of) == (200, 200)

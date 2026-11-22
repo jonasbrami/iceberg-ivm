@@ -3,6 +3,8 @@ name = "iceberg-ivm"
 dynamic = ["version"]
 description = "Incremental view maintenance for Iceberg tables on Trino"
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [
     { name = "Jonas Brami", email = "jonasbrami@gmail.com" }
 ]
@@ -14,7 +16,7 @@ dependencies = [
     "fastapi>=0.135.3",
     "uvicorn>=0.44.0",
     "prometheus-client>=0.25.0",
-    "sqlparse>=0.4",
+    "sqlglot>=30.33.0",
 ]
 
 [project.scripts]

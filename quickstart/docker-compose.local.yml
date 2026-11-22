@@ -6,7 +6,7 @@
 #
 #   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
 #
-# Everything else in the stack (Trino, Postgres, MinIO, seed) keeps using
+# Everything else in the stack (Trino, Postgres, seed) keeps using
 # its pinned image — no need to redo the slow bits when only orchestrator
 # code changed.
 

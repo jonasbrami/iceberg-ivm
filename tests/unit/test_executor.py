@@ -19,7 +19,7 @@ def make_view(**overrides) -> ViewConfig:
             "FROM iceberg.market_data.trades "
             "GROUP BY 1, 2"
         ),
-        "target_table": "iceberg.analytics.ohlcv_1m",
+        "target_table": "iceberg.out.mv",
     }
     defaults.update(overrides)
     return ViewConfig(**defaults)
@@ -63,18 +63,34 @@ def _files_row(column: str, lower: str, upper: str) -> tuple:
 
 
 class TestBuildMergeSql:
-    def test_structure(self):
-        sql = build_merge_sql(
-            "iceberg.out.mv",
-            "SELECT a FROM t WHERE ts >= X AND ts < Y GROUP BY 1",
-            merge_keys=("symbol", "day"),
-            value_columns=["volume"],
-        )
-        assert "MERGE INTO iceberg.out.mv AS t" in sql
-        assert "ON t.symbol = s.symbol AND t.day = s.day" in sql
-        assert "WHEN MATCHED THEN UPDATE SET volume = s.volume" in sql
-        assert "WHEN NOT MATCHED THEN INSERT" in sql
-        assert "ts >= X AND ts < Y" in sql
+    START = datetime(2026, 4, 8, tzinfo=UTC)
+    END = datetime(2026, 4, 9, tzinfo=UTC)
+
+    def sql(self, keys=("day", "symbol"), values=("volume",)):
+        return build_merge_sql("iceberg.out.mv", "SELECT 1", tuple(keys), "day", list(values), self.START, self.END)
+
+    def test_replaces_the_target_range(self):
+        sql = self.sql()
+        assert sql.startswith("MERGE INTO iceberg.out.mv AS t")
+        # Existing target keys in the range are joined in, so vanished groups get deleted.
+        assert 'SELECT "day", "symbol" FROM iceberg.out.mv' in sql
+        assert "WHERE \"day\" >= CAST('2026-04-08 00:00:00.000000 UTC' AS TIMESTAMP(6) WITH TIME ZONE)" in sql
+        assert 'WHEN MATCHED AND s."__ivm_gone" THEN DELETE' in sql
+        assert 'WHEN MATCHED THEN UPDATE SET "volume" = s."volume"' in sql
+        assert 'WHEN NOT MATCHED AND NOT s."__ivm_gone" THEN INSERT ("day", "symbol", "volume")' in sql
+
+    def test_keys_match_null_safely_except_the_bucket(self):
+        sql = self.sql()
+        assert 'ON t."day" = s."day" AND t."symbol" IS NOT DISTINCT FROM s."symbol"' in sql
+        assert 'ON n."day" = o."day" AND n."symbol" IS NOT DISTINCT FROM o."symbol"' in sql
+
+    def test_no_value_columns_has_no_update_clause(self):
+        sql = self.sql(values=())
+        assert "UPDATE SET" not in sql
+        assert 'INSERT ("day", "symbol") VALUES (s."day", s."symbol")' in sql
+
+    def test_identifiers_are_quoted(self):
+        assert '"order"' in self.sql(keys=("day", "order"))
 
 
 # ── execute_refresh: incremental path ──
@@ -92,11 +108,10 @@ class TestExecuteRefreshIncremental:
             async for q in execute_refresh(
                 cursor,
                 view,
-                "iceberg.out.mv",
                 parsed,
                 ["volume"],
-                incremental_range=(r_start, r_end),
-                max_snapshot=99,
+                window=(r_start, r_end),
+                snapshot=99,
             )
         ]
         assert len(queries) == 1
@@ -106,8 +121,8 @@ class TestExecuteRefreshIncremental:
         assert q.range_start == r_start and q.range_end == r_end
         assert q.chunks_done == 1 and q.chunks_total == 1
         merge = cursor.executed[-1]
-        assert "ts >= TIMESTAMP '2026-04-08 00:00:00.000000 UTC'" in merge
-        assert "ts < TIMESTAMP '2026-04-09 00:00:00.000000 UTC'" in merge
+        assert "ts >= CAST('2026-04-08 00:00:00.000000 UTC' AS TIMESTAMP(6) WITH TIME ZONE)" in merge
+        assert "ts < CAST('2026-04-09 00:00:00.000000 UTC' AS TIMESTAMP(6) WITH TIME ZONE)" in merge
         assert "MERGE INTO iceberg.out.mv" in merge
 
     async def test_large_window_with_chunk_emits_one_merge_per_chunk(self):
@@ -126,11 +141,10 @@ class TestExecuteRefreshIncremental:
             async for q in execute_refresh(
                 cursor,
                 view,
-                "iceberg.out.mv",
                 parsed,
                 ["volume"],
-                incremental_range=(r_start, r_end),
-                max_snapshot=99,
+                window=(r_start, r_end),
+                snapshot=99,
             )
         ]
         assert len(queries) == 3
@@ -160,12 +174,11 @@ class TestExecuteRefreshIncremental:
             async for q in execute_refresh(
                 cursor,
                 view,
-                "iceberg.out.mv",
                 parsed,
                 ["volume"],
-                incremental_range=(r_start, r_end),
+                window=(r_start, r_end),
                 resume_from=datetime(2026, 5, 17, tzinfo=UTC),
-                max_snapshot=99,
+                snapshot=99,
             )
         ]
         assert len(queries) == 2
@@ -187,12 +200,11 @@ class TestExecuteRefreshIncremental:
             async for q in execute_refresh(
                 cursor,
                 view,
-                "iceberg.out.mv",
                 parsed,
                 ["volume"],
-                incremental_range=(r_start, r_end),
+                window=(r_start, r_end),
                 resume_from=datetime(2026, 5, 18, 6, tzinfo=UTC),
-                max_snapshot=99,
+                snapshot=99,
             )
         ]
         assert len(queries) == 1
@@ -213,12 +225,11 @@ class TestExecuteRefreshIncremental:
             async for q in execute_refresh(
                 cursor,
                 view,
-                "iceberg.out.mv",
                 parsed,
                 ["volume"],
-                incremental_range=(r_start, r_end),
+                window=(r_start, r_end),
                 resume_from=datetime(2026, 5, 10, tzinfo=UTC),
-                max_snapshot=99,
+                snapshot=99,
             )
         ]
         assert len(queries) == 3
@@ -237,11 +248,10 @@ class TestExecuteRefreshIncremental:
             async for q in execute_refresh(
                 cursor,
                 view,
-                "iceberg.out.mv",
                 parsed,
                 ["volume"],
-                incremental_range=(r_start, r_end),
-                max_snapshot=99,
+                window=(r_start, r_end),
+                snapshot=99,
             )
         ]
         assert len(queries) == 1
@@ -268,11 +278,10 @@ class TestExecuteRefreshIncremental:
             async for q in execute_refresh(
                 cursor,
                 view,
-                "iceberg.out.mv",
                 parsed,
                 ["volume"],
-                incremental_range=(datetime(2026, 2, 10, tzinfo=UTC), datetime(2026, 4, 15, tzinfo=UTC)),
-                max_snapshot=99,
+                window=(datetime(2026, 2, 10, tzinfo=UTC), datetime(2026, 4, 15, tzinfo=UTC)),
+                snapshot=99,
             )
         ]
         assert len(queries) == 1
@@ -301,12 +310,11 @@ class TestExecuteRefreshIncremental:
             async for q in execute_refresh(
                 cursor,
                 view,
-                "iceberg.out.mv",
                 parsed,
                 [],
-                incremental_range=(r_start, r_end),
+                window=(r_start, r_end),
                 resume_from=datetime(2026, 1, 14, tzinfo=UTC),
-                max_snapshot=99,
+                snapshot=99,
             )
         ]
         assert len(queries) == 2
@@ -327,12 +335,11 @@ class TestExecuteRefreshIncremental:
             async for q in execute_refresh(
                 cursor,
                 view,
-                "iceberg.out.mv",
                 parsed,
                 ["volume"],
-                incremental_range=(datetime(2026, 5, 16, tzinfo=UTC), datetime(2026, 5, 19, tzinfo=UTC)),
+                window=(datetime(2026, 5, 16, tzinfo=UTC), datetime(2026, 5, 19, tzinfo=UTC)),
                 resume_from=datetime(2026, 5, 19, tzinfo=UTC),
-                max_snapshot=99,
+                snapshot=99,
             )
         ]
         assert queries == []
@@ -357,10 +364,9 @@ class TestExecuteRefreshSingleShotFull:
             async for q in execute_refresh(
                 cursor,
                 view,
-                "iceberg.out.mv",
                 parsed,
                 ["volume"],
-                max_snapshot=99,
+                snapshot=99,
             )
         ]
         assert len(queries) == 1
@@ -370,8 +376,8 @@ class TestExecuteRefreshSingleShotFull:
         assert q.range_start == datetime(2026, 4, 8, tzinfo=UTC)
         assert q.range_end == datetime(2026, 4, 11, tzinfo=UTC)
         merge = cursor.executed[-1]
-        assert "ts >= TIMESTAMP '2026-04-08 00:00:00.000000 UTC'" in merge
-        assert "ts < TIMESTAMP '2026-04-11 00:00:00.000000 UTC'" in merge
+        assert "ts >= CAST('2026-04-08 00:00:00.000000 UTC' AS TIMESTAMP(6) WITH TIME ZONE)" in merge
+        assert "ts < CAST('2026-04-11 00:00:00.000000 UTC' AS TIMESTAMP(6) WITH TIME ZONE)" in merge
 
     async def test_empty_source_emits_nothing(self):
         view = make_view()
@@ -382,10 +388,9 @@ class TestExecuteRefreshSingleShotFull:
             async for q in execute_refresh(
                 cursor,
                 view,
-                "iceberg.out.mv",
                 parsed,
                 ["volume"],
-                max_snapshot=99,
+                snapshot=99,
             )
         ]
         assert queries == []
@@ -410,10 +415,9 @@ class TestExecuteRefreshChunked:
             async for q in execute_refresh(
                 cursor,
                 view,
-                "iceberg.out.mv",
                 parsed,
                 ["volume"],
-                max_snapshot=99,
+                snapshot=99,
             )
         ]
         assert len(queries) == 3
@@ -428,13 +432,9 @@ class TestExecuteRefreshChunked:
         assert len({q.query_id for q in queries}) == 3
 
     async def test_no_resume_marker_starts_from_source_beginning_despite_target_data(self):
-        # CORRECTNESS (issue #62): a forced full refresh with NO committed
-        # progress marker (bookmark gone → from-beginning recompute) must
-        # start at the SOURCE's beginning, even when the target already holds
-        # historical buckets. The old code resumed from max(bucket) in the
-        # target and walked forward only, silently skipping older buckets the
-        # source may have overwritten. The executor must NOT read the target's
-        # $files on this path: with resume_from=None it walks every chunk.
+        # A full refresh with no progress marker starts at the source's
+        # beginning even when the target already holds later buckets — it must
+        # never resume from what the target happens to contain.
         view = make_view(
             full_refresh_chunk="day",
             query=("SELECT symbol, date_trunc('minute', ts) AS minute FROM iceberg.market_data.trades GROUP BY 1, 2"),
@@ -457,11 +457,10 @@ class TestExecuteRefreshChunked:
             async for q in execute_refresh(
                 cursor,
                 view,
-                "iceberg.out.mv",
                 parsed,
                 [],
                 resume_from=None,
-                max_snapshot=99,
+                snapshot=99,
             )
         ]
         # Every day-chunk from the source's start is re-MERGEd from scratch.
@@ -469,12 +468,32 @@ class TestExecuteRefreshChunked:
         assert queries[0].range_start == datetime(2026, 4, 8, tzinfo=UTC)
         assert queries[1].range_start == datetime(2026, 4, 9, tzinfo=UTC)
         assert queries[2].range_start == datetime(2026, 4, 10, tzinfo=UTC)
-        # The target's $files must never be consulted on the full-refresh path:
-        # the only metadata query issued is the source $files range read.
-        assert sum("$files" in s for s in cursor.executed if s.upper().startswith("SELECT")) == 1
-        assert not any("content = 0" in s for s in cursor.executed), (
-            "full-refresh path must not read the target's bucket max"
+        # The target's range only widens the window; it never moves its start.
+
+    async def test_full_refresh_window_covers_target_rows_outside_the_source(self):
+        """Target buckets the source no longer produces (e.g. from an earlier
+        query on the same table) fall inside the window, so the MERGE deletes them."""
+        view = make_view(
+            full_refresh_chunk="day",
+            query=("SELECT symbol, date_trunc('minute', ts) AS minute FROM iceberg.market_data.trades GROUP BY 1, 2"),
         )
+        parsed = parse_view_query(view.query)
+        cursor = MockCursor(
+            fetchall_responses=[
+                [_files_row("ts", "2026-04-09T10:00:00+00:00", "2026-04-09T15:00:00+00:00")],
+                [_files_row("minute", "2026-04-07T00:00:00+00:00", "2026-04-07T23:59:00+00:00")],
+            ],
+        )
+        queries = [q async for q in execute_refresh(cursor, view, parsed, [], snapshot=99)]
+        assert [q.range_start.day for q in queries] == [7, 8, 9]
+
+    async def test_full_refresh_of_empty_source_clears_the_target(self):
+        view = make_view()
+        parsed = parse_view_query(view.query)
+        cursor = MockCursor(fetchall_responses=[[], [_files_row("day", "2026-04-07T00:00:00", "2026-04-07T00:00:00")]])
+        queries = [q async for q in execute_refresh(cursor, view, parsed, ["volume"], snapshot=99)]
+        assert len(queries) == 1
+        assert "THEN DELETE" in cursor.executed[-1]
 
     async def test_resume_from_marker_floors_to_containing_chunk(self):
         # Interruption-resume: a committed-progress marker from THIS
@@ -500,18 +519,15 @@ class TestExecuteRefreshChunked:
             async for q in execute_refresh(
                 cursor,
                 view,
-                "iceberg.out.mv",
                 parsed,
                 [],
                 resume_from=datetime(2026, 4, 9, tzinfo=UTC),
-                max_snapshot=99,
+                snapshot=99,
             )
         ]
         assert len(queries) == 2
         assert queries[0].range_start == datetime(2026, 4, 9, tzinfo=UTC)
         assert queries[1].range_start == datetime(2026, 4, 10, tzinfo=UTC)
-        # No target $files read even when resuming.
-        assert not any("content = 0" in s for s in cursor.executed)
 
     async def test_resume_marker_mid_chunk_remerges_containing_chunk(self):
         # Marker lands mid-chunk (an interrupted run committed a coarser chunk,
@@ -534,11 +550,10 @@ class TestExecuteRefreshChunked:
             async for q in execute_refresh(
                 cursor,
                 view,
-                "iceberg.out.mv",
                 parsed,
                 [],
                 resume_from=datetime(2026, 4, 10, 6, tzinfo=UTC),
-                max_snapshot=99,
+                snapshot=99,
             )
         ]
         assert len(queries) == 1
@@ -562,11 +577,10 @@ class TestExecuteRefreshChunked:
             async for q in execute_refresh(
                 cursor,
                 view,
-                "iceberg.out.mv",
                 parsed,
                 ["volume"],
                 resume_from=None,
-                max_snapshot=99,
+                snapshot=99,
             )
         ]
         source_min_day = datetime(2026, 4, 8, tzinfo=UTC)
@@ -591,10 +605,9 @@ class TestExecuteRefreshChunked:
         async for q in execute_refresh(
             cursor,
             view,
-            "iceberg.out.mv",
             parsed,
             ["volume"],
-            max_snapshot=99,
+            snapshot=99,
         ):
             collected.append(q)
             break  # stop after the first chunk commits
@@ -611,10 +624,9 @@ class TestExecuteRefreshChunked:
             async for q in execute_refresh(
                 cursor,
                 view,
-                "iceberg.out.mv",
                 parsed,
                 ["volume"],
-                max_snapshot=99,
+                snapshot=99,
             )
         ]
         assert queries == []
@@ -641,11 +653,10 @@ class TestExecuteRefreshChunked:
             async for q in execute_refresh(
                 cursor,
                 view,
-                "iceberg.out.mv",
                 parsed,
                 [],
                 resume_from=None,
-                max_snapshot=99,
+                snapshot=99,
             )
         ]
         assert len(queries) == 3
@@ -671,11 +682,10 @@ class TestExecuteRefreshPinsSnapshot:
             async for q in execute_refresh(
                 cursor,
                 view,
-                "iceberg.out.mv",
                 parsed,
                 ["volume"],
-                max_snapshot=12345,
-                incremental_range=(datetime(2026, 5, 16, tzinfo=UTC), datetime(2026, 5, 19, tzinfo=UTC)),
+                snapshot=12345,
+                window=(datetime(2026, 5, 16, tzinfo=UTC), datetime(2026, 5, 19, tzinfo=UTC)),
             )
         ]
         assert len(queries) == 3

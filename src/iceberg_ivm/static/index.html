@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>iceberg-ivm</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 96 96' fill='none' stroke='%233B82F6' stroke-width='7' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M24 50 L41 21 L50 35 L57 27 L72 50'/%3E%3Cpath d='M14 50 H82'/%3E%3Cpath d='M27 50 L36 70 L58 76 L69 50' opacity='.4'/%3E%3C/svg%3E">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&family=Instrument+Mono:wght@300;400;500&display=swap" rel="stylesheet">
@@ -701,6 +702,8 @@ function app() {
         incremental:  {label: 'incremental', cls: 'bg-emerald-500/[0.10] text-emerald-700 border-emerald-500/[0.3]', dotCls: 'bg-emerald-500', pulse: true},
         full:         {label: 'full',        cls: 'bg-amber-500/[0.12] text-amber-700 border-amber-500/[0.3]',     dotCls: 'bg-amber-500',   pulse: true},
         chunked_full: {label: 'backfill',    cls: 'bg-amber-500/[0.12] text-amber-700 border-amber-500/[0.3]',     dotCls: 'bg-amber-500',   pulse: true},
+        chunked_incremental: {label: 'catch-up', cls: 'bg-emerald-500/[0.10] text-emerald-700 border-emerald-500/[0.3]', dotCls: 'bg-emerald-500', pulse: true},
+        waiting:      {label: 'waiting',     cls: 'bg-[#f0f0f6] text-[#666684] border-[rgba(15,15,30,0.06)]', dotCls: 'bg-[#a8a8c0]', pulse: false},
       };
       if (tbl[action]) out.push(tbl[action]);
       if (st?.last_error) {

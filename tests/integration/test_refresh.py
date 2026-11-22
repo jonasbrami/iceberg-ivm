@@ -101,9 +101,7 @@ class TestFullRefresh:
         result = await detect_changes(cursor, SOURCE_TABLE, "ts", "minute", last_snapshot=None)
         assert result.action == RefreshAction.FULL_REFRESH
 
-        await _drain(
-            execute_refresh(cursor, VIEW, TARGET_TABLE, PARSED, value_cols, max_snapshot=result.current_snapshot)
-        )
+        await _drain(execute_refresh(cursor, VIEW, PARSED, value_cols, snapshot=result.current_snapshot))
         bars = await query_bars(cursor)
         assert len(bars) == 3
         b = [b for b in bars if "09:30" in str(b["minute"])][0]
@@ -122,7 +120,7 @@ class TestIncrementalRefresh:
         cols = await discover_columns(cursor, VIEW.query)
         await cursor.execute(build_create_table_sql(TARGET_TABLE, cols, "ARRAY['day(minute)']"))
         M = await get_current_snapshot(cursor, SOURCE_TABLE)
-        await _drain(execute_refresh(cursor, VIEW, TARGET_TABLE, PARSED, value_cols, max_snapshot=M))
+        await _drain(execute_refresh(cursor, VIEW, PARSED, value_cols, snapshot=M))
 
         result = await detect_changes(cursor, SOURCE_TABLE, "ts", "minute", last_snapshot=None)
 
@@ -136,11 +134,10 @@ class TestIncrementalRefresh:
             execute_refresh(
                 cursor,
                 VIEW,
-                TARGET_TABLE,
                 PARSED,
                 value_cols,
-                incremental_range=result.filter_range,
-                max_snapshot=result.current_snapshot,
+                window=result.filter_range,
+                snapshot=result.current_snapshot,
             )
         )
         assert len(await query_bars(cursor)) == 2
@@ -154,7 +151,7 @@ class TestIncrementalRefresh:
         cols = await discover_columns(cursor, VIEW.query)
         await cursor.execute(build_create_table_sql(TARGET_TABLE, cols, "ARRAY['day(minute)']"))
         M = await get_current_snapshot(cursor, SOURCE_TABLE)
-        await _drain(execute_refresh(cursor, VIEW, TARGET_TABLE, PARSED, value_cols, max_snapshot=M))
+        await _drain(execute_refresh(cursor, VIEW, PARSED, value_cols, snapshot=M))
 
         result = await detect_changes(cursor, SOURCE_TABLE, "ts", "minute", last_snapshot=None)
 
@@ -167,11 +164,10 @@ class TestIncrementalRefresh:
             execute_refresh(
                 cursor,
                 VIEW,
-                TARGET_TABLE,
                 PARSED,
                 value_cols,
-                incremental_range=result.filter_range,
-                max_snapshot=result.current_snapshot,
+                window=result.filter_range,
+                snapshot=result.current_snapshot,
             )
         )
         bars = await query_bars(cursor)
@@ -245,10 +241,9 @@ class TestChunkedFullRefresh:
             execute_refresh(
                 cursor,
                 CHUNKED_VIEW,
-                TARGET_TABLE,
                 PARSED,
                 value_cols,
-                max_snapshot=M,
+                snapshot=M,
             )
         )
         assert all(q.stage == "chunk_merge" for q in chunked_qs)
@@ -260,10 +255,9 @@ class TestChunkedFullRefresh:
             execute_refresh(
                 cursor,
                 VIEW,
-                TARGET_TABLE,
                 PARSED,
                 value_cols,
-                max_snapshot=M,
+                snapshot=M,
             )
         )
         assert len(single_qs) == 1
@@ -285,7 +279,7 @@ class TestChunkedFullRefresh:
         M = await get_current_snapshot(cursor, SOURCE_TABLE)
 
         first = await _drain(
-            execute_refresh(cursor, CHUNKED_VIEW, TARGET_TABLE, PARSED, value_cols, max_snapshot=M),
+            execute_refresh(cursor, CHUNKED_VIEW, PARSED, value_cols, snapshot=M),
             stop_after=1,
         )
         assert len(first) == 1
@@ -298,10 +292,9 @@ class TestChunkedFullRefresh:
             execute_refresh(
                 cursor,
                 CHUNKED_VIEW,
-                TARGET_TABLE,
                 PARSED,
                 value_cols,
-                max_snapshot=M,
+                snapshot=M,
                 resume_from=first[0].range_end,
             )
         )
@@ -309,7 +302,7 @@ class TestChunkedFullRefresh:
 
         resumed_bars = await query_bars(cursor)
         await cursor.execute(f"DELETE FROM {TARGET_TABLE} WHERE true")
-        await _drain(execute_refresh(cursor, VIEW, TARGET_TABLE, PARSED, value_cols, max_snapshot=M))
+        await _drain(execute_refresh(cursor, VIEW, PARSED, value_cols, snapshot=M))
         reference = await query_bars(cursor)
         assert resumed_bars == reference
 
@@ -328,10 +321,9 @@ class TestChunkedFullRefresh:
             execute_refresh(
                 cursor,
                 CHUNKED_VIEW,
-                TARGET_TABLE,
                 PARSED,
                 value_cols,
-                max_snapshot=M,
+                snapshot=M,
             )
         )
         first = await query_bars(cursor)
@@ -341,10 +333,9 @@ class TestChunkedFullRefresh:
             execute_refresh(
                 cursor,
                 CHUNKED_VIEW,
-                TARGET_TABLE,
                 PARSED,
                 value_cols,
-                max_snapshot=M,
+                snapshot=M,
             )
         )
         assert len(replay) == 3, "replay must re-run every chunk under the new model"

@@ -45,7 +45,15 @@ def main() -> None:
     cur.execute("CREATE SCHEMA IF NOT EXISTS iceberg.market_data")
     cur.execute("CREATE SCHEMA IF NOT EXISTS iceberg.analytics")
 
-    cur.execute("DROP TABLE IF EXISTS iceberg.market_data.trades")
+    # Seed once: a later `docker compose up` re-runs this container, and
+    # recreating the table would make every view rebuild from scratch.
+    cur.execute(
+        "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'market_data' AND table_name = 'trades'"
+    )
+    if cur.fetchone()[0]:
+        print("seed: iceberg.market_data.trades already exists, keeping it")
+        return
+
     cur.execute("""
         CREATE TABLE iceberg.market_data.trades (
             symbol VARCHAR,

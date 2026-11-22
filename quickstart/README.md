@@ -1,83 +1,59 @@
-# Quick start — fully self-contained iceberg-ivm
+# Quickstart
 
-A one-command demo stack: Trino + MinIO + Postgres (Iceberg JDBC catalog) +
-iceberg-ivm, with sample trades data and 8 pre-loaded materialized views.
-
-## Run
+A complete local stack in one command: **Trino**, an **Iceberg** catalog (Postgres), sample trade data, and **iceberg-ivm** with 8 views already defined.
 
 ```bash
+cd quickstart
 docker compose up -d
 ```
 
-That's it. The compose file:
+Give it a minute or two (Trino starts, the seed job writes 30 days of trades), then open:
 
-1. Brings up MinIO, Postgres, and Trino.
-2. Runs a one-shot **seed** container that creates `iceberg.market_data.trades`
-   and inserts ~30 days of synthetic trades for 3 symbols.
-3. Once seeding completes, starts **iceberg-ivm** with 8 views pre-loaded.
-
-After ~1-2 minutes (initial Trino start + seed) the UI is fully populated.
-
-## URLs
-
-| What | URL |
+| | |
 |---|---|
-| iceberg-ivm UI | http://localhost:8001 |
-| Trino UI | http://localhost:28080 |
+| **iceberg-ivm** | http://localhost:8001 |
+| **Trino UI** | http://localhost:28080 |
 
-> Quickstart binds the UI on **8001** (not the usual 8000) so it doesn't clash
-> with a locally-running `iceberg-ivm` on the default port. Edit
-> `docker-compose.yml` if you want to change it.
-| MinIO console | http://localhost:19001 (`minioadmin` / `minioadmin`) |
+Both are bound to `127.0.0.1` only. The UI uses port 8001 so it doesn't clash with an iceberg-ivm you may already run on 8000.
 
-## What you'll see
+## The 8 views
 
-Eight materialized views, all refreshing automatically:
-
-| View | Shape |
+| View | What it shows off |
 |---|---|
-| `ohlcv_1m` | Minute OHLCV bars from `trades` |
-| `ohlcv_1h` | Hour OHLCV bars from `trades` |
-| `ohlcv_1d` | Day OHLCV bars from `trades` |
-| `weekly_volume` | Weekly bars direct from `trades` (cross-partition demo) |
-| `monthly_volume` | Monthly bars from `trades` |
-| `hourly_trade_count` | Plain `count(*)` by hour |
-| `symbol_daily_high` | Uses `max_by` (non-decomposable aggregate) |
-| `large_trades_hourly` | Pre-filtered with a `WHERE` clause |
+| `ohlcv_1m` | Minute OHLCV bars, using `min_by` / `max_by` |
+| `ohlcv_1h` | **Chained**: hourly bars rolled up from `ohlcv_1m`'s table |
+| `ohlcv_1d` | Daily bars |
+| `weekly_volume` | Weekly buckets over a daily-partitioned source |
+| `monthly_volume` | Monthly buckets |
+| `hourly_trade_count` | A plain `count(*)` |
+| `symbol_daily_high` | `max_by`, which can't be computed from partial aggregates |
+| `large_trades_hourly` | A `WHERE` filter inside the view |
 
-## Tear down
+## Make it change
+
+Insert a trade in Trino and watch the affected minute, hour, day, week and month buckets refresh. Nothing else is recomputed.
 
 ```bash
-docker compose down -v   # -v also removes the warehouse + state volumes
+docker compose exec trino trino --execute "
+  INSERT INTO iceberg.market_data.trades
+  VALUES ('AAPL', current_timestamp, 199.5, 300)"
 ```
 
-## State persistence
+Edit `views.yaml` while the stack runs (it reloads within 30 s), or add a view from the UI's **New view** button.
 
-The iceberg-ivm SQLite state DB is on a named volume (`ivm-state`). Restarts
-preserve recent-query history; `docker compose down -v` wipes it.
+## Stop
 
-## Trying it for real
+```bash
+docker compose down      # keep data for next time
+docker compose down -v   # also delete the warehouse, catalog and state
+```
 
-Edit `views.yaml` while the stack is running — iceberg-ivm hot-reloads it
-within `config_reload_interval_seconds` (30s). Or use the **New View**
-button in the UI to add views interactively; the API will write back to
-`views.yaml` for you.
+## Run your local checkout
 
-## Running against local source
-
-The default compose pulls the latest published image. To run the quickstart
-against your **local working tree** instead — useful when iterating on the
-orchestrator and you want the demo to exercise your in-progress code —
-layer the `docker-compose.local.yml` overlay:
+To exercise your working tree instead of the published image:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
 ```
 
-The overlay only redirects the `iceberg-ivm` service to build from
-`../Dockerfile`; the rest of the stack (Trino, Postgres, MinIO, seed) keeps
-using its pinned image, so a rebuild only touches the orchestrator.
-
-> Requires Docker Compose **v2.24+** — the overlay uses the `!reset` YAML
-> tag to drop the inherited `image:` field, which was introduced in that
-> release. Older versions will fail with a YAML parse error.
+Only the `iceberg-ivm` service is rebuilt. Requires Docker Compose v2.24+.

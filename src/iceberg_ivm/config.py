@@ -1,146 +1,125 @@
-"""Configuration loading and validation."""
+"""Configuration: the static ``config.yaml``, Trino credentials from the
+environment, and view definitions (``views.yaml`` or the API).
+
+``ViewConfig`` is the single definition of a view. The same model validates
+``views.yaml``, API requests, and what ``save_views`` writes back.
+"""
 
 from __future__ import annotations
 
 import logging
 import os
 import re
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Annotated
 
 import yaml
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from iceberg_ivm.query_parser import (
-    IDENTIFIER_RE,
-    QUALIFIED_NAME_RE,
-    parse_view_query,
-)
+from iceberg_ivm.query_parser import QUALIFIED_NAME_RE, parse_view_query
 
 log = logging.getLogger(__name__)
 
-# full_refresh_chunk must be coarser-or-equal to the view's own granularity
-# and cleanly contain its buckets. Weeks don't divide months (and vice-versa),
-# so the relation is a partial order — hence the explicit override for "week".
-# Sub-second values (millisecond, second) are valid as view granularities but
-# never as chunk granularities — chunked backfills measured in seconds would
-# create millions of tiny commits.
-_GRAN_ORDER = (
-    "millisecond",
-    "second",
-    "minute",
-    "hour",
-    "day",
-    "week",
-    "month",
-    "quarter",
-    "year",
-)
-_SUBDAY_OR_WEEK = ("millisecond", "second", "minute", "hour", "day", "week")
-_VALID_CHUNK_GRANULARITIES = frozenset(("minute", "hour", "day", "week", "month", "quarter", "year"))
-_CHUNK_COMPATIBILITY: dict[str, frozenset[str]] = {
-    g: frozenset(
-        x for x in _GRAN_ORDER[i:] if x in _VALID_CHUNK_GRANULARITIES and (x != "week" or g in _SUBDAY_OR_WEEK)
-    )
+# A chunk must hold whole buckets of the view's granularity. Weeks and months
+# don't divide each other, and sub-minute chunks would mean millions of commits.
+_GRAN_ORDER = ("millisecond", "second", "minute", "hour", "day", "week", "month", "quarter", "year")
+CHUNK_GRANULARITIES = ("minute", "hour", "day", "week", "month", "quarter", "year")
+_CHUNKS_FOR: dict[str, tuple[str, ...]] = {
+    g: tuple(c for c in _GRAN_ORDER[i:] if c in CHUNK_GRANULARITIES and (c != "week" or i <= _GRAN_ORDER.index("week")))
     for i, g in enumerate(_GRAN_ORDER)
 }
-_CHUNK_COMPATIBILITY["week"] = frozenset({"week"})
+_CHUNKS_FOR["week"] = ("week",)
 
-# Trino credentials are *only* read from these environment variables.
-# No defaults, no YAML overrides — keeping secrets out of the repo and
-# making per-environment deployment a matter of setting env vars.
-#
-# TRINO_PASSWORD is optional: if unset, iceberg-ivm connects
-# without BasicAuth (for clusters that allow anonymous access — e.g.
-# the local dev compose stack).
-_TRINO_ENV_REQUIRED = ("TRINO_URL", "TRINO_USER")
+_DURATION_RE = re.compile(r"^\d+[smhd]$")  # Trino duration
+_DATASIZE_RE = re.compile(r"^\d+(B|KB|MB|GB|TB)$")  # Trino data size
+
+PositiveInt = Annotated[int, Field(gt=0, strict=True)]
 
 
-def validate_identifier(value: str, field_name: str) -> None:
-    if not IDENTIFIER_RE.match(value):
-        raise ValueError(f"{field_name}: {value!r} is not a valid SQL identifier")
+class ViewConfig(BaseModel):
+    """One materialized view. Only ``query`` and ``target_table`` are required."""
 
+    model_config = ConfigDict(frozen=True)
 
-def validate_qualified_name(value: str, field_name: str) -> None:
-    if not QUALIFIED_NAME_RE.match(value):
-        raise ValueError(f"{field_name}: {value!r} is not a valid qualified table name")
-
-
-def validate_view_name(value: str, field_name: str = "name") -> None:
-    """Accept a bare SQL identifier (`my_view`) or a dotted qualified name
-    (`iceberg.analytics.my_view`).
-
-    Looser than ``validate_identifier`` because a view's ``name`` defaults to
-    its ``target_table`` FQDN when the user doesn't supply one explicitly —
-    so the FQDN form must round-trip cleanly through validation.
-    """
-    if not QUALIFIED_NAME_RE.match(value):
-        raise ValueError(
-            f"{field_name}: {value!r} is not a valid view name (must be a SQL identifier or a dotted qualified name)"
-        )
-
-
-_MAINTENANCE_OPS = ("optimize", "expire_snapshots", "remove_orphan_files")
-_DURATION_RE = re.compile(r"^\d+[smhd]$")  # Trino duration: s/m/h/d only
-_DATASIZE_RE = re.compile(r"^\d+(B|KB|MB|GB|TB)$")
-
-
-@dataclass(frozen=True)
-class ViewConfig:
-    name: str
+    name: str = ""  # defaults to target_table
     query: str
     target_table: str
-    target_partitioning: str | None = None
-    refresh_interval_seconds: int = 60
-    # Max wall-clock seconds for one refresh tick (detection + every MERGE +
-    # maintenance). None disables the timeout.
-    query_timeout_seconds: int | None = None
-    # Granularity string ("day", "month", …) controlling the size of each
-    # chunk in the first-run chunked backfill. ``None`` → legacy single-shot
-    # full refresh. Validated against the view's own date_trunc granularity
-    # at load time.
-    full_refresh_chunk: str | None = None
-
-    # Iceberg maintenance. ``maintenance_interval_seconds`` is the shared
-    # minimum gap between runs for *every* op (0 = disable maintenance
-    # entirely). Each per-op boolean toggles that op individually; defaults
-    # are True so opting in to maintenance (interval > 0) automatically
-    # runs all three ops. Retention / threshold values are passed straight
-    # through to Trino's named-arg syntax; format-validated at load time so
-    # bad values never reach the executor.
-    maintenance_interval_seconds: int = 0
+    target_partitioning: str | None = None  # e.g. "ARRAY['day(minute)']"
+    refresh_interval_seconds: PositiveInt = 60
+    query_timeout_seconds: PositiveInt | None = None  # per refresh tick
+    full_refresh_chunk: str | None = None  # backfill in chunks of this unit
+    # Iceberg maintenance on the target; 0 disables it.
+    maintenance_interval_seconds: Annotated[int, Field(ge=0)] = 0
     optimize: bool = True
-    optimize_file_size_threshold: str | None = None  # None → Trino default (100MB)
+    optimize_file_size_threshold: str | None = None  # None → Trino's default
     expire_snapshots: bool = True
     expire_snapshots_retention: str = "7d"
     remove_orphan_files: bool = True
     remove_orphan_files_retention: str = "7d"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _default_name(cls, data):
+        if isinstance(data, dict) and not data.get("name"):
+            data = {**data, "name": data.get("target_table")}
+        return data
+
+    @field_validator("target_partitioning", "full_refresh_chunk", "optimize_file_size_threshold", mode="before")
+    @classmethod
+    def _blank_is_none(cls, value):
+        return value or None
+
+    @field_validator("name", "target_table")
+    @classmethod
+    def _qualified_name(cls, value: str) -> str:
+        if not QUALIFIED_NAME_RE.match(value):
+            raise ValueError(f"{value!r} must be a SQL identifier or a dotted name like catalog.schema.table")
+        return value
+
+    @field_validator("expire_snapshots_retention", "remove_orphan_files_retention")
+    @classmethod
+    def _duration(cls, value: str) -> str:
+        if not _DURATION_RE.match(value):
+            raise ValueError(f"{value!r} is not a Trino duration like '7d' or '24h'")
+        return value
+
+    @field_validator("optimize_file_size_threshold")
+    @classmethod
+    def _data_size(cls, value: str | None) -> str | None:
+        if value is not None and not _DATASIZE_RE.match(value):
+            raise ValueError(f"{value!r} is not a data size like '128MB'")
+        return value
+
+    @model_validator(mode="after")
+    def _query_and_chunk(self):
+        parsed = parse_view_query(self.query)
+        chunk = self.full_refresh_chunk
+        if chunk is not None and chunk not in _CHUNKS_FOR[parsed.granularity]:
+            raise ValueError(
+                f"full_refresh_chunk {chunk!r} doesn't hold whole {parsed.granularity} buckets; "
+                f"use one of {list(_CHUNKS_FOR[parsed.granularity])}"
+            )
+        return self
 
 
 @dataclass(frozen=True)
 class ServerConfig:
     port: int = 8000
     config_reload_interval_seconds: int = 30
-    # SQLite file that persists the UI's "recent queries" ring buffer
-    # across restarts. Absolute values are used as-is. For non-absolute
-    # values, the default resolution anchors on the *views file's*
-    # directory (which the Dockerfile expects to be a host bind-mount
-    # and is therefore persistent by construction), falling back to the
-    # config file's directory when that directory doesn't exist or isn't
-    # writable. See ``server.resolve_state_db_path`` and issue #39.
+    # Relative paths resolve next to views.yaml (see server.resolve_state_db_path).
     state_db_path: str = "state.db"
 
 
 @dataclass(frozen=True)
 class TrinoConfig:
-    url: str  # full coordinator URL, e.g. "http://trino:8080" (from TRINO_URL)
-    user: str  # from TRINO_USER
-    password: str | None  # from TRINO_PASSWORD; None → connect anonymously
-    catalog: str  # from YAML (trino.catalog)
-    schema: str  # from YAML (trino.schema)
-    # Browser-reachable Trino URL, used to rewrite info_uris before they reach
-    # the UI. Defaults to `url`; only differs when the orchestrator and the
-    # user's browser talk to Trino over different hostnames (e.g. docker
-    # service hostname inside the network vs `localhost:<published port>`).
+    url: str  # TRINO_URL
+    user: str  # TRINO_USER
+    password: str | None  # TRINO_PASSWORD; None → no authentication
+    catalog: str
+    schema: str
+    # Browser-reachable Trino URL for the UI's query links (TRINO_PUBLIC_URL);
+    # differs from `url` when the service and the browser see different hosts.
     public_url: str = ""
 
 
@@ -151,158 +130,39 @@ class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
 
 
-def validate_chunk_compatibility(chunk: str | None, query: str) -> None:
-    """Validate a ``full_refresh_chunk`` against a view's query.
-
-    No-op when ``chunk`` is ``None`` or empty string (the "single-shot"
-    marker used by the HTTP layer). Raises ``ValueError`` on any of:
-
-    - unknown granularity
-    - granularity that doesn't cleanly contain the view's own buckets
-    - view query missing a direct ``date_trunc(...) AS <alias>`` projection
-    """
-    if not chunk:
-        return
-    parsed = parse_view_query(query)
-    if chunk not in _VALID_CHUNK_GRANULARITIES:
-        raise ValueError(
-            f"full_refresh_chunk: {chunk!r} is not a valid chunk granularity; "
-            f"expected one of {sorted(_VALID_CHUNK_GRANULARITIES)}"
-        )
-    allowed = _CHUNK_COMPATIBILITY[parsed.granularity]
-    if chunk not in allowed:
-        raise ValueError(
-            f"full_refresh_chunk: {chunk!r} is not compatible with the "
-            f"view's date_trunc granularity {parsed.granularity!r}; "
-            f"allowed values: {sorted(allowed)}"
-        )
-    if parsed.bucket_alias is None:
-        raise ValueError(
-            "full_refresh_chunk requires date_trunc("
-            f"{parsed.granularity!r}, {parsed.filter_column}) to appear "
-            "as a direct aliased projection, so the chunk grid lines up with "
-            "the query's own GROUP BY bucket"
-        )
-
-
-def validate_maintenance_config(raw: dict) -> None:
-    """Validate the shared maintenance interval + per-op param strings."""
-    iv = raw.get("maintenance_interval_seconds", 0) or 0
-    if iv < 0:
-        raise ValueError(f"maintenance_interval_seconds must be >= 0 (got {iv!r}); use 0 to disable")
-    for f in ("expire_snapshots_retention", "remove_orphan_files_retention"):
-        v = raw.get(f)
-        if v and not _DURATION_RE.match(str(v)):
-            raise ValueError(f"{f}: {v!r} is not a valid Trino duration (e.g. '7d', '24h')")
-    thr = raw.get("optimize_file_size_threshold")
-    if thr and not _DATASIZE_RE.match(str(thr)):
-        raise ValueError(f"optimize_file_size_threshold: {thr!r} is not a valid data size (e.g. '128MB')")
-
-
-def _parse_view(raw: dict) -> ViewConfig:
-    missing = {"name", "query", "target_table"} - raw.keys()
-    if missing:
-        raise ValueError(f"view missing required fields: {sorted(missing)}")
-
-    validate_view_name(raw["name"], "name")
-    validate_qualified_name(raw["target_table"], "target_table")
-
-    # Full query validation — source_table, filter_column, granularity,
-    # merge_keys are all derived here at load time.  Raises on any violation.
-    parse_view_query(raw["query"])
-
-    chunk = raw.get("full_refresh_chunk")
-    validate_chunk_compatibility(chunk, raw["query"])
-    validate_maintenance_config(raw)
-
-    query_timeout = raw.get("query_timeout_seconds")
-    # ``isinstance(True, int)`` is ``True`` — exclude bools explicitly so a
-    # stray ``query_timeout_seconds: true`` in YAML doesn't silently parse
-    # as a 1-second timeout that nukes every refresh.
-    if query_timeout is not None and (
-        isinstance(query_timeout, bool) or not isinstance(query_timeout, int) or query_timeout <= 0
-    ):
-        raise ValueError(f"query_timeout_seconds: {query_timeout!r} must be a positive integer or omitted")
-
-    return ViewConfig(
-        name=raw["name"],
-        query=raw["query"],
-        target_table=raw["target_table"],
-        target_partitioning=raw.get("target_partitioning"),
-        refresh_interval_seconds=raw.get("refresh_interval_seconds", 60),
-        query_timeout_seconds=query_timeout,
-        full_refresh_chunk=chunk,
-        maintenance_interval_seconds=raw.get("maintenance_interval_seconds", 0),
-        optimize=raw.get("optimize", True),
-        optimize_file_size_threshold=raw.get("optimize_file_size_threshold"),
-        expire_snapshots=raw.get("expire_snapshots", True),
-        expire_snapshots_retention=raw.get("expire_snapshots_retention", "7d"),
-        remove_orphan_files=raw.get("remove_orphan_files", True),
-        remove_orphan_files_retention=raw.get("remove_orphan_files_retention", "7d"),
-    )
-
-
 def load_config(path: str | Path) -> Config:
-    """Load static configuration (trino + server) from a YAML file.
-
-    Trino credentials (URL, user, password) are read *only* from the
-    ``TRINO_URL`` / ``TRINO_USER`` / ``TRINO_PASSWORD`` environment
-    variables — never from YAML — so secrets stay out of the repo and
-    deployments can inject per-environment values. Any host/port/user in
-    the YAML's ``trino:`` section is ignored.
-
-    Views are managed separately via ``load_views`` / ``save_views``.
-    """
-    raw = yaml.safe_load(Path(path).read_text())
+    """Load ``config.yaml``. Trino credentials come only from the environment
+    (``TRINO_URL``, ``TRINO_USER``, optional ``TRINO_PASSWORD``), never YAML."""
+    raw = yaml.safe_load(Path(path).read_text()) or {}
     if "trino" not in raw:
         raise ValueError("config missing 'trino' section")
-
-    trino_raw = raw["trino"]
-    missing_yaml = {"catalog", "schema"} - trino_raw.keys()
+    missing_yaml = {"catalog", "schema"} - raw["trino"].keys()
     if missing_yaml:
         raise ValueError(f"trino config missing required YAML fields: {sorted(missing_yaml)}")
-
-    missing_env = [v for v in _TRINO_ENV_REQUIRED if not os.environ.get(v)]
+    missing_env = [v for v in ("TRINO_URL", "TRINO_USER") if not os.environ.get(v)]
     if missing_env:
-        raise ValueError(
-            f"trino credentials missing from environment: {missing_env}. "
-            f"Set {', '.join(_TRINO_ENV_REQUIRED)} before starting iceberg-ivm."
-        )
+        raise ValueError(f"trino credentials missing from environment: {missing_env}")
 
-    trino_url = os.environ["TRINO_URL"]
+    url = os.environ["TRINO_URL"]
     trino = TrinoConfig(
-        url=trino_url,
+        url=url,
         user=os.environ["TRINO_USER"],
         password=os.environ.get("TRINO_PASSWORD") or None,
-        catalog=trino_raw["catalog"],
-        schema=trino_raw["schema"],
-        public_url=os.environ.get("TRINO_PUBLIC_URL") or trino_url,
+        catalog=raw["trino"]["catalog"],
+        schema=raw["trino"]["schema"],
+        public_url=os.environ.get("TRINO_PUBLIC_URL") or url,
     )
-
-    server_raw = raw.get("server", {})
+    server_raw = raw.get("server") or {}
     server = ServerConfig(
-        port=server_raw.get("port", 8000),
-        config_reload_interval_seconds=server_raw.get("config_reload_interval_seconds", 30),
-        state_db_path=server_raw.get("state_db_path", "state.db"),
+        **{k: server_raw[k] for k in ("port", "config_reload_interval_seconds", "state_db_path") if k in server_raw}
     )
-
-    cfg = Config(trino=trino, views=[], server=server)
-    log.info(
-        "loaded static config from %s (trino=%s as %s / %s.%s)",
-        path,
-        trino.url,
-        trino.user,
-        trino.catalog,
-        trino.schema,
-    )
-    return cfg
+    log.info("loaded %s (trino=%s as %s, %s.%s)", path, trino.url, trino.user, trino.catalog, trino.schema)
+    return Config(trino=trino, views=[], server=server)
 
 
 def load_views(path: str | Path) -> list[ViewConfig]:
-    """Load views from a separate YAML file.
-
-    Returns an empty list if the file does not exist (e.g. fresh Docker volume).
-    """
+    """Load views from YAML (a list, or a mapping with a ``views`` list).
+    A missing or empty file means no views."""
     p = Path(path)
     if not p.exists():
         log.info("views file not found: %s — starting with no views", p)
@@ -310,10 +170,10 @@ def load_views(path: str | Path) -> list[ViewConfig]:
     raw = yaml.safe_load(p.read_text())
     if not raw:
         return []
-    views_raw = raw.get("views", raw) if isinstance(raw, dict) else raw
-    if not isinstance(views_raw, list):
+    items = raw.get("views", raw) if isinstance(raw, dict) else raw
+    if not isinstance(items, list):
         raise ValueError(f"views file {path} must contain a list or a 'views' key")
-    views = [_parse_view(v) for v in views_raw]
+    views = [ViewConfig.model_validate(item) for item in items]
     names = [v.name for v in views]
     if len(names) != len(set(names)):
         raise ValueError("duplicate view names detected")
@@ -321,21 +181,14 @@ def load_views(path: str | Path) -> list[ViewConfig]:
     return views
 
 
-_ALWAYS_EMIT = ("name", "query", "target_table", "refresh_interval_seconds")
-
-
 def save_views(views: list[ViewConfig], path: str | Path) -> None:
-    """Save views to YAML, omitting fields equal to their ViewConfig defaults."""
+    """Write views to YAML, omitting settings left at their defaults."""
+    always = {"name", "query", "target_table", "refresh_interval_seconds"}
+    out = [
+        {k: val for k, val in v.model_dump().items() if k in always or val != ViewConfig.model_fields[k].default}
+        for v in views
+    ]
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    defaults = {f.name: f.default for f in fields(ViewConfig)}
-    out = []
-    for v in views:
-        vd = {}
-        for f in fields(ViewConfig):
-            val = getattr(v, f.name)
-            if f.name in _ALWAYS_EMIT or val != defaults[f.name]:
-                vd[f.name] = val
-        out.append(vd)
     p.write_text(yaml.dump({"views": out}, default_flow_style=False, sort_keys=False))
     log.info("saved %d view(s) to %s", len(views), p)

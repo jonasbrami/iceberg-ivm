@@ -1,18 +1,13 @@
-"""Refresh executor: builds and runs MERGE SQL against Trino.
+"""Refresh executor: one MERGE per bucket-aligned time range.
 
-One refresh = one or more MERGE commits over bucket-aligned time ranges:
+Each MERGE makes the target's rows in ``[start, end)`` exactly equal to the
+view query's result for that range: new groups are inserted, changed groups
+updated, and groups that no longer exist deleted — in a single atomic commit.
 
-  - incremental refresh: one MERGE over the detector's snapped range.
-  - full refresh: one MERGE over the source's whole range.
-  - chunked full refresh: N MERGEs, one per chunk, with per-chunk commit so
-    a crash or restart resumes from the ``current_work`` record (never from
-    the target's own data).
-
-Every chunk reads its source ``FOR VERSION AS OF`` the run's pinned snapshot,
-so a multi-chunk run never mixes data from different source commits.
-
-``execute_refresh`` is a single async generator that yields one ``QueryInfo``
-per committed MERGE. Callers cancel via ``break`` — no callback plumbing.
+A refresh is one MERGE, or one per chunk when ``full_refresh_chunk`` is set.
+Every chunk reads the source ``FOR VERSION AS OF`` the run's pinned snapshot,
+so a multi-chunk run never mixes source states, and a crash resumes from the
+last committed chunk.
 """
 
 from __future__ import annotations
@@ -24,19 +19,15 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from iceberg_ivm.config import ViewConfig
-from iceberg_ivm.detector import (
-    expand_to_bucket_bounds,
-    get_source_column_range,
-    walk_buckets,
-)
-from iceberg_ivm.query_parser import ParsedView, inject_range_filter, inject_version_pin
+from iceberg_ivm.detector import column_range, expand_to_bucket_bounds, walk_buckets
+from iceberg_ivm.query_parser import DIALECT, ParsedView, timestamp_literal
 
 log = logging.getLogger(__name__)
 
 
 @dataclass
 class QueryInfo:
-    """Metadata for one Trino query: linking + stats."""
+    """One Trino query run by a refresh: link + stats for the UI and metrics."""
 
     query_id: str
     info_uri: str
@@ -45,24 +36,13 @@ class QueryInfo:
     elapsed_ms: float
     processed_rows: int = 0
     processed_bytes: int = 0
-    # Range this query covered, if applicable (always set for refresh stages).
     range_start: datetime | None = None
     range_end: datetime | None = None
-    chunks_done: int = 0  # 1-indexed count of committed chunks so far
-    chunks_total: int = 0  # 0 for non-chunked
+    chunks_done: int = 0  # 1-based count of committed chunks so far
+    chunks_total: int = 0  # 0 when not chunked
 
 
-async def _execute_tracked(
-    cursor,
-    sql: str,
-    stage: str,
-    *,
-    range_start: datetime | None = None,
-    range_end: datetime | None = None,
-    chunks_done: int = 0,
-    chunks_total: int = 0,
-) -> QueryInfo:
-    """Execute ``sql`` and return a QueryInfo with timing + stats + range."""
+async def _execute_tracked(cursor, sql: str, stage: str, **extra) -> QueryInfo:
     started = time.time()
     t0 = time.monotonic()
     await cursor.execute(sql)
@@ -75,64 +55,74 @@ async def _execute_tracked(
         elapsed_ms=(time.monotonic() - t0) * 1000,
         processed_rows=stats.get("processedRows", 0) or 0,
         processed_bytes=stats.get("processedBytes", 0) or 0,
-        range_start=range_start,
-        range_end=range_end,
-        chunks_done=chunks_done,
-        chunks_total=chunks_total,
+        **extra,
     )
+
+
+def quote(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
 
 
 def build_merge_sql(
     target_table: str,
-    source_query: str,
-    merge_keys: tuple[str, ...] | list[str],
+    range_query: str,
+    merge_keys: tuple[str, ...],
+    bucket: str,
     value_columns: list[str],
+    start: datetime,
+    end: datetime,
 ) -> str:
-    """Build an atomic MERGE statement. ``source_query`` must already have
-    the time-range WHERE injected (via ``inject_range_filter``)."""
-    on = " AND ".join(f"t.{k} = s.{k}" for k in merge_keys)
-    updates = ", ".join(f"{c} = s.{c}" for c in value_columns)
-    cols = list(merge_keys) + value_columns
+    """MERGE that replaces the target's ``[start, end)`` bucket range with ``range_query``.
+
+    The source side full-outer-joins the fresh aggregates (``n``) with the keys
+    already in the target for that range (``o``); keys only on the ``o`` side
+    are flagged ``__ivm_gone`` and deleted. Keys compare NULL-safely, except the
+    bucket, which is never NULL inside a time range and gives Trino an
+    equi-join to hash on.
+    """
+
+    def match(left: str, right: str) -> str:
+        return " AND ".join(
+            f"{left}.{quote(k)} {'=' if k == bucket else 'IS NOT DISTINCT FROM'} {right}.{quote(k)}" for k in merge_keys
+        )
+
+    lo = timestamp_literal(start).sql(dialect=DIALECT)
+    hi = timestamp_literal(end).sql(dialect=DIALECT)
+    picked = [f'IF(n."__ivm_new", n.{quote(k)}, o.{quote(k)}) AS {quote(k)}' for k in merge_keys]
+    picked += [f"n.{quote(c)}" for c in value_columns]
+    columns = [quote(c) for c in (*merge_keys, *value_columns)]
+    update = (
+        f"WHEN MATCHED THEN UPDATE SET {', '.join(f'{quote(c)} = s.{quote(c)}' for c in value_columns)}\n"
+        if value_columns
+        else ""
+    )
     return (
         f"MERGE INTO {target_table} AS t\n"
-        f"USING (\n{source_query}\n) AS s\n"
-        f"ON {on}\n"
-        f"WHEN MATCHED THEN UPDATE SET {updates}\n"
-        f"WHEN NOT MATCHED THEN INSERT ({', '.join(cols)}) "
-        f"VALUES ({', '.join(f's.{c}' for c in cols)})"
+        f"USING (\n"
+        f'  SELECT {", ".join(picked)}, n."__ivm_new" IS NULL AS "__ivm_gone"\n'
+        f'  FROM (SELECT *, true AS "__ivm_new" FROM (\n{range_query}\n)) AS n\n'
+        f"  FULL OUTER JOIN (\n"
+        f"    SELECT {', '.join(quote(k) for k in merge_keys)} FROM {target_table}\n"
+        f"    WHERE {quote(bucket)} >= {lo} AND {quote(bucket)} < {hi}\n"
+        f"  ) AS o ON {match('n', 'o')}\n"
+        f") AS s\n"
+        f"ON {match('t', 's')}\n"
+        f'WHEN MATCHED AND s."__ivm_gone" THEN DELETE\n'
+        f"{update}"
+        f'WHEN NOT MATCHED AND NOT s."__ivm_gone" THEN INSERT ({", ".join(columns)}) '
+        f"VALUES ({', '.join(f's.{c}' for c in columns)})"
     )
 
 
-async def execute_maintenance(
-    cursor,
-    target_table: str,
-    op: str,
-    params: dict[str, str],
-) -> QueryInfo:
+async def execute_maintenance(cursor, target_table: str, op: str, params: dict[str, str]) -> QueryInfo:
     """Run one Iceberg maintenance op via ``ALTER TABLE ... EXECUTE``.
 
-    ``params`` values are inlined as Trino named args — callers must have
-    validated them (``config.validate_maintenance_config``); we don't escape
-    because Trino's only legitimate values are duration/DataSize literals.
+    ``params`` values are validated duration / data-size literals (see config).
     """
     args = ", ".join(f"{k} => '{v}'" for k, v in params.items())
-    sql = f"ALTER TABLE {target_table} EXECUTE {op}({args})" if args else f"ALTER TABLE {target_table} EXECUTE {op}"
+    sql = f"ALTER TABLE {target_table} EXECUTE {op}" + (f"({args})" if args else "")
     log.info("%s: maintenance — %s", target_table, sql)
     return await _execute_tracked(cursor, sql, stage=f"maintenance_{op}")
-
-
-def _floor_resume_to_chunk(
-    start: datetime,
-    resume_from: datetime,
-    chunk: str,
-) -> datetime:
-    """Floor a resume marker to its containing chunk start, clamped to never
-    precede ``start``. The containing chunk is re-MERGEd in full (idempotent,
-    gap-free even if ``full_refresh_chunk`` changed); the ``max`` clamp stops a
-    stale marker from resuming before the window's own beginning.
-    """
-    resume_start = expand_to_bucket_bounds(resume_from, resume_from, chunk)[0]
-    return max(start, resume_start)
 
 
 def _window_ranges(
@@ -140,93 +130,73 @@ def _window_ranges(
     hi_inclusive: datetime,
     chunk: str | None,
     granularity: str,
-    bucket_alias: str | None,
     resume_from: datetime | None,
 ) -> list[tuple[datetime, datetime]]:
-    """Inclusive ``[lo, hi]`` → ordered half-open ``(start, end)`` ranges.
+    """Inclusive ``[lo, hi]`` → ordered, bucket-aligned half-open ranges.
 
-    The single ranging path for both full and incremental refreshes — they
-    differ only in where the window comes from, not how it is chunked.
-    ``chunk`` None → one granularity-snapped range (single-shot); else N
-    bucket-aligned per-chunk ranges, resuming past ``resume_from`` (this run's
-    own committed progress). The chunk containing ``resume_from`` is re-MERGEd
-    in full — idempotent, gap-free even if ``full_refresh_chunk`` changed mid-run.
+    ``chunk`` None → a single range snapped to the view's granularity; else one
+    range per chunk. A resumed run restarts at the chunk containing
+    ``resume_from`` — re-merging it is idempotent, and stays gap-free even if
+    ``full_refresh_chunk`` changed since the run began.
     """
     start, end = expand_to_bucket_bounds(lo, hi_inclusive, chunk or granularity)
     if chunk is None:
-        return [(start, end)]  # single-shot
-    # Config validation guarantees bucket_alias is set whenever a chunk is —
-    # assert so a future refactor can't silently re-introduce a fallback that
-    # breaks chunking.
-    assert bucket_alias is not None, (
-        "chunked refresh requires bucket_alias; validate_chunk_compatibility should have rejected this view"
-    )
+        return [(start, end)]
     if resume_from is not None:
-        start = _floor_resume_to_chunk(start, resume_from, chunk)
+        start = max(start, expand_to_bucket_bounds(resume_from, resume_from, chunk)[0])
     return list(walk_buckets(start, end, chunk))
+
+
+def _hull(*ranges: tuple[datetime, datetime] | None) -> tuple[datetime, datetime] | None:
+    present = [r for r in ranges if r is not None]
+    if not present:
+        return None
+    return min(r[0] for r in present), max(r[1] for r in present)
 
 
 async def execute_refresh(
     cursor,
     view: ViewConfig,
-    target_table: str,
     parsed: ParsedView,
     value_columns: list[str],
     *,
-    max_snapshot: int,
-    incremental_range: tuple[datetime, datetime] | None = None,
+    snapshot: int,
+    window: tuple[datetime, datetime] | None = None,
     resume_from: datetime | None = None,
 ) -> AsyncIterator[QueryInfo]:
-    """Execute a refresh as a sequence of per-range MERGE commits.
+    """Refresh ``view`` as of source ``snapshot``, yielding one ``QueryInfo``
+    per committed MERGE. Callers stop early with ``break``.
 
-    ``max_snapshot`` pins the source read: every chunk's MERGE source gets
-    ``FROM <source> FOR VERSION AS OF max_snapshot`` (``inject_version_pin``) so
-    all chunks see one immutable source state — no snapshot mixing (#62).
-
-    The window comes from ``incremental_range`` (#61: a large catch-up window
-    is chunked, not run as one OOM-prone MERGE) or, absent it, from the source's
-    full extent (full refresh). Both feed one ranging path (``_window_ranges``):
-    chunked into N per-chunk MERGEs when ``view.full_refresh_chunk`` is set,
-    else a single MERGE.
-
-    ``resume_from`` (``current_work.work_last_merged_chunk``) skips chunks
-    at/below its containing chunk — one resume path for both full and
-    incremental, since the window itself is pinned by ``max_snapshot``.
-
-    Yields one ``QueryInfo`` per committed MERGE; caller cancels by ``break``.
+    ``window`` is the detector's bucket-aligned ``[start, end)``. Without one
+    (full refresh) the window spans everything the source has and everything
+    the target already holds, so the whole target ends up equal to the query.
     """
-    if incremental_range is not None:
-        # Detector hands a half-open ``[start, end)``; convert to an inclusive
-        # hi (``end - 1µs``) so an already chunk-aligned end isn't over-expanded
-        # by a whole empty chunk when re-aligned to the (coarser) chunk grid.
-        lo, hi_inclusive = incremental_range[0], incremental_range[1] - timedelta(microseconds=1)
+    if window is not None:
+        # Inclusive hi, so an already chunk-aligned end doesn't grow by an empty chunk.
+        lo, hi = window[0], window[1] - timedelta(microseconds=1)
     else:
-        # Full refresh recomputes from the source's beginning so overwritten
-        # historical buckets are re-merged, not skipped (#62).
-        source_range = await get_source_column_range(cursor, parsed.source_table, parsed.filter_column)
-        if source_range is None:
-            log.info("%s: source %s is empty, nothing to refresh", view.name, parsed.source_table)
+        whole = _hull(
+            await column_range(cursor, parsed.source_table, parsed.filter_column),
+            await column_range(cursor, view.target_table, parsed.bucket_alias),
+        )
+        if whole is None:
+            log.info("%s: source and target are empty, nothing to refresh", view.name)
             return
-        lo, hi_inclusive = source_range
-    ranges = _window_ranges(
-        lo, hi_inclusive, view.full_refresh_chunk, parsed.granularity, parsed.bucket_alias, resume_from
-    )
-    stage = "chunk_merge" if view.full_refresh_chunk else "merge"
+        lo, hi = whole
 
-    total = len(ranges)
+    ranges = _window_ranges(lo, hi, view.full_refresh_chunk, parsed.granularity, resume_from)
+    stage = "chunk_merge" if view.full_refresh_chunk else "merge"
     for i, (start, end) in enumerate(ranges, start=1):
-        src = inject_range_filter(view.query, parsed.filter_column, start, end)
-        # Pin every chunk to the run's snapshot (no mixing); parser guarantees
-        # single-source, so one pin suffices.
-        src = inject_version_pin(src, parsed.source_table, max_snapshot)
-        sql = build_merge_sql(target_table, src, parsed.merge_keys, value_columns)
-        log.info("%s: %s %d/%d [%s, %s) @ snapshot %d", view.name, stage, i, total, start, end, max_snapshot)
+        sql = build_merge_sql(
+            view.target_table,
+            parsed.range_query(start, end, snapshot),
+            parsed.merge_keys,
+            parsed.bucket_alias,
+            value_columns,
+            start,
+            end,
+        )
+        log.info("%s: %s %d/%d [%s, %s) @ snapshot %d", view.name, stage, i, len(ranges), start, end, snapshot)
         yield await _execute_tracked(
-            cursor,
-            sql,
-            stage,
-            range_start=start,
-            range_end=end,
-            chunks_done=i,
-            chunks_total=total,
+            cursor, sql, stage, range_start=start, range_end=end, chunks_done=i, chunks_total=len(ranges)
         )
