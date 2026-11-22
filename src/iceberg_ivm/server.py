@@ -126,6 +126,7 @@ class ViewRuntime:
     refresh_cond: asyncio.Condition = field(default_factory=asyncio.Condition)
     refresh_seq: int = 0
     refresh_in_flight: bool = False
+    rebuild_requested: bool = False  # applied by the worker at its next tick
 
 
 @dataclass
@@ -193,7 +194,7 @@ def get_trino_connection(s: AppState) -> _Connection:
         "schema": cfg.trino.schema,
         "user": cfg.trino.user,
         # UTC sessions make Trino's date_trunc on TIMESTAMP WITH TIME ZONE agree
-        # with the bucket math in detector.py (see DESIGN.md, "Timezones").
+        # with the bucket math in detector.py (see docs/how-it-works.md, "Time zones").
         "timezone": "UTC",
     }
     if cfg.trino.password:
@@ -448,6 +449,13 @@ async def _refresh(s: AppState, view: ViewConfig, conn, vs: ViewStatus) -> None:
     parsed = parse_view_query(view.query)
     cursor = await conn.cursor()
     history = s.history
+    rt = s.view_runtimes.get(view.name)
+    if rt is not None and rt.rebuild_requested:
+        rt.rebuild_requested = False
+        if history:
+            await history.set_last_source_snapshot(view.name, None)
+            await history.clear_current_work(view.name)
+        log.info("%s: rebuild requested → full refresh", view.name)
     bookmark = await history.get_last_source_snapshot(view.name) if history else None
     pinned, resume_from = await history.get_current_work(view.name) if history else (None, None)
     window = None
@@ -1101,6 +1109,16 @@ async def trigger_refresh(name: str, s: AppState = Depends(get_app_state)):
         "last_action": vs.last_action if vs else None,
         "last_error": vs.last_error if vs else None,
     }
+
+
+@app.post("/api/views/{name}/rebuild")
+async def rebuild_view(name: str, s: AppState = Depends(get_app_state)):
+    """Recompute the whole view from its source now. The target ends up
+    exactly equal to the query; it stays readable throughout."""
+    if not s.config or not any(v.name == name for v in s.config.views):
+        raise HTTPException(404, f"view '{name}' not found")
+    s.view_runtimes.setdefault(name, ViewRuntime()).rebuild_requested = True
+    return await trigger_refresh(name, s)
 
 
 @app.get("/", response_class=HTMLResponse)

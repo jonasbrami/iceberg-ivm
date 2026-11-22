@@ -133,6 +133,11 @@ def _single_select(sql: str) -> exp.Select:
         raise ValueError("joins are not supported; the query must read from a single source table")
     if any(s is not query for s in query.find_all(exp.Select)):
         raise ValueError("subqueries are not supported")
+    # Both would be evaluated over each refreshed range, not the whole table.
+    if any(query.args.get(k) for k in ("limit", "offset", "fetch")):
+        raise ValueError("LIMIT / OFFSET / FETCH are not supported; a refresh recomputes one time range at a time")
+    if query.find(exp.Window):
+        raise ValueError("window functions (OVER …) are not supported; a refresh recomputes one time range at a time")
     return query
 
 

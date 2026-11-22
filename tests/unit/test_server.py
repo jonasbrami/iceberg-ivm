@@ -3189,3 +3189,35 @@ async def test_source_not_found_is_raised_for_missing_tables_only():
         cursor.execute.side_effect = exc
         with pytest.raises(expected):
             await get_current_snapshot(cursor, "iceberg.a.b")
+
+
+async def test_rebuild_clears_the_bookmark_at_the_next_tick(setup_state, tmp_path):
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+
+    h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
+    await h.open()
+    setup_state.history = h
+    view = setup_state.config.views[0]
+    await h.set_last_source_snapshot(view.name, 10)
+    setup_state.view_runtimes["test_view"] = server_mod.ViewRuntime(rebuild_requested=True)
+    seen = {}
+
+    async def detect(cursor, source, column, granularity, bookmark):
+        seen["bookmark"] = bookmark
+        return ChangeResult(RefreshAction.NO_CHANGE, current_snapshot=None)
+
+    try:
+        with (
+            patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+            patch.object(server_mod, "detect_changes", detect),
+        ):
+            await server_mod.refresh_view(setup_state, view)
+        assert seen["bookmark"] is None  # → detection answers FULL_REFRESH
+        assert setup_state.view_runtimes["test_view"].rebuild_requested is False
+    finally:
+        await h.close()
+
+
+def test_rebuild_unknown_view_is_404(client):
+    assert client.post("/api/views/nope/rebuild").status_code == 404

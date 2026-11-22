@@ -193,6 +193,12 @@ class TestParseViewQuery:
         ("SELECT date_trunc('day', ts) AS d FROM t GROUP BY ROLLUP (d)", "ROLLUP"),
         ("SELECT date_trunc('day', ts) AS d FROM t FOR VERSION AS OF 1 GROUP BY 1", "FOR VERSION"),
         ("SELECT date_trunc('day', ts) AS d FROM t {range_filter} GROUP BY 1", "range_filter"),
+        ("SELECT date_trunc('day', ts) AS d, count(*) AS n FROM t GROUP BY 1 LIMIT 10", "LIMIT"),
+        ("SELECT date_trunc('day', ts) AS d, count(*) AS n FROM t GROUP BY 1 OFFSET 5", "OFFSET"),
+        (
+            "SELECT date_trunc('day', ts) AS d, rank() OVER (ORDER BY count(*)) AS r FROM t GROUP BY 1",
+            "window functions",
+        ),
         ("SELECT 1; SELECT 2", "single"),
         ("   ", "empty"),
         ("SELEC date_trunc('day', ts) FROM", "could not parse"),
