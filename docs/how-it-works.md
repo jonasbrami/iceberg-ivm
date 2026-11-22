@@ -211,7 +211,7 @@ SELECT date_trunc('day', ts + INTERVAL '1' HOUR) AS d ... GROUP BY 1
 SELECT date_trunc('day', ts) AS d, count(*) FROM trades GROUP BY 1
 ```
 
-Also rejected: joins, subqueries, CTEs, `UNION`/`INTERSECT`/`EXCEPT`, `SELECT *`, `GROUP BY ALL`/`ROLLUP`/`CUBE`/`GROUPING SETS`, and your own `FOR VERSION AS OF` (iceberg-ivm pins the snapshot itself). Supported bucket units: `millisecond`, `second`, `minute`, `hour`, `day`, `week`, `month`, `quarter`, `year`.
+Also rejected: joins, subqueries, CTEs, `UNION`/`INTERSECT`/`EXCEPT`, `SELECT *`, `LIMIT`/`OFFSET` and window functions (a refresh evaluates the query over one time range at a time), `GROUP BY ALL`/`ROLLUP`/`CUBE`/`GROUPING SETS`, and your own `FOR VERSION AS OF` (iceberg-ivm pins the snapshot itself). Supported bucket units: `millisecond`, `second`, `minute`, `hour`, `day`, `week`, `month`, `quarter`, `year`.
 
 ## The target table
 
@@ -242,7 +242,6 @@ Deleting a view through the API or UI removes its rows, so a view created again 
 - **The time column needs min/max statistics.** Iceberg writers collect them by default, but only for a table's first 100 columns unless configured otherwise. Set `write.metadata.metrics.column.<col>=full` if your time column is beyond that.
 - **Row-level updates must not move a row to another time bucket.** With merge-on-read, a deleted row is recorded as a position-delete file, which carries no time bounds. iceberg-ivm recomputes the buckets of the rewritten rows, so an update that changes a row's timestamp leaves its old bucket stale. Updates that keep the timestamp, including other views' MERGEs, are handled.
 - **Deletes cost a full refresh.** That is correct but can be expensive on a large source. Set `full_refresh_chunk` so it runs in resumable pieces.
-- **Avoid `LIMIT` and window functions (`OVER`) in view queries.** They aren't rejected yet, but they are evaluated per refreshed range, not over the whole table, so their results would be wrong.
 - **Don't drop the target table by hand.** The bookmark would still point past data the new, empty table never received. Delete the view and create it again to rebuild.
 - **Run one instance per set of views.** Two instances refreshing the same view would run conflicting MERGEs.
 - **The UI and API have no authentication unless you set `IVM_PASSWORD`.** It enables HTTP Basic auth on everything except `/health` and `/metrics`.
