@@ -1983,7 +1983,7 @@ async def test_refresh_view_respects_query_timeout(setup_state, tmp_path):
     from iceberg_ivm.detector import ChangeResult, RefreshAction
     from iceberg_ivm.introspect import ColumnInfo
 
-    view = dataclasses.replace(setup_state.config.views[0], query_timeout_seconds=1)
+    view = setup_state.config.views[0].model_copy(update={"query_timeout_seconds": 1})
     setup_state.config = dataclasses.replace(setup_state.config, views=[view])
     setup_state.view_statuses[view.name] = ViewStatus(name=view.name)
     h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)
@@ -2061,7 +2061,7 @@ async def test_refresh_external_cancel_propagates_past_timeout_handler(setup_sta
     from iceberg_ivm.introspect import ColumnInfo
 
     # Budget set generously so the timeout itself cannot plausibly fire.
-    view = dataclasses.replace(setup_state.config.views[0], query_timeout_seconds=3600)
+    view = setup_state.config.views[0].model_copy(update={"query_timeout_seconds": 3600})
     setup_state.config = dataclasses.replace(setup_state.config, views=[view])
     setup_state.view_statuses[view.name] = ViewStatus(name=view.name)
     h = QueryHistory(tmp_path / "state.db", limit=RECENT_QUERY_LIMIT)

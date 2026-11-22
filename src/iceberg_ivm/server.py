@@ -9,7 +9,6 @@ import logging
 import os
 import secrets
 import time
-import typing
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,23 +16,12 @@ from urllib.parse import urlparse
 
 import aiotrino
 from aiotrino.auth import BasicAuthentication
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
-from pydantic import BaseModel, create_model, field_validator
+from pydantic import BaseModel, ValidationError
 
-from iceberg_ivm.config import (
-    Config,
-    TrinoConfig,
-    ViewConfig,
-    load_config,
-    load_views,
-    save_views,
-    validate_chunk_compatibility,
-    validate_maintenance_config,
-    validate_qualified_name,
-    validate_view_name,
-)
+from iceberg_ivm.config import Config, TrinoConfig, ViewConfig, load_config, load_views, save_views
 from iceberg_ivm.detector import (
     FullRefreshNeeded,
     RefreshAction,
@@ -549,8 +537,7 @@ async def view_worker(s: AppState, name: str) -> None:
     Asyncio is single-threaded: because this task is the only one that awaits
     ``refresh_view(view)`` for ``name``, refreshes are sequential by
     construction — no lock needed. Manual triggers set ``runtime.wake`` to
-    request a refresh; bursts of triggers coalesce into a single follow-up
-    pass, which removes the refresh-storm behaviour described in #24.
+    request a refresh; bursts of triggers coalesce into one follow-up pass.
     """
     rt = s.view_runtimes.setdefault(name, ViewRuntime())
     try:
@@ -662,7 +649,7 @@ def resolve_state_db_path(
     is bind-mounted from the host, so it's persistent by construction
     (whereas ``config.yaml`` is often mounted file-only into ``/app``,
     which lives in the container's writable layer and gets wiped on
-    image bumps — see issue #39). Falls back to the config file's
+    image bumps). Falls back to the config file's
     directory when the views directory doesn't exist or isn't writable
     (e.g. test fixtures pointing at a not-yet-created path).
     """
@@ -704,8 +691,7 @@ async def lifespan(app: FastAPI):
                     "state_db_path resolved under /app/ (%s) — in Docker this is "
                     "the container's writable layer and will be wiped on image "
                     "bumps. Mount a host directory for views.yaml or set an "
-                    "absolute server.state_db_path on a persistent volume "
-                    "(see issue #39).",
+                    "absolute server.state_db_path on a persistent volume.",
                     db_path,
                 )
             db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -855,27 +841,21 @@ _FIELD_META: dict[str, dict] = {
     },
 }
 
+
 # Resolve string annotations to real types (PEP 563 / `from __future__ import annotations`).
-_VIEW_TYPES: dict[str, type] = typing.get_type_hints(ViewConfig)
-
-
 def _build_form_schema() -> list[dict]:
     schema = []
-    for f in dataclasses.fields(ViewConfig):
-        meta = _FIELD_META.get(f.name, {})
-        t = _VIEW_TYPES[f.name]
-        default_type = "boolean" if t is bool else "number" if t is int else "string"
+    for name, f in ViewConfig.model_fields.items():
+        meta = _FIELD_META.get(name, {})
+        default_type = "boolean" if f.annotation is bool else "number" if f.annotation is int else "string"
         entry = {
-            "name": f.name,
-            "label": meta.get("label", f.name.replace("_", " ").title()),
+            "name": name,
+            "label": meta.get("label", name.replace("_", " ").title()),
             "type": meta.get("type", default_type),
             "required": meta.get("required", False),
-            # Always emit a boolean so the UI's `:disabled` binding never
-            # receives `undefined` — Alpine renders an `undefined` value as
-            # a present `disabled` attribute, which silently locks the field.
             "disabled_on_edit": meta.get("disabled_on_edit", False),
         }
-        if f.default is not dataclasses.MISSING:
+        if not f.is_required():
             entry["default"] = f.default
         for k in ("placeholder", "help", "group", "options", "rows", "min", "suffix"):
             if k in meta:
@@ -887,42 +867,17 @@ def _build_form_schema() -> list[dict]:
 VIEW_FORM_SCHEMA: list[dict] = _build_form_schema()
 
 
-def _build_view_create_model() -> type[BaseModel]:
-    """Pydantic ViewCreate model auto-derived from ViewConfig fields.
-
-    ``name`` is optional at the API boundary — both ``""`` and ``null``
-    round-trip and are substituted with ``target_table`` inside the create
-    handler. The ``str | None`` typing keeps any reasonable client (UI
-    JS that emits ``null`` for blank optional fields, curl, etc.) from
-    needing to know our defaulting rule.
-    """
-    fields_spec: dict[str, tuple] = {}
-    for f in dataclasses.fields(ViewConfig):
-        if f.name == "name":
-            field_type: object = str | None
-            default = None
-        else:
-            field_type = _VIEW_TYPES[f.name]
-            default = ... if f.default is dataclasses.MISSING else f.default
-        fields_spec[f.name] = (field_type, default)
-
-    def _check_name(cls, v):
-        if v:
-            validate_view_name(v, "name")
-        return v
-
-    def _check_target_table(cls, v):
-        validate_qualified_name(v, "target_table")
-        return v
-
-    validators = {
-        "_v_name": field_validator("name")(_check_name),
-        "_v_target_table": field_validator("target_table")(_check_target_table),
-    }
-    return create_model("ViewCreate", __validators__=validators, **fields_spec)
-
-
-ViewCreate = _build_view_create_model()
+def _validate_view(data: dict) -> ViewConfig:
+    """``ViewConfig`` from a request body, or a 422 with readable messages."""
+    try:
+        return ViewConfig.model_validate(data)
+    except ValidationError as e:
+        messages = []
+        for err in e.errors():
+            msg = err["msg"].removeprefix("Value error, ")
+            where = ".".join(str(p) for p in err["loc"])
+            messages.append(f"{where}: {msg}" if where else msg)
+        raise HTTPException(422, "; ".join(messages)) from None
 
 
 class ViewResponse(BaseModel):
@@ -969,7 +924,7 @@ def rewrite_info_uri(info_uri: str, internal_url: str, public_url: str) -> str:
 
 def _view_to_response(v: ViewConfig, vs: ViewStatus | None, trino: TrinoConfig | None = None) -> ViewResponse:
     parsed = parse_view_query(v.query)
-    data = {f.name: getattr(v, f.name) for f in dataclasses.fields(ViewConfig)}
+    data = v.model_dump()
     status_dict: dict | None = dataclasses.asdict(vs) if vs else None
     if status_dict and trino is not None and trino.public_url and trino.public_url != trino.url:
         for q in status_dict.get("recent_queries") or ():
@@ -1043,99 +998,43 @@ def parse_query(body: ParseRequest) -> ParseResponse:
     )
 
 
+def _save(s: AppState, views: list[ViewConfig]) -> None:
+    save_views(views, s.views_path)
+    s.config = Config(trino=s.config.trino, views=views, server=s.config.server)
+    s.views_mtime = s.views_path.stat().st_mtime
+    VIEWS_CONFIGURED.set(len(views))
+
+
 @app.post("/api/views", status_code=201)
-def create_view(
-    body: ViewCreate,
-    s: AppState = Depends(get_app_state),
-) -> ViewResponse:
+def create_view(body: dict = Body(...), s: AppState = Depends(get_app_state)) -> ViewResponse:
     if not s.config:
         raise HTTPException(500, "config not loaded")
-
-    # Default name → target_table FQDN. Lets API/UI callers omit a redundant
-    # label when they're happy to identify the view by where it writes.
-    name = body.name or body.target_table
-    try:
-        validate_view_name(name, "name")
-    except ValueError as exc:
-        raise HTTPException(422, str(exc)) from exc
-
-    if any(v.name == name for v in s.config.views):
-        raise HTTPException(409, f"view '{name}' already exists")
-
-    # Validate the query — raises on any violation.  Rejected queries never
-    # make it into saved state.
-    try:
-        parse_view_query(body.query)
-        validate_chunk_compatibility(body.full_refresh_chunk, body.query)
-        validate_maintenance_config(body.model_dump())
-    except ValueError as exc:
-        raise HTTPException(422, str(exc)) from exc
-
-    # Normalize the UI's empty-string sentinel ("single-shot") to None so it
-    # round-trips through YAML the same way YAML-loaded views do.
-    payload = body.model_dump()
-    payload["name"] = name
-    if not payload.get("full_refresh_chunk"):
-        payload["full_refresh_chunk"] = None
-    if not payload.get("optimize_file_size_threshold"):
-        payload["optimize_file_size_threshold"] = None
-    new_view = ViewConfig(**payload)
-    new_views = list(s.config.views) + [new_view]
-    new_cfg = Config(trino=s.config.trino, views=new_views, server=s.config.server)
-    save_views(new_views, s.views_path)
-    s.config = new_cfg
-    s.views_mtime = s.views_path.stat().st_mtime
-    s.view_statuses[name] = ViewStatus(name=name)
-    VIEWS_CONFIGURED.set(len(new_views))
-    log.info("created view %r via API", name)
-
-    return _view_to_response(new_view, s.view_statuses[name], s.config.trino)
+    view = _validate_view(body)
+    if any(v.name == view.name for v in s.config.views):
+        raise HTTPException(409, f"view '{view.name}' already exists")
+    _save(s, [*s.config.views, view])
+    s.view_statuses[view.name] = ViewStatus(name=view.name)
+    log.info("created view %r via API", view.name)
+    return _view_to_response(view, s.view_statuses[view.name], s.config.trino)
 
 
 @app.put("/api/views/{name}")
-def update_view(
-    name: str,
-    body: ViewCreate,
-    s: AppState = Depends(get_app_state),
-) -> ViewResponse:
-    """Update mutable fields of an existing view.
-
-    ``name`` and ``query`` are the view's identity — changing the query would
-    silently orphan already-materialized rows (the target table gets recreated
-    on the next refresh), so both are rejected here. To change either, delete
-    the view and recreate it.
-    """
+def update_view(name: str, body: dict = Body(...), s: AppState = Depends(get_app_state)) -> ViewResponse:
+    """Change a view's settings. Its name and query are its identity: to
+    change either, delete the view and create a new one."""
     if not s.config:
         raise HTTPException(500, "config not loaded")
     existing = next((v for v in s.config.views if v.name == name), None)
     if not existing:
         raise HTTPException(404, f"view '{name}' not found")
-    if body.name and body.name != name:
+    if body.get("name") not in (None, "", name):
         raise HTTPException(422, "name cannot be changed; delete and recreate the view instead")
-    if body.query.strip() != existing.query.strip():
+    view = _validate_view({**body, "name": name})
+    if view.query.strip() != existing.query.strip():
         raise HTTPException(422, "query cannot be changed; delete and recreate the view instead")
-
-    try:
-        validate_chunk_compatibility(body.full_refresh_chunk, body.query)
-        validate_maintenance_config(body.model_dump())
-    except ValueError as exc:
-        raise HTTPException(422, str(exc)) from exc
-
-    payload = body.model_dump()
-    payload["name"] = name
-    if not payload.get("full_refresh_chunk"):
-        payload["full_refresh_chunk"] = None
-    if not payload.get("optimize_file_size_threshold"):
-        payload["optimize_file_size_threshold"] = None
-    updated = ViewConfig(**payload)
-    new_views = [updated if v.name == name else v for v in s.config.views]
-    new_cfg = Config(trino=s.config.trino, views=new_views, server=s.config.server)
-    save_views(new_views, s.views_path)
-    s.config = new_cfg
-    s.views_mtime = s.views_path.stat().st_mtime
+    _save(s, [view if v.name == name else v for v in s.config.views])
     log.info("updated view %r via API", name)
-
-    return _view_to_response(updated, s.view_statuses.get(name), s.config.trino)
+    return _view_to_response(view, s.view_statuses.get(name), s.config.trino)
 
 
 @app.delete("/api/views/{name}", status_code=204)
@@ -1144,11 +1043,7 @@ async def delete_view(name: str, s: AppState = Depends(get_app_state)):
         raise HTTPException(500, "config not loaded")
     if not any(v.name == name for v in s.config.views):
         raise HTTPException(404, f"view '{name}' not found")
-    new_views = [v for v in s.config.views if v.name != name]
-    new_cfg = Config(trino=s.config.trino, views=new_views, server=s.config.server)
-    save_views(new_views, s.views_path)
-    s.config = new_cfg
-    s.views_mtime = s.views_path.stat().st_mtime
+    _save(s, [v for v in s.config.views if v.name != name])
     # Cancel and await the worker before clearing runtime state and history.
     # The supervisor's sync_workers would do this on its next tick (~1s
     # later), during which the worker could keep writing view_status and
@@ -1163,7 +1058,6 @@ async def delete_view(name: str, s: AppState = Depends(get_app_state)):
     s.view_runtimes.pop(name, None)
     if s.history is not None:
         await s.history.delete_view(name)
-    VIEWS_CONFIGURED.set(len(new_views))
     log.info("deleted view %r via API", name)
 
 
