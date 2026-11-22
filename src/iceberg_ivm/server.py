@@ -25,6 +25,7 @@ from iceberg_ivm.config import Config, TrinoConfig, ViewConfig, load_config, loa
 from iceberg_ivm.detector import (
     FullRefreshNeeded,
     RefreshAction,
+    SourceNotFound,
     detect_changes,
     incremental_range_since,
     snapshot_exists,
@@ -103,6 +104,8 @@ class ViewStatus:
     # so existing consumers of the counter are not broken.
     chunks_done: int = 0
     chunks_total: int | None = None
+    # Informational, not an error (e.g. "waiting for <source> to exist").
+    note: str | None = None
     # Ring buffer of the last few refresh queries (MERGE / INSERT / DELETE).
     # In-memory only; cleared on process restart.
     recent_queries: list[QueryInfo] = field(default_factory=list)
@@ -406,6 +409,11 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
     try:
         async with asyncio.timeout(view.query_timeout_seconds):  # None → no timeout
             await _refresh(s, view, conn, vs)
+    except SourceNotFound as e:
+        vs.last_action = "waiting"
+        vs.last_error = None
+        vs.note = str(e)
+        await _persist_view_status(s, view.name, vs)
     except TimeoutError:
         vs.last_error = f"refresh exceeded query_timeout_seconds={view.query_timeout_seconds}"
         vs.total_errors += 1
@@ -436,6 +444,7 @@ async def _refresh(s: AppState, view: ViewConfig, conn, vs: ViewStatus) -> None:
     that snapshot only when the run completes, so an interrupted run resumes
     with the same pin and window. A missing bookmark means "full refresh".
     """
+    vs.note = None
     parsed = parse_view_query(view.query)
     cursor = await conn.cursor()
     history = s.history

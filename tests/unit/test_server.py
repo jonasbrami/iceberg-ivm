@@ -3157,3 +3157,35 @@ def test_password_protects_ui_and_api_but_not_probes(client, monkeypatch):
 def test_no_password_means_open_access(client, monkeypatch):
     monkeypatch.delenv("IVM_PASSWORD", raising=False)
     assert client.get("/api/views").status_code == 200
+
+
+async def test_missing_source_table_is_waiting_not_an_error(setup_state):
+    """A chained view's upstream target may not exist yet on the first tick."""
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import SourceNotFound
+
+    vs = setup_state.view_statuses["test_view"]
+    errors_before = vs.total_errors
+    with (
+        patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+        patch.object(server_mod, "detect_changes", AsyncMock(side_effect=SourceNotFound("waiting for x to exist"))),
+    ):
+        await server_mod.refresh_view(setup_state, setup_state.config.views[0])
+    assert (vs.last_action, vs.last_error, vs.note) == ("waiting", None, "waiting for x to exist")
+    assert vs.total_errors == errors_before
+
+
+async def test_source_not_found_is_raised_for_missing_tables_only():
+    from iceberg_ivm.detector import SourceNotFound, get_current_snapshot
+
+    class Missing(Exception):
+        error_name = "TABLE_NOT_FOUND"
+
+    class Broken(Exception):
+        error_name = "GENERIC_INTERNAL_ERROR"
+
+    for exc, expected in ((Missing("gone"), SourceNotFound), (Broken("boom"), Broken)):
+        cursor = AsyncMock()
+        cursor.execute.side_effect = exc
+        with pytest.raises(expected):
+            await get_current_snapshot(cursor, "iceberg.a.b")

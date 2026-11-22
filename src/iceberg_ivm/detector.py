@@ -38,6 +38,11 @@ class MissingStatsError(Exception):
     """Data files have no min/max statistics for the time column."""
 
 
+class SourceNotFound(Exception):
+    """The source table (or its schema) doesn't exist yet — e.g. the upstream
+    view of a chain hasn't created its target. Not an error: wait for it."""
+
+
 @dataclass
 class ChangeResult:
     action: RefreshAction
@@ -53,7 +58,12 @@ def system_table(table: str, suffix: str) -> str:
 
 async def get_current_snapshot(cursor, table: str) -> int | None:
     """The snapshot the main branch points at, or None for an empty table."""
-    await cursor.execute(f"SELECT snapshot_id FROM {system_table(table, 'refs')} WHERE name = 'main'")
+    try:
+        await cursor.execute(f"SELECT snapshot_id FROM {system_table(table, 'refs')} WHERE name = 'main'")
+    except Exception as e:
+        if getattr(e, "error_name", None) in ("TABLE_NOT_FOUND", "SCHEMA_NOT_FOUND"):
+            raise SourceNotFound(f"waiting for {table} to exist") from e
+        raise
     row = await cursor.fetchone()
     return row[0] if row else None
 

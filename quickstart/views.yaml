@@ -16,19 +16,20 @@ views:
     target_partitioning: "ARRAY['day(bucket)']"
     refresh_interval_seconds: 20
 
+  # Chained: rolls up ohlcv_1m's target table instead of reading raw trades.
   - name: ohlcv_1h
     query: |
       SELECT
         symbol,
-        date_trunc('hour', ts) AS bucket,
-        min_by(price, ts) AS open,
-        max(price)        AS high,
-        min(price)        AS low,
-        max_by(price, ts) AS close,
-        sum(quantity)     AS volume,
-        count(*)          AS trade_count
-      FROM iceberg.market_data.trades
-      GROUP BY symbol, date_trunc('hour', ts)
+        date_trunc('hour', bucket) AS bucket,
+        min_by(open, bucket)  AS open,
+        max(high)             AS high,
+        min(low)              AS low,
+        max_by(close, bucket) AS close,
+        sum(volume)           AS volume,
+        sum(trade_count)      AS trade_count
+      FROM iceberg.analytics.ohlcv_1m
+      GROUP BY 1, 2
     target_table: iceberg.analytics.ohlcv_1h
     refresh_interval_seconds: 25
 
