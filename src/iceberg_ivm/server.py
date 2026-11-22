@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import dataclasses
+import importlib.metadata
 import logging
 import os
 import secrets
@@ -18,10 +19,11 @@ import aiotrino
 from aiotrino.auth import BasicAuthentication
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
+from fastapi.staticfiles import StaticFiles
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, ValidationError
 
-from iceberg_ivm.config import Config, TrinoConfig, ViewConfig, load_config, load_views, save_views
+from iceberg_ivm.config import CHUNKS_FOR, Config, TrinoConfig, ViewConfig, load_config, load_views, save_views
 from iceberg_ivm.detector import (
     FullRefreshNeeded,
     RefreshAction,
@@ -108,6 +110,7 @@ class ViewStatus:
     chunks_total: int | None = None
     # Informational, not an error (e.g. "waiting for <source> to exist").
     note: str | None = None
+    running: bool = False  # MERGEs are executing right now (not persisted)
     # Freshness, as epoch seconds: the last successful check of the source,
     # the commit time of the source's newest snapshot, and the commit time of
     # the snapshot the view reflects. Equal last two = up to date.
@@ -399,6 +402,12 @@ async def _record_query(s: AppState, view_name: str, vs: ViewStatus, q: QueryInf
         vs.recent_queries = ([q, *vs.recent_queries])[:RECENT_QUERY_LIMIT]
 
 
+def _error_text(e: Exception) -> str:
+    """Trino errors carry a readable message; anything else uses its own text."""
+    message = getattr(e, "message", None)
+    return message if isinstance(message, str) and message else str(e)
+
+
 def _epoch(value) -> float | None:
     return value.timestamp() if value is not None else None
 
@@ -439,12 +448,13 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
         log.warning("%s: refresh timed out after %ds", view.name, view.query_timeout_seconds)
         await _persist_view_status(s, view.name, vs)
     except Exception as e:
-        vs.last_error = str(e)
+        vs.last_error = _error_text(e)
         vs.total_errors += 1
         REFRESH_ERRORS.labels(view=view.name).inc()
         log.exception("%s: refresh failed", view.name)
         await _persist_view_status(s, view.name, vs)
     finally:
+        vs.running = False
         # Shielded so a cancelled tick still cancels its Trino queries and closes.
         try:
             await asyncio.shield(conn.close())
@@ -530,6 +540,7 @@ async def _refresh(s: AppState, view: ViewConfig, conn, vs: ViewStatus) -> None:
     total_rows = 0
     total_bytes = 0
 
+    vs.running = True
     async for q in execute_refresh(
         cursor, view, parsed, value_columns, snapshot=pinned, window=window, resume_from=resume_from
     ):
@@ -785,128 +796,7 @@ async def basic_auth(request: Request, call_next):
     return await call_next(request)
 
 
-# ── API models + form schema, all derived from ViewConfig ──
-
-# Per-field presentation metadata: label + anything non-inferrable from the
-# dataclass annotation/default. Not in the map → derived defaults (label from
-# Title Case, required=False, type inferred from annotation).
-_GRAN_OPTIONS = [{"value": "", "label": "— none (single-shot) —"}] + [
-    {"value": g, "label": g} for g in ("hour", "day", "week", "month", "quarter", "year")
-]
-_FIELD_META: dict[str, dict] = {
-    "name": {
-        "placeholder": "defaults to target table",
-        "disabled_on_edit": True,
-        "help": (
-            "optional label used to identify this view in the API and UI. "
-            "Leave blank to default to the target table FQDN."
-        ),
-    },
-    "query": {
-        "required": True,
-        "type": "text",
-        "rows": 10,
-        "disabled_on_edit": True,
-        "placeholder": (
-            "SELECT symbol,\n       date_trunc('minute', ts) AS minute,\n"
-            "       min_by(price, ts) AS open,\n       max(price)        AS high,\n"
-            "       min(price)        AS low,\n       max_by(price, ts) AS close\n"
-            "FROM iceberg.market_data.trades\nGROUP BY symbol, date_trunc('minute', ts)"
-        ),
-        "help": (
-            "exactly what you would write after CREATE MATERIALIZED VIEW … AS. "
-            "source table, filter column, granularity and merge keys are "
-            "derived automatically from the query."
-        ),
-    },
-    "target_table": {"required": True, "group": "target", "placeholder": "iceberg.analytics.my_view"},
-    "target_partitioning": {"group": "target", "placeholder": "ARRAY['day(minute)']", "help": "unpartitioned if blank"},
-    "refresh_interval_seconds": {"min": 1, "suffix": "seconds", "label": "Refresh Interval"},
-    "query_timeout_seconds": {
-        # Set explicitly: ``_build_form_schema``'s inference resolves
-        # ``int | None`` to ``types.UnionType``, not ``int``, and would
-        # otherwise render this as a text input.
-        "type": "number",
-        "min": 1,
-        "suffix": "seconds",
-        "label": "Query Timeout",
-        "help": "Optional. Max wall-clock seconds for a single refresh tick. Leave blank for no timeout.",
-    },
-    "full_refresh_chunk": {
-        "type": "select",
-        "group": "target",
-        "options": _GRAN_OPTIONS,
-        "label": "Full Refresh Chunk Size",
-        "help": (
-            "If set, the first-run backfill is split into chunks of this size "
-            "and each chunk is committed independently. Must be coarser-or-equal "
-            "to the view's own date_trunc granularity. Sub-second views "
-            "(second / millisecond) must pick minute or coarser."
-        ),
-    },
-    "maintenance_interval_seconds": {
-        "min": 0,
-        "suffix": "seconds",
-        "group": "maintenance",
-        "label": "Maintenance Interval",
-        "help": "Shared interval for every enabled op. 0 disables maintenance entirely.",
-    },
-    "optimize": {
-        "group": "maintenance",
-        "label": "Optimize",
-        "help": "Run ALTER TABLE ... EXECUTE optimize on each tick.",
-    },
-    "optimize_file_size_threshold": {
-        "group": "maintenance",
-        "label": "Optimize File Size Threshold",
-        "placeholder": "e.g. 128MB (default: Trino's 100MB)",
-    },
-    "expire_snapshots": {
-        "group": "maintenance",
-        "label": "Expire Snapshots",
-        "help": "Run ALTER TABLE ... EXECUTE expire_snapshots on each tick.",
-    },
-    "expire_snapshots_retention": {
-        "group": "maintenance",
-        "label": "Expire Snapshots Retention",
-        "help": "Trino duration (e.g. '7d'). Must be ≥ catalog's min-retention.",
-    },
-    "remove_orphan_files": {
-        "group": "maintenance",
-        "label": "Remove Orphan Files",
-        "help": "Run ALTER TABLE ... EXECUTE remove_orphan_files on each tick.",
-    },
-    "remove_orphan_files_retention": {
-        "group": "maintenance",
-        "label": "Remove Orphan Files Retention",
-        "help": "Trino duration (e.g. '7d'). Must be ≥ catalog's min-retention.",
-    },
-}
-
-
-# Resolve string annotations to real types (PEP 563 / `from __future__ import annotations`).
-def _build_form_schema() -> list[dict]:
-    schema = []
-    for name, f in ViewConfig.model_fields.items():
-        meta = _FIELD_META.get(name, {})
-        default_type = "boolean" if f.annotation is bool else "number" if f.annotation is int else "string"
-        entry = {
-            "name": name,
-            "label": meta.get("label", name.replace("_", " ").title()),
-            "type": meta.get("type", default_type),
-            "required": meta.get("required", False),
-            "disabled_on_edit": meta.get("disabled_on_edit", False),
-        }
-        if not f.is_required():
-            entry["default"] = f.default
-        for k in ("placeholder", "help", "group", "options", "rows", "min", "suffix"):
-            if k in meta:
-                entry[k] = meta[k]
-        schema.append(entry)
-    return schema
-
-
-VIEW_FORM_SCHEMA: list[dict] = _build_form_schema()
+# ── API models ──
 
 
 def _validate_view(data: dict) -> ViewConfig:
@@ -932,6 +822,8 @@ class ViewResponse(BaseModel):
     model_config = {"extra": "allow"}
     source_table: str
     filter_column: str
+    granularity: str
+    bucket_alias: str
     merge_keys: tuple[str, ...]
     status: dict | None = None
 
@@ -974,6 +866,8 @@ def _view_to_response(v: ViewConfig, vs: ViewStatus | None, trino: TrinoConfig |
     return ViewResponse(
         source_table=parsed.source_table,
         filter_column=parsed.filter_column,
+        granularity=parsed.granularity,
+        bucket_alias=parsed.bucket_alias,
         merge_keys=parsed.merge_keys,
         status=status_dict,
         **data,
@@ -983,10 +877,20 @@ def _view_to_response(v: ViewConfig, vs: ViewStatus | None, trino: TrinoConfig |
 # ── Endpoints ──
 
 
-@app.get("/api/views/schema")
-def view_schema():
-    """Return form field metadata so the UI can render dynamically."""
-    return VIEW_FORM_SCHEMA
+@app.get("/api/info")
+def info(s: AppState = Depends(get_app_state)):
+    """What the UI shows in its header."""
+    trino = s.config.trino if s.config else None
+    try:
+        version = importlib.metadata.version("iceberg-ivm")
+    except importlib.metadata.PackageNotFoundError:
+        version = "dev"
+    return {
+        "version": version,
+        "trino_url": (trino.public_url or trino.url) if trino else None,
+        "catalog": trino.catalog if trino else None,
+        "schema": trino.schema if trino else None,
+    }
 
 
 @app.get("/health")
@@ -1018,7 +922,9 @@ class ParseResponse(BaseModel):
     source_table: str
     filter_column: str
     granularity: str
+    bucket_alias: str
     merge_keys: tuple[str, ...]
+    chunk_sizes: tuple[str, ...]  # valid values for full_refresh_chunk
 
 
 @app.post("/api/views/parse")
@@ -1036,7 +942,9 @@ def parse_query(body: ParseRequest) -> ParseResponse:
         source_table=p.source_table,
         filter_column=p.filter_column,
         granularity=p.granularity,
+        bucket_alias=p.bucket_alias,
         merge_keys=p.merge_keys,
+        chunk_sizes=CHUNKS_FOR[p.granularity],
     )
 
 
@@ -1048,7 +956,7 @@ def _save(s: AppState, views: list[ViewConfig]) -> None:
 
 
 @app.post("/api/views", status_code=201)
-def create_view(body: dict = Body(...), s: AppState = Depends(get_app_state)) -> ViewResponse:
+async def create_view(body: dict = Body(...), s: AppState = Depends(get_app_state)) -> ViewResponse:
     if not s.config:
         raise HTTPException(500, "config not loaded")
     view = _validate_view(body)
@@ -1056,6 +964,9 @@ def create_view(body: dict = Body(...), s: AppState = Depends(get_app_state)) ->
         raise HTTPException(409, f"view '{view.name}' already exists")
     _save(s, [*s.config.views, view])
     s.view_statuses[view.name] = ViewStatus(name=view.name)
+    if not s.stop_event.is_set() and view.name not in s.workers:
+        # Start now rather than at the supervisor's next config reload.
+        s.workers[view.name] = asyncio.create_task(view_worker(s, view.name))
     log.info("created view %r via API", view.name)
     return _view_to_response(view, s.view_statuses[view.name], s.config.trino)
 
@@ -1146,6 +1057,11 @@ async def rebuild_view(name: str, s: AppState = Depends(get_app_state)):
     return await trigger_refresh(name, s)
 
 
+_STATIC = Path(__file__).parent / "static"
+app.mount("/static", StaticFiles(directory=_STATIC), name="static")
+
+
 @app.get("/", response_class=HTMLResponse)
 def ui():
-    return HTMLResponse((Path(__file__).parent / "static" / "index.html").read_text())
+    # no-cache: a browser revalidates the page, so an upgrade shows up on reload.
+    return HTMLResponse((_STATIC / "index.html").read_text(), headers={"Cache-Control": "no-cache"})

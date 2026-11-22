@@ -25,11 +25,11 @@ log = logging.getLogger(__name__)
 # don't divide each other, and sub-minute chunks would mean millions of commits.
 _GRAN_ORDER = ("millisecond", "second", "minute", "hour", "day", "week", "month", "quarter", "year")
 CHUNK_GRANULARITIES = ("minute", "hour", "day", "week", "month", "quarter", "year")
-_CHUNKS_FOR: dict[str, tuple[str, ...]] = {
+CHUNKS_FOR: dict[str, tuple[str, ...]] = {
     g: tuple(c for c in _GRAN_ORDER[i:] if c in CHUNK_GRANULARITIES and (c != "week" or i <= _GRAN_ORDER.index("week")))
     for i, g in enumerate(_GRAN_ORDER)
 }
-_CHUNKS_FOR["week"] = ("week",)
+CHUNKS_FOR["week"] = ("week",)
 
 _DURATION_RE = re.compile(r"^\d+[smhd]$")  # Trino duration
 _DATASIZE_RE = re.compile(r"^\d+(B|KB|MB|GB|TB)$")  # Trino data size
@@ -95,10 +95,10 @@ class ViewConfig(BaseModel):
     def _query_and_chunk(self):
         parsed = parse_view_query(self.query)
         chunk = self.full_refresh_chunk
-        if chunk is not None and chunk not in _CHUNKS_FOR[parsed.granularity]:
+        if chunk is not None and chunk not in CHUNKS_FOR[parsed.granularity]:
             raise ValueError(
                 f"full_refresh_chunk {chunk!r} doesn't hold whole {parsed.granularity} buckets; "
-                f"use one of {list(_CHUNKS_FOR[parsed.granularity])}"
+                f"use one of {list(CHUNKS_FOR[parsed.granularity])}"
             )
         return self
 
