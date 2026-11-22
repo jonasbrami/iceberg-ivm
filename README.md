@@ -18,7 +18,10 @@
 </p>
 
 <p align="center">
-  <img src="docs/screenshots/ui-overview.png" width="860" alt="The iceberg-ivm dashboard: each view's health, freshness and last refresh">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/dashboard-dark.png">
+    <img src="docs/screenshots/dashboard-light.png" width="860" alt="The iceberg-ivm dashboard: each view's health, freshness and last refresh, with one view expanded to show its query, lineage and recent queries">
+  </picture>
 </p>
 
 ---
@@ -88,7 +91,7 @@ The rules:
 - ❌ Joins, subqueries, CTEs, `UNION`, `LIMIT`, window functions
 - ❌ A query whose `GROUP BY` has no time bucket. Without one, each refresh would overwrite all-time totals with totals for just the new rows, so it's rejected with an explanation.
 
-You can also create views from the UI. It checks the query as you type and shows what it derived.
+You can also create views from the UI. It checks the query as you type and shows what it derived. The UI works offline (no CDNs) and follows your system's light or dark theme.
 
 ## Run it on your Trino
 

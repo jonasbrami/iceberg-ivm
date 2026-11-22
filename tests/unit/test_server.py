@@ -265,84 +265,6 @@ def test_view_to_response_is_a_noop_when_trino_arg_is_none(setup_state):
     assert resp.status["recent_queries"][0]["info_uri"] == "http://trino:8080/ui/query.html?qid"
 
 
-def test_view_schema(client):
-    """Schema endpoint drives the dynamic UI — must expose only create-view fields.
-
-    source_table / filter_column / merge_keys are derived from the query and
-    must NOT appear in the create form.
-    """
-    r = client.get("/api/views/schema")
-    assert r.status_code == 200
-    schema = r.json()
-    assert isinstance(schema, list)
-    names = {f["name"] for f in schema}
-    assert names == {
-        "name",
-        "query",
-        "target_table",
-        "target_partitioning",
-        "refresh_interval_seconds",
-        "query_timeout_seconds",
-        "full_refresh_chunk",
-        "maintenance_interval_seconds",
-        "optimize",
-        "optimize_file_size_threshold",
-        "expire_snapshots",
-        "expire_snapshots_retention",
-        "remove_orphan_files",
-        "remove_orphan_files_retention",
-    }
-    for f in schema:
-        assert "label" in f and "type" in f and "required" in f
-    # Derived fields must not leak into the create form
-    assert "source_table" not in names
-    assert "filter_column" not in names
-    assert "merge_keys" not in names
-
-
-def test_view_schema_maintenance_fields_grouped(client):
-    """All maintenance fields (shared interval, per-op booleans, retention/threshold)
-    share the 'maintenance' group so the UI can render them as one section."""
-    schema = client.get("/api/views/schema").json()
-    maint = [f for f in schema if f.get("group") == "maintenance"]
-    assert {f["name"] for f in maint} == {
-        "maintenance_interval_seconds",
-        "optimize",
-        "optimize_file_size_threshold",
-        "expire_snapshots",
-        "expire_snapshots_retention",
-        "remove_orphan_files",
-        "remove_orphan_files_retention",
-    }
-    # Per-op toggles must surface as booleans so the UI renders checkboxes,
-    # not text inputs.
-    by_name = {f["name"]: f for f in maint}
-    for op in ("optimize", "expire_snapshots", "remove_orphan_files"):
-        assert by_name[op]["type"] == "boolean", f"{op} should be a boolean field"
-        assert by_name[op]["default"] is True, f"{op} should default to enabled"
-
-
-def test_view_schema_full_refresh_chunk_is_select_with_granularity_options(client):
-    """The UI renders full_refresh_chunk as a dropdown — the schema must expose
-    ``type: select`` and a granularity allow-list that matches the allow-list
-    validated server-side by ``validate_chunk_compatibility``."""
-    schema = client.get("/api/views/schema").json()
-    field = next(f for f in schema if f["name"] == "full_refresh_chunk")
-    assert field["type"] == "select"
-    assert field["required"] is False
-    option_values = [o["value"] for o in field["options"]]
-    # Empty-string option is the "single-shot" sentinel
-    assert "" in option_values
-    # Each other value must be a valid granularity
-    for v in option_values:
-        if v == "":
-            continue
-        assert v in {"hour", "day", "week", "month", "quarter", "year"}
-
-
-# ── CRUD ──
-
-
 def test_list_views(client):
     views = client.get("/api/views").json()
     assert len(views) == 1
@@ -546,37 +468,6 @@ def test_update_view_whitespace_only_query_diff_is_accepted(client):
         },
     )
     assert r.status_code == 200, r.text
-
-
-def test_view_schema_query_field_is_disabled_on_edit(client):
-    """The UI must lock the query field when editing — query changes are
-    semantically a delete+recreate, not an update."""
-    schema = client.get("/api/views/schema").json()
-    query_field = next(f for f in schema if f["name"] == "query")
-    assert query_field.get("disabled_on_edit") is True
-
-
-def test_view_schema_name_field_is_optional(client):
-    """The name field is optional in the form schema — UI shows '(optional)' /
-    placeholder hints that it defaults to the target table."""
-    schema = client.get("/api/views/schema").json()
-    name_field = next(f for f in schema if f["name"] == "name")
-    assert name_field["required"] is False
-    assert name_field.get("disabled_on_edit") is True
-
-
-def test_view_schema_query_timeout_seconds_is_number(client):
-    """``query_timeout_seconds`` is typed ``int | None`` — that resolves to a
-    ``types.UnionType`` (not ``int``), so ``_build_form_schema``'s default
-    inference falls back to ``"string"``. The ``_FIELD_META`` entry sets
-    ``"type": "number"`` explicitly to compensate; this test pins that so
-    the field can't silently regress to a text input."""
-    schema = client.get("/api/views/schema").json()
-    field = next(f for f in schema if f["name"] == "query_timeout_seconds")
-    assert field["type"] == "number"
-    assert field.get("min") == 1
-    # Required must be False — the field is optional (no timeout by default).
-    assert field["required"] is False
 
 
 def test_update_view_blank_name_is_accepted(client, setup_state):
@@ -1242,7 +1133,7 @@ async def test_view_worker_resets_refresh_in_flight_on_cancel(setup_state):
 def test_ui(client):
     r = client.get("/")
     assert r.status_code == 200
-    assert "Materialized Views" in r.text
+    assert "New view" in r.text
 
 
 # ── Config reload ──
@@ -3259,3 +3150,76 @@ async def test_freshness_is_recorded_on_refresh_and_on_idle_ticks(setup_state):
             stack.enter_context(p)
         await server_mod.refresh_view(setup_state, view)
     assert (vs.source_committed_at, vs.data_as_of) == (200, 200)
+
+
+def test_info_reports_version_and_trino(client):
+    body = client.get("/api/info").json()
+    assert body["trino_url"] == "http://localhost:8080"
+    assert (body["catalog"], body["schema"]) == ("iceberg", "analytics")
+    assert body["version"]
+
+
+def test_parse_reports_bucket_and_valid_chunk_sizes(client):
+    body = client.post(
+        "/api/views/parse", json={"query": "SELECT date_trunc('day', ts) AS d, count(*) AS n FROM t GROUP BY 1"}
+    ).json()
+    assert body["bucket_alias"] == "d"
+    assert body["chunk_sizes"] == ["day", "week", "month", "quarter", "year"]
+
+
+def test_views_include_bucket_details(client):
+    view = client.get("/api/views").json()[0]
+    assert (view["granularity"], view["bucket_alias"]) == ("day", "d")
+    assert view["status"]["running"] is False
+
+
+def test_ui_is_self_contained(client):
+    """The page must work without internet access: no CDN scripts or fonts."""
+    html = client.get("/").text
+    assert "/static/alpine.min.js" in html
+    assert "cdn." not in html and "fonts.googleapis" not in html
+    assert client.get("/static/alpine.min.js").status_code == 200
+
+
+async def test_trino_errors_are_recorded_as_their_message(setup_state):
+    from iceberg_ivm import server as server_mod
+
+    class TrinoUserError(Exception):
+        message = "Schema no_such_schema not found"
+
+    vs = setup_state.view_statuses["test_view"]
+    with (
+        patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+        patch.object(server_mod, "detect_changes", AsyncMock(side_effect=TrinoUserError("type=USER_ERROR, ..."))),
+    ):
+        await server_mod.refresh_view(setup_state, setup_state.config.views[0])
+    assert vs.last_error == "Schema no_such_schema not found"
+
+
+async def test_created_view_starts_its_worker_right_away(setup_state):
+    from httpx import ASGITransport, AsyncClient
+
+    from iceberg_ivm import server as server_mod
+
+    setup_state.stop_event.clear()
+    started = []
+
+    async def fake_worker(s, name):
+        started.append(name)
+
+    try:
+        with patch.object(server_mod, "view_worker", fake_worker):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                r = await c.post(
+                    "/api/views",
+                    json={
+                        "query": "SELECT date_trunc('day', ts) AS d, count(*) AS n FROM iceberg.db.t GROUP BY 1",
+                        "target_table": "iceberg.analytics.fresh",
+                    },
+                )
+            assert r.status_code == 201
+            await asyncio.sleep(0)
+        assert started == ["iceberg.analytics.fresh"]
+    finally:
+        setup_state.stop_event.set()
+        setup_state.workers.clear()

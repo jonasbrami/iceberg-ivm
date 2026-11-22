@@ -33,7 +33,9 @@ CREATE TABLE IF NOT EXISTS query_history (
     started_at      REAL    NOT NULL,
     elapsed_ms      REAL    NOT NULL,
     processed_rows  INTEGER NOT NULL DEFAULT 0,
-    processed_bytes INTEGER NOT NULL DEFAULT 0
+    processed_bytes INTEGER NOT NULL DEFAULT 0,
+    range_start     TEXT,  -- ISO-8601 time range the MERGE recomputed
+    range_end       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_query_history_view_started
     ON query_history (view, started_at DESC);
@@ -141,11 +143,15 @@ class QueryHistory:
             "source_committed_at": "REAL",
             "data_as_of": "REAL",
         }
-        async with self._db.execute("PRAGMA table_info(view_status)") as cur:
-            cols = {row[1] for row in await cur.fetchall()}
-        for column, type_ in added.items():
-            if column not in cols:
-                await self._db.execute(f"ALTER TABLE view_status ADD COLUMN {column} {type_}")
+        await self._add_missing_columns("view_status", added)
+        await self._add_missing_columns("query_history", {"range_start": "TEXT", "range_end": "TEXT"})
+
+    async def _add_missing_columns(self, table: str, columns: dict[str, str]) -> None:
+        async with self._db.execute(f"PRAGMA table_info({table})") as cur:
+            existing = {row[1] for row in await cur.fetchall()}
+        for column, type_ in columns.items():
+            if column not in existing:
+                await self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {type_}")
 
     async def close(self) -> None:
         if self._db is not None:
@@ -159,8 +165,8 @@ class QueryHistory:
         await self._db.executemany(
             "INSERT INTO query_history "
             "(view, query_id, info_uri, stage, started_at, elapsed_ms, "
-            " processed_rows, processed_bytes) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " processed_rows, processed_bytes, range_start, range_end) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (
                     view,
@@ -171,6 +177,8 @@ class QueryHistory:
                     q.elapsed_ms,
                     q.processed_rows,
                     q.processed_bytes,
+                    q.range_start.isoformat() if q.range_start else None,
+                    q.range_end.isoformat() if q.range_end else None,
                 )
                 for q in queries
             ],
@@ -192,7 +200,7 @@ class QueryHistory:
         """Return the newest-first list of at most ``self.limit`` queries."""
         async with self._db.execute(
             "SELECT query_id, info_uri, stage, started_at, elapsed_ms, "
-            "       processed_rows, processed_bytes "
+            "       processed_rows, processed_bytes, range_start, range_end "
             "FROM query_history WHERE view = ? "
             "ORDER BY started_at DESC LIMIT ?",
             (view, self.limit),
@@ -207,6 +215,8 @@ class QueryHistory:
                 elapsed_ms=r[4],
                 processed_rows=r[5],
                 processed_bytes=r[6],
+                range_start=datetime.fromisoformat(r[7]) if r[7] else None,
+                range_end=datetime.fromisoformat(r[8]) if r[8] else None,
             )
             for r in rows
         ]

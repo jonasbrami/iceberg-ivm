@@ -517,3 +517,14 @@ async def test_current_work_migration_idempotent(tmp_path):
         assert (await h2.get_view_status("v"))["total_refreshes"] == 5
     finally:
         await h2.close()
+
+
+async def test_recent_keeps_the_merged_time_range(history):
+    from datetime import UTC, datetime
+
+    from iceberg_ivm.executor import QueryInfo
+
+    start, end = datetime(2026, 4, 9, 10, tzinfo=UTC), datetime(2026, 4, 9, 11, tzinfo=UTC)
+    await history.append("v", [QueryInfo("q1", "", "merge", 1.0, 5.0, range_start=start, range_end=end)])
+    (q,) = await history.recent("v")
+    assert (q.range_start, q.range_end) == (start, end)
