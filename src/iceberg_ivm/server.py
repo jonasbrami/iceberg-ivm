@@ -572,6 +572,7 @@ async def _refresh(s: AppState, view: ViewConfig, conn, vs: ViewStatus) -> None:
         await history.set_last_source_snapshot(view.name, pinned)
         await history.clear_current_work(view.name)
     vs.total_refreshes += 1
+    vs.last_error = None  # also when the run had no chunk to merge
     vs.chunks_total = None  # keep chunks_done so the UI can show "7/7"
     if pinned_at is None:
         pinned_at = await snapshot_committed_at(cursor, parsed.source_table, pinned)
@@ -875,10 +876,12 @@ def _view_to_response(v: ViewConfig, vs: ViewStatus | None, trino: TrinoConfig |
 
 
 # ── Endpoints ──
+# Handlers that read or change AppState are async, so they run on the event
+# loop alongside the view workers instead of racing them from a thread.
 
 
 @app.get("/api/info")
-def info(s: AppState = Depends(get_app_state)):
+async def info(s: AppState = Depends(get_app_state)):
     """What the UI shows in its header."""
     trino = s.config.trino if s.config else None
     try:
@@ -894,7 +897,7 @@ def info(s: AppState = Depends(get_app_state)):
 
 
 @app.get("/health")
-def health(s: AppState = Depends(get_app_state)):
+async def health(s: AppState = Depends(get_app_state)):
     return {"status": "ok", "views": len(s.config.views) if s.config else 0}
 
 
@@ -907,7 +910,7 @@ def metrics():
 
 
 @app.get("/api/views")
-def list_views(s: AppState = Depends(get_app_state)) -> list[ViewResponse]:
+async def list_views(s: AppState = Depends(get_app_state)) -> list[ViewResponse]:
     if not s.config:
         return []
     trino = s.config.trino
@@ -928,7 +931,7 @@ class ParseResponse(BaseModel):
 
 
 @app.post("/api/views/parse")
-def parse_query(body: ParseRequest) -> ParseResponse:
+async def parse_query(body: ParseRequest) -> ParseResponse:
     """Parse a view query and return the derived attributes.
 
     Used by the UI to live-validate the query as the operator types.
@@ -972,7 +975,7 @@ async def create_view(body: dict = Body(...), s: AppState = Depends(get_app_stat
 
 
 @app.put("/api/views/{name}")
-def update_view(name: str, body: dict = Body(...), s: AppState = Depends(get_app_state)) -> ViewResponse:
+async def update_view(name: str, body: dict = Body(...), s: AppState = Depends(get_app_state)) -> ViewResponse:
     """Change a view's settings. Its name and query are its identity: to
     change either, delete the view and create a new one."""
     if not s.config:

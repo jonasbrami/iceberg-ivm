@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 
 from iceberg_ivm.config import ViewConfig
 from iceberg_ivm.detector import column_range, expand_to_bucket_bounds, walk_buckets
-from iceberg_ivm.query_parser import DIALECT, ParsedView, timestamp_literal
+from iceberg_ivm.query_parser import DIALECT, ParsedView, quote, timestamp_literal
 
 log = logging.getLogger(__name__)
 
@@ -57,10 +57,6 @@ async def _execute_tracked(cursor, sql: str, stage: str, **extra) -> QueryInfo:
         processed_bytes=stats.get("processedBytes", 0) or 0,
         **extra,
     )
-
-
-def quote(name: str) -> str:
-    return '"' + name.replace('"', '""') + '"'
 
 
 def build_merge_sql(

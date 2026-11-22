@@ -66,8 +66,8 @@ class TestBuildCreateTableSql:
         cols = [ColumnInfo("symbol", "varchar"), ColumnInfo("ts", "timestamp(6)")]
         sql = build_create_table_sql("iceberg.out.mv", cols)
         assert "CREATE TABLE IF NOT EXISTS iceberg.out.mv" in sql
-        assert "symbol varchar" in sql
-        assert "ts timestamp(6)" in sql
+        assert '"symbol" varchar' in sql
+        assert '"ts" timestamp(6)' in sql
         assert "format = 'PARQUET'" in sql
         assert "partitioning" not in sql
 
@@ -76,3 +76,12 @@ class TestBuildCreateTableSql:
         sql = build_create_table_sql("t", cols, "ARRAY['day(ts)']")
         assert "partitioning = ARRAY['day(ts)']" in sql
         assert "format = 'PARQUET'" in sql
+
+
+def test_create_table_quotes_column_names():
+    """Reserved words and odd characters in output names must not break the DDL (#68)."""
+    from iceberg_ivm.introspect import ColumnInfo, build_create_table_sql
+
+    sql = build_create_table_sql("iceberg.out.mv", [ColumnInfo("order", "bigint"), ColumnInfo('we"ird; x', "varchar")])
+    assert '"order" bigint' in sql
+    assert '"we""ird; x" varchar' in sql

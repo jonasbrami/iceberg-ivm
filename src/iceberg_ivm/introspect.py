@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from iceberg_ivm.query_parser import quote
+
 
 @dataclass(frozen=True)
 class ColumnInfo:
@@ -27,7 +29,7 @@ def build_create_table_sql(
     partitioning: str | None = None,
 ) -> str:
     """Generate CREATE TABLE IF NOT EXISTS DDL for the target table."""
-    col_str = ",\n  ".join(f"{c.name} {c.type}" for c in columns)
+    col_str = ",\n  ".join(f"{quote(c.name)} {c.type}" for c in columns)
     sql = f"CREATE TABLE IF NOT EXISTS {target_table} (\n  {col_str}\n)"
     props = ["format = 'PARQUET'"]
     if partitioning:

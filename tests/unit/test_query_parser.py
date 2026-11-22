@@ -185,6 +185,16 @@ class TestParseViewQuery:
         ("WITH x AS (SELECT * FROM t) SELECT date_trunc('day', ts) AS d FROM x GROUP BY 1", "CTE"),
         ("SELECT date_trunc('day', ts) AS d FROM (SELECT * FROM t) GROUP BY 1", "subqueries"),
         ("SELECT date_trunc('day', ts) AS d FROM t WHERE x IN (SELECT x FROM u) GROUP BY 1", "subqueries"),
+        # #66: a second source nested anywhere would be neither watched nor pinned
+        (
+            "SELECT date_trunc('day', ts) AS d, max(p) AS hi FROM t GROUP BY 1 HAVING max(p) > (SELECT avg(x) FROM o)",
+            "subqueries",
+        ),
+        (
+            "SELECT date_trunc('day', ts) AS d FROM t WHERE s IN (SELECT s FROM a UNION SELECT s FROM b) GROUP BY 1",
+            "subqueries",
+        ),
+        ("SELECT date_trunc('day', ts) AS d, max(p) - (SELECT avg(x) FROM o) AS hi FROM t GROUP BY 1", "subqueries"),
         ("SELECT date_trunc('day', ts) AS d, count(*) FROM t GROUP BY 1", "alias"),
         ("SELECT * FROM t GROUP BY 1", "SELECT \\*"),
         ("SELECT date_trunc('day', ts) AS d, x AS d FROM t GROUP BY 1, 2", "duplicate"),
