@@ -285,7 +285,7 @@ class QueryHistory:
             row = await cur.fetchone()
         return row[0] if row and row[0] is not None else None
 
-    async def set_last_source_snapshot(self, view: str, snapshot_id: int) -> None:
+    async def set_last_source_snapshot(self, view: str, snapshot_id: int | None) -> None:
         await self._db.execute(
             "INSERT INTO view_status (view, last_source_snapshot) VALUES (?, ?) "
             "ON CONFLICT(view) DO UPDATE SET "

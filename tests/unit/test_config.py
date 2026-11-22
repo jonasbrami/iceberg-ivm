@@ -432,33 +432,6 @@ def test_query_timeout_seconds_rejects_non_positive_int(tmp_path, bad):
         load_views(write_views(tmp_path, raw))
 
 
-def test_full_refresh_chunk_rejects_view_without_direct_bucket_projection(tmp_path):
-    """``full_refresh_chunk`` requires a direct ``date_trunc(g, col) AS <alias>``
-    projection so the target has a column the executor can read as the
-    resume point. A wrapped expression is rejected only when chunking is
-    enabled."""
-    wrapped = (
-        "views:\n  - name: v\n"
-        "    query: \"SELECT from_iso8601_date(CAST(date_trunc('day', ts) AS varchar)) AS d FROM t GROUP BY 1\"\n"
-        "    target_table: iceberg.analytics.v\n"
-        "    full_refresh_chunk: day\n"
-    )
-    with pytest.raises(ValueError, match="aliased projection"):
-        load_views(write_views(tmp_path, wrapped))
-
-
-def test_wrapped_date_trunc_accepted_without_chunk(tmp_path):
-    """A view whose date_trunc is wrapped is accepted when chunking is OFF
-    (it just can't use the chunked-backfill path)."""
-    wrapped = (
-        "views:\n  - name: v\n"
-        "    query: \"SELECT from_iso8601_date(CAST(date_trunc('day', ts) AS varchar)) AS d FROM t GROUP BY 1\"\n"
-        "    target_table: iceberg.analytics.v\n"
-    )
-    views = load_views(write_views(tmp_path, wrapped))
-    assert views[0].full_refresh_chunk is None
-
-
 # ── Iceberg maintenance config ──
 
 

@@ -73,7 +73,7 @@ async def setup_and_full_refresh(cursor, view, parsed, target):
     value_cols = [c.name for c in cols if c.name not in parsed.merge_keys]
     await cursor.execute(build_create_table_sql(target, cols, view.target_partitioning))
     M = await get_current_snapshot(cursor, SOURCE_TABLE)
-    await _drain(execute_refresh(cursor, view, target, parsed, value_cols, max_snapshot=M))
+    await _drain(execute_refresh(cursor, view, parsed, value_cols, snapshot=M))
     result = await detect_changes(cursor, SOURCE_TABLE, "ts", parsed.granularity, last_snapshot=None)
     return result, value_cols
 
@@ -117,11 +117,10 @@ class TestWeeklyBarsCrossPartition:
             execute_refresh(
                 cursor,
                 WEEKLY_VIEW,
-                WEEKLY_TARGET,
                 WEEKLY_PARSED,
                 value_cols,
-                incremental_range=result.filter_range,
-                max_snapshot=result.current_snapshot,
+                window=result.filter_range,
+                snapshot=result.current_snapshot,
             )
         )
 
@@ -154,11 +153,10 @@ class TestWeeklyBarsCrossPartition:
             execute_refresh(
                 cursor,
                 WEEKLY_VIEW,
-                WEEKLY_TARGET,
                 WEEKLY_PARSED,
                 value_cols,
-                incremental_range=result.filter_range,
-                max_snapshot=result.current_snapshot,
+                window=result.filter_range,
+                snapshot=result.current_snapshot,
             )
         )
 
@@ -205,11 +203,10 @@ class TestLateArrivingData:
             execute_refresh(
                 cursor,
                 WEEKLY_VIEW,
-                WEEKLY_TARGET,
                 WEEKLY_PARSED,
                 value_cols,
-                incremental_range=result.filter_range,
-                max_snapshot=result.current_snapshot,
+                window=result.filter_range,
+                snapshot=result.current_snapshot,
             )
         )
         last_snap = result.current_snapshot
@@ -236,11 +233,10 @@ class TestLateArrivingData:
             execute_refresh(
                 cursor,
                 WEEKLY_VIEW,
-                WEEKLY_TARGET,
                 WEEKLY_PARSED,
                 value_cols,
-                incremental_range=result.filter_range,
-                max_snapshot=result.current_snapshot,
+                window=result.filter_range,
+                snapshot=result.current_snapshot,
             )
         )
 
@@ -282,11 +278,10 @@ class TestMonthlyBarsCrossPartition:
             execute_refresh(
                 cursor,
                 MONTHLY_VIEW,
-                MONTHLY_TARGET,
                 MONTHLY_PARSED,
                 value_cols,
-                incremental_range=result.filter_range,
-                max_snapshot=result.current_snapshot,
+                window=result.filter_range,
+                snapshot=result.current_snapshot,
             )
         )
 

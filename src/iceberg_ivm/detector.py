@@ -1,8 +1,13 @@
-"""Change detection via Iceberg file-level metadata ($snapshots, $all_entries).
+"""Change detection from Iceberg metadata only — no source data is scanned.
 
-Instead of diffing partitions, we read column-level min/max from new files'
-readable_metrics. This works regardless of partition scheme and correctly
-handles GROUP BY expressions that span multiple source partitions.
+* ``$refs`` gives the main branch's current snapshot.
+* ``$snapshots`` gives the ancestry from the bookmark to it, and each
+  snapshot's operation.
+* ``$all_entries`` gives the min/max of the time column over the data files
+  those snapshots added or removed: the time range that needs recomputing.
+
+That range is then widened to whole ``date_trunc`` buckets, so every group the
+new rows touch is recomputed from complete source data.
 """
 
 from __future__ import annotations
@@ -23,208 +28,102 @@ class RefreshAction(Enum):
     INCREMENTAL = auto()
 
 
-class ExpiredSnapshotError(Exception):
-    """last_source_snapshot no longer present in $snapshots (Iceberg expired it)."""
+class FullRefreshNeeded(Exception):
+    """The change since the bookmark can't be bounded to a time range: the
+    bookmark is no longer an ancestor of the current snapshot (expired, rolled
+    back, table replaced), rows were deleted, or new files lack statistics."""
 
 
-class MissingFilterColumnError(Exception):
-    """$all_entries has rows but none expose filter_column — config error."""
-
-
-class UnexpectedOperationError(Exception):
-    """Source snapshot used a `delete` (or otherwise unknown) op — the
-    no-data-loss assumption is violated. Allowed ops are `append` and
-    `overwrite` (real data changes that drive incremental refresh) and
-    `replace` (compaction, skipped)."""
+class MissingStatsError(Exception):
+    """Data files have no min/max statistics for the time column."""
 
 
 @dataclass
 class ChangeResult:
     action: RefreshAction
     current_snapshot: int | None = None
-    filter_range: tuple[datetime, datetime] | None = None  # snapped (start, end)
+    filter_range: tuple[datetime, datetime] | None = None  # bucket-aligned [start, end)
 
 
 def system_table(table: str, suffix: str) -> str:
-    """Build a reference to an Iceberg system table.
-
-    Trino syntax: catalog.schema."table$suffix"
-    """
-    parts = table.rsplit(".", 1)
-    if len(parts) == 1:
-        return f'"{parts[0]}${suffix}"'
-    return f'{parts[0]}."{parts[1]}${suffix}"'
+    """``catalog.schema."table$suffix"`` — Trino's name for an Iceberg metadata table."""
+    head, _, name = table.rpartition(".")
+    return f'{head}."{name}${suffix}"' if head else f'"{name}${suffix}"'
 
 
-async def get_current_snapshot(cursor, source_table: str) -> int | None:
-    """Get latest snapshot_id from source table. Metadata-only.
-
-    The (committed_at, snapshot_id) tiebreak matches get_snapshots_since:
-    sibling snapshots can share a millisecond-precision committed_at, so
-    ordering by committed_at alone is non-deterministic and would let the
-    next tick observe last_snapshot == current_snap and skip real new data.
-    """
-    await cursor.execute(
-        f"SELECT snapshot_id FROM {system_table(source_table, 'snapshots')} "
-        f"ORDER BY committed_at DESC, snapshot_id DESC LIMIT 1"
-    )
+async def get_current_snapshot(cursor, table: str) -> int | None:
+    """The snapshot the main branch points at, or None for an empty table."""
+    await cursor.execute(f"SELECT snapshot_id FROM {system_table(table, 'refs')} WHERE name = 'main'")
     row = await cursor.fetchone()
     return row[0] if row else None
 
 
-async def snapshot_exists(cursor, source_table: str, snapshot_id: int) -> bool:
-    """True iff ``snapshot_id`` is still in ``$snapshots`` (metadata-only).
-
-    Validates a pinned in-flight snapshot before resuming: every chunk reads
-    ``FOR VERSION AS OF`` it, so if it expired the resume can never succeed and
-    must be discarded (see ``server.refresh_view``).
-    """
-    await cursor.execute(f"SELECT 1 FROM {system_table(source_table, 'snapshots')} WHERE snapshot_id = {snapshot_id}")
+async def snapshot_exists(cursor, table: str, snapshot_id: int) -> bool:
+    await cursor.execute(f"SELECT 1 FROM {system_table(table, 'snapshots')} WHERE snapshot_id = {snapshot_id}")
     return (await cursor.fetchone()) is not None
 
 
-async def get_snapshots_since(cursor, source_table: str, last_snap: int, max_snapshot: int | None = None) -> list[dict]:
-    """Return snapshots in ``(last_snap, max_snapshot]``, ordered by (committed_at, snapshot_id).
+async def snapshots_between(cursor, table: str, since: int, upto: int) -> list[tuple[int, str]]:
+    """``(snapshot_id, operation)`` of every snapshot after ``since`` up to and
+    including ``upto``, oldest first, following ``upto``'s parent chain.
 
-    ``max_snapshot=None`` → up to the latest (live detection); a bound pins the
-    set a run processes, freezing the window across resumes (#61/#62). The
-    snapshot_id tiebreak matters: committed_at is millisecond-precision, so
-    sibling snapshots can share a timestamp. Raises ExpiredSnapshotError if
-    ``last_snap`` (or, when given, ``max_snapshot``) is no longer in $snapshots.
+    Raises ``FullRefreshNeeded`` if ``since`` is not an ancestor of ``upto``.
     """
-    snaps = system_table(source_table, "snapshots")
-    await cursor.execute(f"SELECT committed_at FROM {snaps} WHERE snapshot_id = {last_snap}")
-    row = await cursor.fetchone()
-    if row is None:
-        raise ExpiredSnapshotError(
-            f"{source_table}: last_source_snapshot={last_snap} is not in $snapshots "
-            f"(expired?). Cannot compute the set of new snapshots."
-        )
-    committed_at = row[0]
-    lower = (
-        f"(committed_at > TIMESTAMP '{committed_at}' "
-        f"OR (committed_at = TIMESTAMP '{committed_at}' AND snapshot_id > {last_snap}))"
-    )
-    upper = ""
-    if max_snapshot is not None:
-        await cursor.execute(f"SELECT committed_at FROM {snaps} WHERE snapshot_id = {max_snapshot}")
-        mrow = await cursor.fetchone()
-        if mrow is None:
-            raise ExpiredSnapshotError(
-                f"{source_table}: max_snapshot={max_snapshot} is not in $snapshots "
-                f"(expired?). Cannot compute the pinned snapshot window."
+    await cursor.execute(f"SELECT snapshot_id, parent_id, operation FROM {system_table(table, 'snapshots')}")
+    parents = {sid: (pid, op) for sid, pid, op in await cursor.fetchall()}
+    chain: list[tuple[int, str]] = []
+    current: int | None = upto
+    while current != since:
+        if current not in parents:
+            raise FullRefreshNeeded(
+                f"{table}: bookmark snapshot {since} is not an ancestor of {upto} "
+                "(expired, rolled back, or the table was replaced)"
             )
-        max_committed = mrow[0]
-        upper = (
-            f" AND (committed_at < TIMESTAMP '{max_committed}' "
-            f"OR (committed_at = TIMESTAMP '{max_committed}' AND snapshot_id <= {max_snapshot}))"
-        )
+        parent, operation = parents[current]
+        chain.append((current, operation))
+        current = parent
+    return chain[::-1]
+
+
+def _bounds(rows: list, table: str, column: str) -> tuple[datetime, datetime] | None:
+    """Min lower bound and max upper bound of ``column`` across ``(readable_metrics,)``
+    rows of data files. A file whose values are all NULL is skipped; any other
+    file without bounds raises ``MissingStatsError``."""
+    low: datetime | None = None
+    high: datetime | None = None
+    for (raw,) in rows:
+        metrics = (json.loads(raw) if isinstance(raw, str) else raw) or {}
+        stats = metrics.get(column) or {}
+        lower, upper = stats.get("lower_bound"), stats.get("upper_bound")
+        if lower is None or upper is None:
+            values = stats.get("value_count")
+            if values is not None and values == stats.get("null_value_count"):
+                continue
+            raise MissingStatsError(
+                f"{table}: data files have no min/max statistics for column {column!r}, so the changed "
+                f"time range is unknown. Enable them with write.metadata.metrics.column.{column}=full "
+                "and rewrite (optimize) the files written without them."
+            )
+        lower, upper = datetime.fromisoformat(str(lower)), datetime.fromisoformat(str(upper))
+        low = lower if low is None else min(low, lower)
+        high = upper if high is None else max(high, upper)
+    return None if low is None else (low, high)
+
+
+async def changed_range(cursor, table: str, snapshot_ids: list[int], column: str) -> tuple[datetime, datetime] | None:
+    """Raw ``(min, max)`` of ``column`` over data files added or removed by ``snapshot_ids``."""
+    ids = ", ".join(str(s) for s in snapshot_ids)
     await cursor.execute(
-        f"SELECT snapshot_id, operation FROM {snaps} WHERE {lower}{upper} ORDER BY committed_at, snapshot_id"
+        f"SELECT readable_metrics FROM {system_table(table, 'all_entries')} "
+        f"WHERE snapshot_id IN ({ids}) AND status IN (1, 2) AND data_file.content = 0"
     )
-    return [{"snapshot_id": r[0], "operation": r[1]} for r in await cursor.fetchall()]
+    return _bounds(await cursor.fetchall(), table, column)
 
 
-# Snapshot ops the detector understands. `delete` and any unknown op fall
-# through to UnexpectedOperationError below.
-#
-#   append    — new data, drive incremental refresh
-#   overwrite — MERGE INTO (e.g. an upstream chained MV's refresh): treat
-#               its added files exactly like an append for file-stats
-#               purposes and drive incremental refresh
-#   replace   — compaction / OPTIMIZE: no logical data change, skip the
-#               refresh but advance the bookmark
-CHANGE_OPS = frozenset({"append", "overwrite"})
-NOOP_OPS = frozenset({"replace"})
-ALLOWED_OPS = CHANGE_OPS | NOOP_OPS
-
-
-async def get_new_files_column_range(
-    cursor,
-    source_table: str,
-    snapshot_ids: list[int],
-    filter_column: str,
-) -> tuple[datetime, datetime] | None:
-    """Read min/max of filter_column across files added in given snapshots.
-
-    Uses $all_entries.readable_metrics — metadata-only, no data scan.
-    Returns (min_dt, max_dt) or None if no data files were found.
-    """
-    snap_list = ", ".join(str(s) for s in snapshot_ids)
-    await cursor.execute(
-        f"SELECT readable_metrics "
-        f"FROM {system_table(source_table, 'all_entries')} "
-        f"WHERE snapshot_id IN ({snap_list}) AND status = 1"  # ADDED data files
-    )
-    rows = await cursor.fetchall()
-    if not rows:
-        return None
-    lows, highs, saw = _iter_column_bounds(rows, filter_column)
-    if not saw:
-        raise MissingFilterColumnError(
-            f"{source_table}: filter_column {filter_column!r} not found in any "
-            f"file's readable_metrics. Check the view config."
-        )
-    if not lows or not highs:
-        return None
-    return (min(lows), max(highs))
-
-
-def _iter_column_bounds(
-    rows: list,
-    column: str,
-) -> tuple[list[datetime], list[datetime], bool]:
-    """Extract ``(lower_bounds, upper_bounds, saw_column)`` from a list of
-    ``(readable_metrics,)`` rows. ``saw_column`` is True iff at least one
-    file's metrics included ``column`` — distinguishes "no files" from
-    "files exist but column is absent" for missing-column detection.
-    """
-    lows: list[datetime] = []
-    highs: list[datetime] = []
-    saw = False
-    for (metrics_raw,) in rows:
-        if metrics_raw is None:
-            continue
-        metrics = metrics_raw if isinstance(metrics_raw, dict) else json.loads(metrics_raw)
-        col = metrics.get(column)
-        if col is None:
-            continue
-        saw = True
-        lb = col.get("lower_bound")
-        ub = col.get("upper_bound")
-        if lb is not None:
-            lows.append(datetime.fromisoformat(str(lb)))
-        if ub is not None:
-            highs.append(datetime.fromisoformat(str(ub)))
-    return lows, highs, saw
-
-
-async def get_source_column_range(
-    cursor,
-    source_table: str,
-    filter_column: str,
-) -> tuple[datetime, datetime] | None:
-    """Read ``(min, max)`` of ``filter_column`` across all live files in the
-    current snapshot of ``source_table``.
-
-    Uses ``$files.readable_metrics`` — this returns the live file set of
-    the current snapshot, not per-commit manifest rows. Metadata-only.
-    Raises ``MissingFilterColumnError`` if files exist but none carry
-    ``filter_column`` metrics. Returns ``None`` for empty tables.
-    """
-    await cursor.execute(f"SELECT readable_metrics FROM {system_table(source_table, 'files')}")
-    rows = await cursor.fetchall()
-    if not rows:
-        return None
-    lows, highs, saw = _iter_column_bounds(rows, filter_column)
-    if not saw:
-        raise MissingFilterColumnError(
-            f"{source_table}: filter_column {filter_column!r} not found in any "
-            f"file's readable_metrics. Check the view config."
-        )
-    if not lows or not highs:
-        return None
-    return (min(lows), max(highs))
+async def column_range(cursor, table: str, column: str) -> tuple[datetime, datetime] | None:
+    """Raw ``(min, max)`` of ``column`` over the table's current data files, or None if empty."""
+    await cursor.execute(f"SELECT readable_metrics FROM {system_table(table, 'files')} WHERE content = 0")
+    return _bounds(await cursor.fetchall(), table, column)
 
 
 def midnight(dt: datetime) -> datetime:
@@ -335,57 +234,43 @@ def expand_to_bucket_bounds(
     return floor(min_ts), nxt(max_ts)
 
 
+# Snapshot operations, by what they mean for a view:
+#   append, overwrite — rows added (or rewritten, e.g. an upstream view's MERGE):
+#                       recompute the buckets their data files cover
+#   replace           — compaction, no logical change: skip
+#   delete, other     — rows removed with no bound on where: full refresh
+CHANGE_OPS = frozenset({"append", "overwrite"})
+NOOP_OPS = frozenset({"replace"})
+
+
 async def incremental_range_since(
     cursor,
     source_table: str,
     filter_column: str,
-    filter_granularity: str,
-    last_snapshot: int,
-    max_snapshot: int | None = None,
+    granularity: str,
+    since: int,
+    upto: int,
 ) -> tuple[datetime, datetime] | None:
-    """Snapped ``[start, end)`` of buckets touched by append/overwrite files in
-    snapshots ``(last_snapshot, max_snapshot]`` (``max_snapshot=None`` → up to
-    the latest, used by live detection; a pinned bound freezes the window across
-    resumes — see DESIGN.md "No window drift", #61/#62).
+    """Bucket-aligned ``[start, end)`` touched by snapshots in ``(since, upto]``,
+    or None when they hold no data change (only compaction).
 
-    Returns ``None`` when the window has no data to merge (no new snapshots, or
-    only compaction). Raises ``ExpiredSnapshotError`` if a bound snapshot is
-    gone, ``UnexpectedOperationError`` on a delete/unknown op.
+    Raises ``FullRefreshNeeded`` when the change can't be bounded.
     """
-    snapshots = await get_snapshots_since(cursor, source_table, last_snapshot, max_snapshot=max_snapshot)
-    if not snapshots:
-        log.debug("%s: no new snapshots in (%s, %s]", source_table, last_snapshot, max_snapshot)
+    snapshots = await snapshots_between(cursor, source_table, since, upto)
+    unbounded = sorted({op for _, op in snapshots if op not in CHANGE_OPS | NOOP_OPS})
+    if unbounded:
+        raise FullRefreshNeeded(f"{source_table}: snapshot operations {unbounded} remove rows without a time bound")
+    changed = [sid for sid, op in snapshots if op in CHANGE_OPS]
+    if not changed:
         return None
-
-    ops = [s["operation"] for s in snapshots]
-    log.debug("%s: %d snapshots in window, operations: %s", source_table, len(snapshots), ops)
-
-    # append, overwrite → real data changes; replace → compaction (skip);
-    # anything else (delete, unknown op) → fail loudly.
-    unknown = [op for op in ops if op not in ALLOWED_OPS]
-    if unknown:
-        raise UnexpectedOperationError(
-            f"{source_table}: unexpected snapshot operations {unknown} — "
-            f"source must only see append / overwrite (data changes) or "
-            f"replace (compaction); pure deletes are not supported."
-        )
-
-    change_snaps = [s for s in snapshots if s["operation"] in CHANGE_OPS]
-    if not change_snaps:
-        log.info("%s: only compaction (replace) snapshots in window → nothing to merge", source_table)
+    try:
+        raw = await changed_range(cursor, source_table, changed, filter_column)
+    except MissingStatsError as e:
+        raise FullRefreshNeeded(str(e)) from e
+    if raw is None:
         return None
-
-    # Files added in CHANGE snapshots only (append + overwrite); compaction-added
-    # files would uselessly expand the range with rewritten copies.
-    snap_ids = [s["snapshot_id"] for s in change_snaps]
-    col_range = await get_new_files_column_range(cursor, source_table, snap_ids, filter_column)
-    if col_range is None:
-        log.debug("%s: snapshots in window but no data files (compaction?)", source_table)
-        return None
-
-    min_ts, max_ts = col_range
-    snapped = expand_to_bucket_bounds(min_ts, max_ts, filter_granularity)
-    log.info("file stats: %s in [%s, %s] → snapped to [%s, %s)", filter_column, min_ts, max_ts, snapped[0], snapped[1])
+    snapped = expand_to_bucket_bounds(*raw, granularity)
+    log.info("%s: %s in [%s, %s] → recompute [%s, %s)", source_table, filter_column, *raw, *snapped)
     return snapped
 
 
@@ -393,50 +278,21 @@ async def detect_changes(
     cursor,
     source_table: str,
     filter_column: str,
-    filter_granularity: str,
+    granularity: str,
     last_snapshot: int | None,
 ) -> ChangeResult:
-    """Detect what changed in the source table since last_snapshot.
-
-    Uses file-level column statistics from $all_entries.readable_metrics
-    to compute the minimum range of data that needs recomputing, snapped
-    to GROUP BY bucket boundaries.
-    """
-    current_snap = await get_current_snapshot(cursor, source_table)
-    if current_snap is None:
-        log.debug("%s: no snapshots found", source_table)
-        return ChangeResult(action=RefreshAction.NO_CHANGE)
-
-    if current_snap == last_snapshot:
-        log.debug("%s: snapshot unchanged (%d)", source_table, current_snap)
-        return ChangeResult(action=RefreshAction.NO_CHANGE, current_snapshot=current_snap)
-
-    # First run → full refresh
+    """Decide what a refresh must do to bring the view from ``last_snapshot``
+    (None: never refreshed) to the source's current snapshot."""
+    current = await get_current_snapshot(cursor, source_table)
+    if current is None or current == last_snapshot:
+        return ChangeResult(RefreshAction.NO_CHANGE, current_snapshot=current)
     if last_snapshot is None:
-        log.info("%s: first run (no last_snapshot) → full refresh", source_table)
-        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=current_snap)
-
-    # Derive the incremental window over (last_snapshot, current_snap]. If
-    # last_snapshot has been expired from $snapshots (source dropped+recreated,
-    # or history aged out) we can't diff — recover by re-materializing
-    # everything from the current source (treat as a fresh full refresh).
+        return ChangeResult(RefreshAction.FULL_REFRESH, current_snapshot=current)
     try:
-        rng = await incremental_range_since(cursor, source_table, filter_column, filter_granularity, last_snapshot)
-    except ExpiredSnapshotError as exc:
-        log.warning(
-            "%s: bookmark snapshot %d expired (%s) → falling back to FULL_REFRESH",
-            source_table,
-            last_snapshot,
-            exc,
-        )
-        return ChangeResult(action=RefreshAction.FULL_REFRESH, current_snapshot=current_snap)
-
-    if rng is None:
-        # No new snapshots, or only compaction → nothing to merge; advance state.
-        return ChangeResult(action=RefreshAction.NO_CHANGE, current_snapshot=current_snap)
-
-    return ChangeResult(
-        action=RefreshAction.INCREMENTAL,
-        current_snapshot=current_snap,
-        filter_range=rng,
-    )
+        window = await incremental_range_since(cursor, source_table, filter_column, granularity, last_snapshot, current)
+    except FullRefreshNeeded as e:
+        log.warning("%s → full refresh", e)
+        return ChangeResult(RefreshAction.FULL_REFRESH, current_snapshot=current)
+    if window is None:
+        return ChangeResult(RefreshAction.NO_CHANGE, current_snapshot=current)
+    return ChangeResult(RefreshAction.INCREMENTAL, current_snapshot=current, filter_range=window)

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import dataclasses
 import logging
 import os
+import secrets
 import time
 import typing
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
@@ -16,7 +18,7 @@ from urllib.parse import urlparse
 import aiotrino
 from aiotrino.auth import BasicAuthentication
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, Response
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, create_model, field_validator
 
@@ -33,6 +35,7 @@ from iceberg_ivm.config import (
     validate_view_name,
 )
 from iceberg_ivm.detector import (
+    FullRefreshNeeded,
     RefreshAction,
     detect_changes,
     incremental_range_since,
@@ -162,30 +165,49 @@ def get_app_state(request: Request) -> AppState:
 # ── Core logic ──
 
 
-def get_trino_connection(s: AppState) -> aiotrino.dbapi.Connection:
+class _Connection:
+    """aiotrino connection whose ``close()`` also cancels queries still running.
+
+    aiotrino's own ``close()`` only drops the HTTP session, which would leave a
+    timed-out or cancelled MERGE running (and committing) inside Trino.
+    """
+
+    def __init__(self, conn: aiotrino.dbapi.Connection) -> None:
+        self._conn = conn
+        self._cursors: list = []
+
+    async def cursor(self):
+        cursor = await self._conn.cursor()
+        self._cursors.append(cursor)
+        return cursor
+
+    async def close(self) -> None:
+        for cursor in self._cursors:
+            with suppress(Exception):
+                await cursor.cancel()  # no-op for finished queries
+        await self._conn.close()
+
+
+def get_trino_connection(s: AppState) -> _Connection:
     cfg = s.config
     parsed = urlparse(cfg.trino.url)
     scheme = parsed.scheme or "http"
-    host = parsed.hostname
-    port = parsed.port or (443 if scheme == "https" else 80)
-    if not host:
+    if not parsed.hostname:
         raise ValueError(f"TRINO_URL does not contain a host: {cfg.trino.url!r}")
-    log.debug("connecting to Trino at %s as %s", cfg.trino.url, cfg.trino.user)
-    # Pin every session to UTC so Trino's `date_trunc` on TIMESTAMP WITH
-    # TIME ZONE columns agrees with the Python-side expand_to_bucket_bounds math. See
-    # DESIGN.md "Timezone assumption" for the full rationale.
     kwargs = {
-        "host": host,
-        "port": port,
+        "host": parsed.hostname,
+        "port": parsed.port or (443 if scheme == "https" else 80),
         "http_scheme": scheme,
         "catalog": cfg.trino.catalog,
         "schema": cfg.trino.schema,
         "user": cfg.trino.user,
+        # UTC sessions make Trino's date_trunc on TIMESTAMP WITH TIME ZONE agree
+        # with the bucket math in detector.py (see DESIGN.md, "Timezones").
         "timezone": "UTC",
     }
     if cfg.trino.password:
         kwargs["auth"] = BasicAuthentication(cfg.trino.user, cfg.trino.password)
-    return aiotrino.dbapi.connect(**kwargs)
+    return _Connection(aiotrino.dbapi.connect(**kwargs))
 
 
 def reload_config(s: AppState) -> None:
@@ -372,22 +394,11 @@ async def _record_query(s: AppState, view_name: str, vs: ViewStatus, q: QueryInf
         vs.recent_queries = ([q, *vs.recent_queries])[:RECENT_QUERY_LIMIT]
 
 
-async def _skip_tick(
-    s: AppState,
-    view: ViewConfig,
-    conn,
-    target_table: str,
-    vs: ViewStatus,
-    *,
-    advance_to: int | None,
-) -> None:
-    """Skip-this-tick bookkeeping: mark skip, advance the bookmark to
-    ``advance_to`` (``None`` → leave unchanged), clear current_work, persist."""
+async def _skip_tick(s: AppState, view: ViewConfig, conn, vs: ViewStatus, *, advance_to: int | None) -> None:
+    """Record a tick with nothing to merge: move the bookmark to ``advance_to``
+    (None: leave it), clear any in-flight run and any error from an earlier
+    failed tick, then run due maintenance."""
     vs.last_action = "skip"
-    # A successful detection that resolves to skip clears any sticky error from a
-    # prior transient failure (e.g. a connection reset on PREPARE). When the source
-    # has no new data, every tick is NO_CHANGE and no refresh runs to overwrite the
-    # frozen error — so the skip path is the only place it gets reset (issue #54).
     vs.last_error = None
     vs.chunks_total = None
     vs.chunks_done = 0
@@ -397,204 +408,16 @@ async def _skip_tick(
             await s.history.set_last_source_snapshot(view.name, advance_to)
         await s.history.clear_current_work(view.name)
     await _persist_view_status(s, view.name, vs)
-    await maintain_view(s, view, conn, target_table)
+    await maintain_view(s, view, conn, view.target_table)
 
 
 async def refresh_view(s: AppState, view: ViewConfig) -> None:
+    """One tick for one view; errors are recorded on its status, never raised."""
     conn = get_trino_connection(s)
-    cursor = await conn.cursor()
     vs = s.view_statuses.setdefault(view.name, ViewStatus(name=view.name))
-
     try:
-        # asyncio.timeout(None) is a documented no-op, so no None-branch needed.
-        async with asyncio.timeout(view.query_timeout_seconds):
-            parsed = parse_view_query(view.query)
-            target_table = view.target_table
-
-            # Create target on first run (unpartitioned by default; see #22).
-            columns = await discover_columns(cursor, view.query)
-            await cursor.execute(
-                build_create_table_sql(
-                    target_table,
-                    columns,
-                    view.target_partitioning,
-                )
-            )
-            value_columns = [c.name for c in columns if c.name not in parsed.merge_keys]
-
-            last_snap = await s.history.get_last_source_snapshot(view.name) if s.history is not None else None
-            work_max, work_chunk = (
-                await s.history.get_current_work(view.name) if s.history is not None else (None, None)
-            )
-
-            # current_work=(M, last_merged_chunk) is the in-flight run; while set,
-            # the bookmark can't move (it advances only on completion, which clears
-            # current_work), so a tick is either RESUMING it or starting FRESH.
-            # See DESIGN.md "Chunked, snapshot-pinned, resumable refresh".
-
-            # Validate the pin before resuming: M must still exist (every chunk
-            # reads FOR VERSION AS OF M), and for an incremental resume so must the
-            # bookmark (window is (bookmark, M]). If either expired, discard and
-            # restart full-from-scratch — else an expired pin fails every chunk forever.
-            if work_max is not None:
-                valid = await snapshot_exists(cursor, parsed.source_table, work_max)
-                if valid and last_snap is not None:
-                    valid = await snapshot_exists(cursor, parsed.source_table, last_snap)
-                if not valid:
-                    log.warning(
-                        "%s: in-flight run's pinned snapshot %d (or bookmark %s) expired → "
-                        "discarding current_work, full refresh from scratch",
-                        view.name,
-                        work_max,
-                        last_snap,
-                    )
-                    if s.history is not None:
-                        await s.history.clear_current_work(view.name)
-                    work_max, work_chunk = None, None
-
-            if work_max is not None:
-                # RESUME: reuse M verbatim, never re-detect — keeps the window
-                # frozen so a later overwrite of an older bucket can't drift it.
-                max_snapshot = work_max
-                resume_from = work_chunk
-                if last_snap is None:
-                    action = RefreshAction.FULL_REFRESH
-                    incremental_range = None
-                else:
-                    action = RefreshAction.INCREMENTAL
-                    incremental_range = await incremental_range_since(
-                        cursor,
-                        parsed.source_table,
-                        parsed.filter_column,
-                        parsed.granularity,
-                        last_snap,
-                        max_snapshot,
-                    )
-                SOURCE_SNAPSHOT.labels(view=view.name).set(max_snapshot)
-                log.info(
-                    "%s: resuming pinned %s @ snapshot %d from %s", view.name, action.name, max_snapshot, work_chunk
-                )
-            else:
-                # FRESH run: detect against the live source and pin its current
-                # snapshot for the duration of this run.
-                t0 = time.monotonic()
-                result = await detect_changes(
-                    cursor,
-                    parsed.source_table,
-                    parsed.filter_column,
-                    parsed.granularity,
-                    last_snap,
-                )
-                DETECTION_DURATION.labels(view=view.name).observe(time.monotonic() - t0)
-                log.info("%s: detection → %s (%.3fs)", view.name, result.action.name, time.monotonic() - t0)
-                if result.current_snapshot is not None:
-                    SOURCE_SNAPSHOT.labels(view=view.name).set(result.current_snapshot)
-
-                if result.action == RefreshAction.NO_CHANGE:
-                    # Advance the bookmark past empty-append / compaction-only
-                    # snapshots so we don't re-detect them every cycle.
-                    advance = result.current_snapshot if result.current_snapshot != last_snap else None
-                    await _skip_tick(s, view, conn, target_table, vs, advance_to=advance)
-                    return
-
-                max_snapshot = result.current_snapshot
-                action = result.action
-                incremental_range = result.filter_range if action == RefreshAction.INCREMENTAL else None
-                resume_from = None
-                # Persist the in-flight record so an interrupt resumes from this pin.
-                if s.history is not None:
-                    await s.history.set_current_work(view.name, max_snapshot, None)
-
-            # An INCREMENTAL window with nothing to merge.
-            if action == RefreshAction.INCREMENTAL and incremental_range is None:
-                if resume_from is not None:
-                    # Frozen resume window came back empty though chunks committed →
-                    # an INTERIOR snapshot expired (endpoints passed the probes).
-                    # Advancing to M would orphan the un-merged chunks; instead keep
-                    # the bookmark and clear current_work so the next tick re-covers.
-                    log.warning(
-                        "%s: resumed incremental window unexpectedly empty (interior "
-                        "snapshot expired?) → discarding current_work, re-detecting next tick",
-                        view.name,
-                    )
-                    await _skip_tick(s, view, conn, target_table, vs, advance_to=None)
-                else:
-                    # Nothing to merge (only compaction since bookmark): advance to M.
-                    await _skip_tick(s, view, conn, target_table, vs, advance_to=max_snapshot)
-                return
-
-            # Set vs.last_action up-front so /api/views reflects what's running,
-            # not what last finished — matters for multi-hour chunked runs.
-            if action == RefreshAction.FULL_REFRESH:
-                vs.last_action = "chunked_full" if view.full_refresh_chunk else "full"
-            else:
-                vs.last_action = "chunked_incremental" if view.full_refresh_chunk else "incremental"
-            vs.chunks_done = 0
-            vs.chunks_total = None
-
-            total_elapsed = 0.0
-            total_rows = 0
-            total_bytes = 0
-
-            async for q in execute_refresh(
-                cursor,
-                view,
-                target_table,
-                parsed,
-                value_columns,
-                max_snapshot=max_snapshot,
-                incremental_range=incremental_range,
-                resume_from=resume_from,
-            ):
-                total_elapsed += q.elapsed_ms / 1000.0
-                total_rows += q.processed_rows
-                total_bytes += q.processed_bytes
-                vs.last_refresh = time.time()
-                vs.last_duration = q.elapsed_ms / 1000.0
-                vs.last_error = None
-                vs.last_range = f"[{q.range_start}, {q.range_end})"
-                # Keep chunks_done aligned with chunks_total: a non-chunked
-                # single-shot still arrives with q.chunks_done=1, q.chunks_total=1,
-                # and persisting "1/None" creates phantom progress in the UI.
-                if q.chunks_total > 1:
-                    vs.chunks_done = q.chunks_done
-                    vs.chunks_total = q.chunks_total
-                else:
-                    vs.chunks_done = 0
-                    vs.chunks_total = None
-                await _record_query(s, view.name, vs, q)
-                await _persist_view_status(s, view.name, vs)
-                if q.chunks_total > 1:
-                    # Record progress AFTER the chunk's MERGE lands, so the next
-                    # tick resumes from this committed chunk under the same pin.
-                    if s.history is not None and q.range_end is not None:
-                        await s.history.set_current_work(view.name, max_snapshot, q.range_end)
-                    CHUNKS_COMPLETED.labels(view=view.name).inc()
-                    CHUNK_DURATION.labels(view=view.name).observe(q.elapsed_ms / 1000.0)
-                    CHUNK_ROWS.labels(view=view.name).inc(q.processed_rows)
-                if s.stop_event.is_set():
-                    # Graceful shutdown mid-run — leave bookmark + current_work so
-                    # the next tick resumes the same pinned run from this chunk.
-                    log.info("%s: refresh interrupted after chunk %d/%d", view.name, q.chunks_done, q.chunks_total)
-                    return
-
-            # Clean completion: advance the bookmark to the pinned M (not the live
-            # latest) and clear current_work. The MV is now consistent as of M;
-            # newer commits land on the next tick over (M, M'].
-            REFRESH_TOTAL.labels(view=view.name, type="incremental" if incremental_range is not None else "full").inc()
-            if s.history is not None:
-                await s.history.set_last_source_snapshot(view.name, max_snapshot)
-                await s.history.clear_current_work(view.name)
-            vs.total_refreshes += 1
-            # Clear in-flight marker; leave chunks_done so the UI shows "12/12".
-            vs.chunks_total = None
-            REFRESH_DURATION.labels(view=view.name).observe(total_elapsed)
-            REFRESH_LAST_SUCCESS.labels(view=view.name).set(vs.last_refresh or time.time())
-            REFRESH_BYTES.labels(view=view.name).inc(total_bytes)
-            REFRESH_ROWS.labels(view=view.name).inc(total_rows)
-            await _persist_view_status(s, view.name, vs)
-            await maintain_view(s, view, conn, target_table)
-
+        async with asyncio.timeout(view.query_timeout_seconds):  # None → no timeout
+            await _refresh(s, view, conn, vs)
     except TimeoutError:
         vs.last_error = f"refresh exceeded query_timeout_seconds={view.query_timeout_seconds}"
         vs.total_errors += 1
@@ -608,15 +431,116 @@ async def refresh_view(s: AppState, view: ViewConfig) -> None:
         log.exception("%s: refresh failed", view.name)
         await _persist_view_status(s, view.name, vs)
     finally:
-        # Shield the close so a task cancellation mid-execute doesn't cancel
-        # the close itself and leak the Trino connection. Re-raise CancelledError
-        # so the task actually finishes cancelling.
+        # Shielded so a cancelled tick still cancels its Trino queries and closes.
         try:
             await asyncio.shield(conn.close())
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("%s: conn.close failed", view.name)
+            log.exception("%s: closing the Trino connection failed", view.name)
+
+
+async def _refresh(s: AppState, view: ViewConfig, conn, vs: ViewStatus) -> None:
+    """Bring ``view`` up to date with its source.
+
+    A run pins the source snapshot it targets and records it (plus the last
+    committed chunk) as ``current_work`` before merging. The bookmark moves to
+    that snapshot only when the run completes, so an interrupted run resumes
+    with the same pin and window. A missing bookmark means "full refresh".
+    """
+    parsed = parse_view_query(view.query)
+    cursor = await conn.cursor()
+    history = s.history
+    bookmark = await history.get_last_source_snapshot(view.name) if history else None
+    pinned, resume_from = await history.get_current_work(view.name) if history else (None, None)
+    window = None
+
+    if pinned is not None:
+        try:
+            if not await snapshot_exists(cursor, parsed.source_table, pinned):
+                raise FullRefreshNeeded(f"pinned snapshot {pinned} expired")
+            if bookmark is not None:
+                window = await incremental_range_since(
+                    cursor, parsed.source_table, parsed.filter_column, parsed.granularity, bookmark, pinned
+                )
+                if window is None:
+                    await _skip_tick(s, view, conn, vs, advance_to=pinned)
+                    return
+            log.info("%s: resuming run pinned at snapshot %d from %s", view.name, pinned, resume_from)
+        except FullRefreshNeeded as e:
+            log.warning("%s: discarding interrupted run: %s", view.name, e)
+            if history:
+                await history.clear_current_work(view.name)
+            pinned = resume_from = window = None
+
+    if pinned is None:
+        t0 = time.monotonic()
+        result = await detect_changes(cursor, parsed.source_table, parsed.filter_column, parsed.granularity, bookmark)
+        DETECTION_DURATION.labels(view=view.name).observe(time.monotonic() - t0)
+        if result.current_snapshot is not None:
+            SOURCE_SNAPSHOT.labels(view=view.name).set(result.current_snapshot)
+        if result.action == RefreshAction.NO_CHANGE:
+            advance = result.current_snapshot if result.current_snapshot != bookmark else None
+            await _skip_tick(s, view, conn, vs, advance_to=advance)
+            return
+        pinned, window = result.current_snapshot, result.filter_range
+        if history:
+            if result.action == RefreshAction.FULL_REFRESH and bookmark is not None:
+                # Forget the bookmark so a restart mid-run resumes it as a full refresh.
+                await history.set_last_source_snapshot(view.name, None)
+            await history.set_current_work(view.name, pinned, None)
+        log.info("%s: %s at snapshot %d", view.name, result.action.name, pinned)
+
+    columns = await discover_columns(cursor, view.query)
+    await cursor.execute(build_create_table_sql(view.target_table, columns, view.target_partitioning))
+    value_columns = [c.name for c in columns if c.name not in parsed.merge_keys]
+
+    kind = "full" if window is None else "incremental"
+    vs.last_action = f"chunked_{kind}" if view.full_refresh_chunk else kind
+    vs.chunks_done = 0
+    vs.chunks_total = None
+    total_elapsed = 0.0
+    total_rows = 0
+    total_bytes = 0
+
+    async for q in execute_refresh(
+        cursor, view, parsed, value_columns, snapshot=pinned, window=window, resume_from=resume_from
+    ):
+        total_elapsed += q.elapsed_ms / 1000.0
+        total_rows += q.processed_rows
+        total_bytes += q.processed_bytes
+        vs.last_refresh = time.time()
+        vs.last_duration = q.elapsed_ms / 1000.0
+        vs.last_error = None
+        vs.last_range = f"[{q.range_start}, {q.range_end})"
+        chunked = q.chunks_total > 1
+        vs.chunks_done, vs.chunks_total = (q.chunks_done, q.chunks_total) if chunked else (0, None)
+        await _record_query(s, view.name, vs, q)
+        await _persist_view_status(s, view.name, vs)
+        if chunked:
+            # Only after the chunk's MERGE committed: a restart resumes after it.
+            if history and q.range_end is not None:
+                await history.set_current_work(view.name, pinned, q.range_end)
+            CHUNKS_COMPLETED.labels(view=view.name).inc()
+            CHUNK_DURATION.labels(view=view.name).observe(q.elapsed_ms / 1000.0)
+            CHUNK_ROWS.labels(view=view.name).inc(q.processed_rows)
+        if s.stop_event.is_set():
+            log.info("%s: interrupted after chunk %d/%d; will resume", view.name, q.chunks_done, q.chunks_total)
+            return
+
+    # The view now reflects the source as of `pinned`; newer commits are next tick's.
+    REFRESH_TOTAL.labels(view=view.name, type=kind).inc()
+    if history:
+        await history.set_last_source_snapshot(view.name, pinned)
+        await history.clear_current_work(view.name)
+    vs.total_refreshes += 1
+    vs.chunks_total = None  # keep chunks_done so the UI can show "7/7"
+    REFRESH_DURATION.labels(view=view.name).observe(total_elapsed)
+    REFRESH_LAST_SUCCESS.labels(view=view.name).set(vs.last_refresh or time.time())
+    REFRESH_BYTES.labels(view=view.name).inc(total_bytes)
+    REFRESH_ROWS.labels(view=view.name).inc(total_rows)
+    await _persist_view_status(s, view.name, vs)
+    await maintain_view(s, view, conn, view.target_table)
 
 
 async def view_worker(s: AppState, name: str) -> None:
@@ -792,6 +716,8 @@ async def lifespan(app: FastAPI):
             stack.push_async_callback(s.history.close)
             await hydrate_view_state(s)
 
+        if not os.environ.get("IVM_PASSWORD"):
+            log.warning("IVM_PASSWORD is not set: the UI and API accept anyone who can reach this port")
         log.info(
             "starting supervisor — %d views configured",
             len(s.config.views) if s.config else 0,
@@ -811,6 +737,24 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="iceberg-ivm", lifespan=lifespan)
+
+_OPEN_PATHS = frozenset({"/health", "/metrics"})
+
+
+@app.middleware("http")
+async def basic_auth(request: Request, call_next):
+    """When ``IVM_PASSWORD`` is set, require it (HTTP Basic, any user name)
+    for the UI and API. ``/health`` and ``/metrics`` stay open for probes."""
+    password = os.environ.get("IVM_PASSWORD")
+    if password and request.url.path not in _OPEN_PATHS:
+        scheme, _, encoded = request.headers.get("authorization", "").partition(" ")
+        try:
+            supplied = base64.b64decode(encoded).decode().partition(":")[2] if scheme.lower() == "basic" else ""
+        except (ValueError, UnicodeDecodeError):
+            supplied = ""
+        if not secrets.compare_digest(supplied.encode(), password.encode()):
+            return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="iceberg-ivm"'})
+    return await call_next(request)
 
 
 # ── API models + form schema, all derived from ViewConfig ──

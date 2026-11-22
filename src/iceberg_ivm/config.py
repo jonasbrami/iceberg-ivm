@@ -159,7 +159,6 @@ def validate_chunk_compatibility(chunk: str | None, query: str) -> None:
 
     - unknown granularity
     - granularity that doesn't cleanly contain the view's own buckets
-    - view query missing a direct ``date_trunc(...) AS <alias>`` projection
     """
     if not chunk:
         return
@@ -175,13 +174,6 @@ def validate_chunk_compatibility(chunk: str | None, query: str) -> None:
             f"full_refresh_chunk: {chunk!r} is not compatible with the "
             f"view's date_trunc granularity {parsed.granularity!r}; "
             f"allowed values: {sorted(allowed)}"
-        )
-    if parsed.bucket_alias is None:
-        raise ValueError(
-            "full_refresh_chunk requires date_trunc("
-            f"{parsed.granularity!r}, {parsed.filter_column}) to appear "
-            "as a direct aliased projection, so the chunk grid lines up with "
-            "the query's own GROUP BY bucket"
         )
 
 

@@ -1,44 +1,228 @@
-"""Tests for the change detector."""
+"""Tests for change detection: Iceberg metadata reads and bucket math."""
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from iceberg_ivm.detector import (
-    ExpiredSnapshotError,
-    MissingFilterColumnError,
+    FullRefreshNeeded,
+    MissingStatsError,
     RefreshAction,
-    UnexpectedOperationError,
+    changed_range,
+    column_range,
     detect_changes,
     expand_to_bucket_bounds,
     get_current_snapshot,
-    get_new_files_column_range,
-    get_snapshots_since,
-    get_source_column_range,
+    incremental_range_since,
+    snapshots_between,
+    system_table,
     walk_buckets,
 )
 
 
-class MockCursor:
-    def __init__(self, results: list[list[tuple]]):
-        self._results = results
-        self._idx = 0
-        self._rows = []
-        self.executed_sql: list[str] = []
+class MetaCursor:
+    """Fake Trino cursor answering by which Iceberg metadata table a query reads."""
 
-    async def execute(self, sql: str):
-        self.executed_sql.append(sql)
-        if self._idx < len(self._results):
-            self._rows = list(self._results[self._idx])
+    def __init__(self, *, main=None, snapshots=(), entries=(), files=()):
+        self.main = main
+        self.snapshots = list(snapshots)  # (snapshot_id, parent_id, operation)
+        self.entries = list(entries)  # (readable_metrics,)
+        self.files = list(files)  # (readable_metrics,)
+        self.sql: list[str] = []
+        self._rows: list = []
+
+    async def execute(self, sql):
+        self.sql.append(sql)
+        if "$refs" in sql:
+            self._rows = [(self.main,)] if self.main is not None else []
+        elif "$snapshots" in sql:
+            self._rows = list(self.snapshots)
+        elif "$all_entries" in sql:
+            self._rows = list(self.entries)
+        elif "$files" in sql:
+            self._rows = list(self.files)
         else:
-            self._rows = []
-        self._idx += 1
+            raise AssertionError(f"unexpected SQL: {sql}")
 
     async def fetchone(self):
         return self._rows[0] if self._rows else None
 
     async def fetchall(self):
         return self._rows
+
+
+def metrics(column="ts", lower="2026-04-09T10:15:00", upper="2026-04-09T15:30:00", values=10, nulls=0):
+    return (
+        json.dumps(
+            {column: {"value_count": values, "null_value_count": nulls, "lower_bound": lower, "upper_bound": upper}}
+        ),
+    )
+
+
+SRC = "iceberg.md.trades"
+
+
+def test_system_table_quotes_the_metadata_suffix():
+    assert system_table("iceberg.md.trades", "snapshots") == 'iceberg.md."trades$snapshots"'
+    assert system_table("trades", "files") == '"trades$files"'
+
+
+# ── current snapshot and lineage ──
+
+
+async def test_current_snapshot_is_the_main_branch_ref():
+    cur = MetaCursor(main=42)
+    assert await get_current_snapshot(cur, SRC) == 42
+    assert "name = 'main'" in cur.sql[0]
+
+
+async def test_current_snapshot_of_empty_table_is_none():
+    assert await get_current_snapshot(MetaCursor(), SRC) is None
+
+
+async def test_snapshots_between_follows_parents_oldest_first():
+    # 4 is on a side branch (parent 2) and must not be included.
+    cur = MetaCursor(
+        snapshots=[(1, None, "append"), (2, 1, "append"), (3, 2, "replace"), (4, 2, "append"), (5, 3, "overwrite")]
+    )
+    assert await snapshots_between(cur, SRC, 1, 5) == [(2, "append"), (3, "replace"), (5, "overwrite")]
+
+
+async def test_snapshots_between_same_snapshot_is_empty():
+    assert await snapshots_between(MetaCursor(snapshots=[(1, None, "append")]), SRC, 1, 1) == []
+
+
+async def test_snapshots_between_survives_an_expired_bookmark():
+    """Expiring the bookmark itself is harmless: its children still name it as
+    parent, and their manifests (which the diff reads) are still live."""
+    cur = MetaCursor(snapshots=[(2, 1, "append"), (3, 2, "append")])
+    assert await snapshots_between(cur, SRC, 1, 3) == [(2, "append"), (3, "append")]
+
+
+@pytest.mark.parametrize(
+    "snapshots",
+    [
+        [(1, None, "append"), (3, None, "append")],  # table replaced: 3 doesn't descend from 1
+        [(1, None, "append"), (2, 9, "append"), (3, 2, "append")],  # interior parent 9 expired
+    ],
+)
+async def test_snapshots_between_raises_when_bookmark_is_not_an_ancestor(snapshots):
+    with pytest.raises(FullRefreshNeeded, match="not an ancestor"):
+        await snapshots_between(MetaCursor(snapshots=snapshots), SRC, 1, 3)
+
+
+# ── file statistics ──
+
+
+async def test_changed_range_spans_all_files():
+    cur = MetaCursor(
+        entries=[
+            metrics(lower="2026-04-09T10:15:00", upper="2026-04-09T11:00:00"),
+            metrics(lower="2026-04-08T23:59:00", upper="2026-04-09T15:30:00"),
+        ]
+    )
+    assert await changed_range(cur, SRC, [2, 3], "ts") == (datetime(2026, 4, 8, 23, 59), datetime(2026, 4, 9, 15, 30))
+    sql = cur.sql[0]
+    assert "snapshot_id IN (2, 3)" in sql and "status IN (1, 2)" in sql and "data_file.content = 0" in sql
+
+
+async def test_changed_range_skips_files_whose_values_are_all_null():
+    cur = MetaCursor(entries=[metrics(lower=None, upper=None, values=5, nulls=5), metrics()])
+    assert await changed_range(cur, SRC, [2], "ts") == (datetime(2026, 4, 9, 10, 15), datetime(2026, 4, 9, 15, 30))
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        metrics(lower=None, upper=None, values=1000, nulls=0),  # metrics mode counts
+        metrics(lower=None, upper=None, values=None, nulls=None),  # metrics mode none
+        metrics(column="other"),  # column missing from metrics
+    ],
+)
+async def test_changed_range_refuses_files_without_bounds(row):
+    """Skipping such a file would silently drop its rows from the view."""
+    with pytest.raises(MissingStatsError, match="no min/max statistics for column 'ts'"):
+        await changed_range(MetaCursor(entries=[metrics(), row]), SRC, [2], "ts")
+
+
+async def test_changed_range_of_no_files_is_none():
+    assert await changed_range(MetaCursor(), SRC, [2], "ts") is None
+
+
+async def test_column_range_reads_live_data_files():
+    cur = MetaCursor(files=[metrics(lower="2026-04-01T00:00:00+00:00", upper="2026-04-30T12:00:00+00:00")])
+    lo, hi = await column_range(cur, SRC, "ts")
+    assert (lo, hi) == (datetime(2026, 4, 1, tzinfo=UTC), datetime(2026, 4, 30, 12, tzinfo=UTC))
+    assert '"trades$files" WHERE content = 0' in cur.sql[0]
+
+
+# ── incremental_range_since ──
+
+
+async def test_incremental_range_is_snapped_to_buckets():
+    cur = MetaCursor(snapshots=[(1, None, "append"), (2, 1, "append")], entries=[metrics()])
+    assert await incremental_range_since(cur, SRC, "ts", "day", 1, 2) == (datetime(2026, 4, 9), datetime(2026, 4, 10))
+
+
+async def test_incremental_range_ignores_compaction_files():
+    cur = MetaCursor(snapshots=[(1, None, "append"), (2, 1, "replace"), (3, 2, "append")], entries=[metrics()])
+    await incremental_range_since(cur, SRC, "ts", "hour", 1, 3)
+    assert "snapshot_id IN (3)" in cur.sql[-1]
+
+
+async def test_incremental_range_of_compaction_only_is_none():
+    cur = MetaCursor(snapshots=[(1, None, "append"), (2, 1, "replace")])
+    assert await incremental_range_since(cur, SRC, "ts", "hour", 1, 2) is None
+
+
+async def test_deletes_need_a_full_refresh():
+    cur = MetaCursor(snapshots=[(1, None, "append"), (2, 1, "delete")])
+    with pytest.raises(FullRefreshNeeded, match="delete"):
+        await incremental_range_since(cur, SRC, "ts", "hour", 1, 2)
+
+
+async def test_missing_stats_need_a_full_refresh():
+    cur = MetaCursor(snapshots=[(1, None, "append"), (2, 1, "append")], entries=[metrics(lower=None, upper=None)])
+    with pytest.raises(FullRefreshNeeded, match="statistics"):
+        await incremental_range_since(cur, SRC, "ts", "hour", 1, 2)
+
+
+# ── detect_changes ──
+
+
+async def test_detect_no_change_when_bookmark_is_current():
+    r = await detect_changes(MetaCursor(main=7), SRC, "ts", "day", 7)
+    assert (r.action, r.current_snapshot) == (RefreshAction.NO_CHANGE, 7)
+
+
+async def test_detect_no_change_on_empty_source():
+    r = await detect_changes(MetaCursor(), SRC, "ts", "day", None)
+    assert (r.action, r.current_snapshot) == (RefreshAction.NO_CHANGE, None)
+
+
+async def test_detect_first_run_is_full_refresh():
+    r = await detect_changes(MetaCursor(main=7), SRC, "ts", "day", None)
+    assert (r.action, r.current_snapshot) == (RefreshAction.FULL_REFRESH, 7)
+
+
+async def test_detect_incremental():
+    cur = MetaCursor(main=2, snapshots=[(1, None, "append"), (2, 1, "append")], entries=[metrics()])
+    r = await detect_changes(cur, SRC, "ts", "hour", 1)
+    assert r.action == RefreshAction.INCREMENTAL
+    assert r.filter_range == (datetime(2026, 4, 9, 10), datetime(2026, 4, 9, 16))
+
+
+async def test_detect_compaction_only_advances_without_refresh():
+    cur = MetaCursor(main=2, snapshots=[(1, None, "append"), (2, 1, "replace")])
+    r = await detect_changes(cur, SRC, "ts", "hour", 1)
+    assert (r.action, r.current_snapshot) == (RefreshAction.NO_CHANGE, 2)
+
+
+async def test_detect_falls_back_to_full_refresh_when_change_is_unbounded():
+    cur = MetaCursor(main=3, snapshots=[(1, None, "append"), (3, None, "append")])  # table replaced
+    r = await detect_changes(cur, SRC, "ts", "hour", 1)
+    assert (r.action, r.current_snapshot) == (RefreshAction.FULL_REFRESH, 3)
 
 
 # ── expand_to_bucket_bounds ──
@@ -396,362 +580,6 @@ class TestExpandToBucketBoundsInversesDateTrunc:
         )
 
 
-# ── get_current_snapshot ──
-
-
-class TestGetCurrentSnapshot:
-    async def test_returns_id(self):
-        assert await get_current_snapshot(MockCursor([[(12345,)]]), "db.t") == 12345
-
-    async def test_returns_none(self):
-        assert await get_current_snapshot(MockCursor([[]]), "db.t") is None
-
-    async def test_sql_uses_snapshot_id_tiebreak(self):
-        """ORDER BY committed_at alone is non-deterministic when two siblings
-        share a millisecond-precision committed_at — the wrong winner can leave
-        last_snapshot == current_snap on the next tick and skip real new data.
-        Mirrors the tiebreak in get_snapshots_since."""
-        cursor = MockCursor([[(12345,)]])
-        await get_current_snapshot(cursor, "db.t")
-        sql = cursor.executed_sql[0]
-        # Both keys should be in the ORDER BY with committed_at first and
-        # snapshot_id as the tiebreak, descending so LIMIT 1 returns the head.
-        # Snapshot IDs are not strictly time-ordered across writers, so key
-        # order matters.
-        order_by = sql.split("ORDER BY", 1)[1]
-        assert "committed_at" in order_by
-        assert "snapshot_id" in order_by
-        assert order_by.index("committed_at") < order_by.index("snapshot_id")
-
-
-# ── get_snapshots_since ──
-
-
-class TestGetSnapshotsSince:
-    async def test_raises_on_missing_last_snap(self):
-        """If last_snap is no longer in $snapshots (Iceberg expired it),
-        iceberg-ivm must fail loudly rather than silently return []."""
-        # First execute is the committed_at lookup for last_snap: empty.
-        cursor = MockCursor([[]])
-        with pytest.raises(ExpiredSnapshotError):
-            await get_snapshots_since(cursor, "db.t", last_snap=999)
-
-    async def test_sql_uses_snapshot_id_tiebreak(self):
-        """The committed_at > (...) comparison must tiebreak with snapshot_id,
-        otherwise sibling snapshots sharing a millisecond-precision
-        committed_at with last_snap would be dropped.
-
-        We assert the shape of the generated SQL (two-query split, with the
-        second query referencing snapshot_id in its predicate).
-        """
-        cursor = MockCursor(
-            [
-                [(1_700_000_000_000,)],  # committed_at of last_snap
-                [(200, "append"), (300, "append")],
-            ]
-        )
-        await get_snapshots_since(cursor, "db.t", last_snap=100)
-        assert len(cursor.executed_sql) == 2, (
-            f"expected two queries (committed_at lookup + later snapshots), got {cursor.executed_sql}"
-        )
-        second = cursor.executed_sql[1]
-        assert "snapshot_id" in second
-        assert "100" in second  # last_snap appears in the tiebreak clause
-
-
-# ── get_new_files_column_range ──
-
-
-class TestGetNewFilesColumnRange:
-    async def test_computes_range(self):
-        cursor = MockCursor(
-            [
-                [
-                    ({"ts": {"lower_bound": "2026-04-08T09:00:00+00:00", "upper_bound": "2026-04-08T12:00:00+00:00"}},),
-                    ({"ts": {"lower_bound": "2026-04-08T11:00:00+00:00", "upper_bound": "2026-04-08T15:00:00+00:00"}},),
-                ]
-            ]
-        )
-        result = await get_new_files_column_range(cursor, "db.t", [100, 200], "ts")
-        assert result is not None
-        lo, hi = result
-        assert lo == datetime(2026, 4, 8, 9, 0, tzinfo=UTC)
-        assert hi == datetime(2026, 4, 8, 15, 0, tzinfo=UTC)
-
-    async def test_no_data_files(self):
-        cursor = MockCursor([[]])
-        assert await get_new_files_column_range(cursor, "db.t", [100], "ts") is None
-
-    async def test_raises_when_filter_column_absent_from_metrics(self):
-        """File rows exist, but none contain the filter_column in their
-        per-column metrics. That's a configuration error (typo'd column
-        name, schema drift) — must fail loudly instead of silently
-        returning None and freezing the view.
-        """
-        cursor = MockCursor(
-            [
-                [
-                    ({"other_col": {"lower_bound": "1", "upper_bound": "2"}},),
-                    ({"other_col": {"lower_bound": "3", "upper_bound": "4"}},),
-                ]
-            ]
-        )
-        with pytest.raises(MissingFilterColumnError):
-            await get_new_files_column_range(cursor, "db.t", [1], "ts")
-
-    async def test_min_max_ignores_lex_order(self):
-        """Two files whose chronological order disagrees with lex order.
-
-        The first row's lower_bound is "2026-04-08T09:00:00.000000+00:00".
-        The second row's lower_bound is "2026-04-08T08:00:00.000000-01:00",
-        which is the SAME instant (09:00 UTC). Its upper_bound is
-        "2026-04-08T09:30:00.000000-01:00" = 10:30 UTC, which is LATER
-        chronologically than the first row's upper_bound (10:00 UTC) —
-        but LEXICOGRAPHICALLY its string is EARLIER because "08..." < "09...".
-
-        After the fix, get_new_files_column_range returns datetimes and
-        computes min/max on the instants, not the strings.
-        """
-        cursor = MockCursor(
-            [
-                [
-                    (
-                        {
-                            "ts": {
-                                "lower_bound": "2026-04-08T09:00:00.000000+00:00",
-                                "upper_bound": "2026-04-08T10:00:00.000000+00:00",
-                            }
-                        },
-                    ),
-                    (
-                        {
-                            "ts": {
-                                "lower_bound": "2026-04-08T08:00:00.000000-01:00",
-                                "upper_bound": "2026-04-08T09:30:00.000000-01:00",
-                            }
-                        },
-                    ),
-                ]
-            ]
-        )
-        result = await get_new_files_column_range(cursor, "db.t", [1, 2], "ts")
-        assert result is not None
-        lo, hi = result
-        assert lo == datetime(2026, 4, 8, 9, 0, tzinfo=UTC)
-        assert hi == datetime(2026, 4, 8, 10, 30, tzinfo=UTC)
-
-
-# ── detect_changes ──
-
-
-class TestDetectChanges:
-    async def test_no_change_same_snapshot(self):
-        cursor = MockCursor([[(100,)]])
-        r = await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
-        assert r.action == RefreshAction.NO_CHANGE
-
-    async def test_full_refresh_first_run(self):
-        cursor = MockCursor([[(200,)]])
-        r = await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=None)
-        assert r.action == RefreshAction.FULL_REFRESH
-        assert r.current_snapshot == 200
-
-    async def test_incremental_with_range(self):
-        cursor = MockCursor(
-            [
-                [(200,)],  # get_current_snapshot
-                [(1_700_000_000_000,)],  # committed_at lookup for last_snap
-                [(200, "append")],  # snapshots strictly since last_snap
-                # get_new_files_column_range — readable_metrics per file
-                [({"ts": {"lower_bound": "2026-04-08T10:00:00+00:00", "upper_bound": "2026-04-08T15:30:00+00:00"}},)],
-            ]
-        )
-        r = await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
-        assert r.action == RefreshAction.INCREMENTAL
-        assert r.filter_range is not None
-        # Day granularity: should snap to full day
-        start, end = r.filter_range
-        assert start.day == 8 and start.hour == 0
-        assert end.day == 9 and end.hour == 0
-
-    async def test_incremental_week_granularity(self):
-        cursor = MockCursor(
-            [
-                [(200,)],
-                [(1_700_000_000_000,)],  # committed_at lookup
-                [(200, "append")],
-                [({"ts": {"lower_bound": "2026-04-08T10:00:00+00:00", "upper_bound": "2026-04-08T15:00:00+00:00"}},)],
-            ]
-        )
-        r = await detect_changes(cursor, "db.t", "ts", "week", last_snapshot=100)
-        assert r.action == RefreshAction.INCREMENTAL
-        start, end = r.filter_range
-        # Apr 8 is Wednesday → week snaps to Mon Apr 6 – Mon Apr 13
-        assert start.day == 6
-        assert end.day == 13
-
-    async def test_expired_last_snapshot_falls_back_to_full_refresh(self):
-        """If ``last_snapshot`` is no longer present in the source's
-        ``$snapshots`` (because the source was re-created or its history
-        was expired), the orchestrator's bookmark is stale and incremental
-        detection is impossible — but the situation is *recoverable*: a
-        FULL_REFRESH from the new source recomputes everything we need.
-
-        Before this fix, ``get_snapshots_since`` raised ``ExpiredSnapshotError``
-        and that propagated up through ``detect_changes``, leaving the view
-        wedged in an error loop (Finding #1 of the 2026-05-18 UI battle-test).
-        The fix catches the error inside ``detect_changes`` and converts it
-        to a FULL_REFRESH against the *current* snapshot.
-        """
-        cursor = MockCursor(
-            [
-                [(200,)],  # get_current_snapshot → 200 (new)
-                [],  # committed_at lookup for last_snap=100 → empty (expired)
-            ]
-        )
-        r = await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
-        assert r.action == RefreshAction.FULL_REFRESH
-        assert r.current_snapshot == 200
-        # No further queries should be issued — we can't read $all_entries
-        # against an expired bookmark, and we don't need to.
-        assert len(cursor.executed_sql) == 2, cursor.executed_sql
-
-    async def test_no_data_files_in_new_snapshots(self):
-        cursor = MockCursor(
-            [
-                [(200,)],
-                [(1_700_000_000_000,)],  # committed_at lookup
-                [(200, "append")],
-                [],  # no entries from $all_entries
-            ]
-        )
-        r = await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
-        assert r.action == RefreshAction.NO_CHANGE
-
-    async def test_compaction_only_no_change_advances_state(self):
-        """Only `replace` (compaction) snapshots since last_snap: no data
-        changed, just files rewritten. Detector should return NO_CHANGE
-        with the advanced current_snapshot and must NOT issue the
-        $all_entries file-range query.
-        """
-        cursor = MockCursor(
-            [
-                [(200,)],  # current_snapshot
-                [(1_700_000_000_000,)],  # committed_at lookup
-                [(200, "replace")],  # compaction-only
-                # no $all_entries query should follow
-            ]
-        )
-        r = await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
-        assert r.action == RefreshAction.NO_CHANGE
-        assert r.current_snapshot == 200
-        # Exactly 3 queries: current_snapshot, committed_at lookup,
-        # snapshots-since. No file-range query.
-        assert len(cursor.executed_sql) == 3, cursor.executed_sql
-        assert not any("all_entries" in s for s in cursor.executed_sql)
-
-    async def test_mixed_append_and_replace_uses_only_append_snapshots(self):
-        """When the new-snapshot set contains both an append and a
-        compaction, the file-range query must scope to the append
-        snapshot only. Compaction-added files contain the same rows
-        rewritten and would uselessly expand the range.
-        """
-        cursor = MockCursor(
-            [
-                [(51,)],  # current_snapshot
-                [(1_700_000_000_000,)],  # committed_at lookup
-                [(50, "append"), (51, "replace")],  # both ops
-                [({"ts": {"lower_bound": "2026-04-08T09:00:00+00:00", "upper_bound": "2026-04-08T10:00:00+00:00"}},)],
-            ]
-        )
-        r = await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
-        assert r.action == RefreshAction.INCREMENTAL
-        file_query = next(s for s in cursor.executed_sql if "all_entries" in s)
-        assert "IN (50)" in file_query, (
-            f"expected file-range query to scope to append snapshot 50 only, got: {file_query}"
-        )
-        assert "51" not in file_query
-
-    async def test_delete_operation_raises(self):
-        """`delete` and any unknown op violate the no-data-loss assumption
-        and must raise, not silently trigger a FULL_REFRESH (which was the
-        old behavior)."""
-        cursor = MockCursor(
-            [
-                [(200,)],
-                [(1_700_000_000_000,)],
-                [(200, "delete")],
-            ]
-        )
-        with pytest.raises(UnexpectedOperationError):
-            await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
-
-    async def test_unknown_operation_raises(self):
-        """An entirely unknown operation name must also raise loudly so
-        new Iceberg ops are surfaced to the operator instead of silently
-        ignored."""
-        cursor = MockCursor(
-            [
-                [(200,)],
-                [(1_700_000_000_000,)],
-                [(200, "rewrite")],  # not in the allowed set
-            ]
-        )
-        with pytest.raises(UnexpectedOperationError):
-            await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
-
-    async def test_overwrite_drives_incremental_refresh(self):
-        """`overwrite` snapshots are produced by MERGE INTO (e.g. an upstream
-        chained MV's refresh). They are real data changes and must drive
-        an incremental refresh exactly like `append`, scoping the
-        $all_entries file-range query to the overwrite snapshot's added
-        files."""
-        cursor = MockCursor(
-            [
-                [(200,)],  # current_snapshot
-                [(1_700_000_000_000,)],  # committed_at lookup
-                [(200, "overwrite")],  # one MERGE-driven snapshot
-                [({"ts": {"lower_bound": "2026-04-08T10:00:00+00:00", "upper_bound": "2026-04-08T15:30:00+00:00"}},)],
-            ]
-        )
-        r = await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
-        assert r.action == RefreshAction.INCREMENTAL
-        assert r.current_snapshot == 200
-        assert r.filter_range is not None
-        start, end = r.filter_range
-        # Day granularity: should snap to full day [Apr 8, Apr 9)
-        assert start == datetime(2026, 4, 8, tzinfo=UTC)
-        assert end == datetime(2026, 4, 9, tzinfo=UTC)
-        # The file-range query must scope to snapshot 200.
-        file_query = next(s for s in cursor.executed_sql if "all_entries" in s)
-        assert "IN (200)" in file_query
-
-    async def test_mixed_append_overwrite_replace_uses_change_snapshots(self):
-        """When the new-snapshot set mixes append, overwrite (MERGE) and
-        replace (compaction), the file-range query must scope to the
-        change-driving snapshots only (append + overwrite), never to
-        compaction-rewritten files."""
-        cursor = MockCursor(
-            [
-                [(53,)],  # current_snapshot
-                [(1_700_000_000_000,)],  # committed_at lookup
-                [(50, "append"), (51, "replace"), (52, "overwrite"), (53, "replace")],  # mixed
-                [({"ts": {"lower_bound": "2026-04-08T09:00:00+00:00", "upper_bound": "2026-04-08T10:00:00+00:00"}},)],
-            ]
-        )
-        r = await detect_changes(cursor, "db.t", "ts", "day", last_snapshot=100)
-        assert r.action == RefreshAction.INCREMENTAL
-        file_query = next(s for s in cursor.executed_sql if "all_entries" in s)
-        # Both 50 (append) and 52 (overwrite) drive change; 51/53 (replace) must not.
-        assert "50" in file_query
-        assert "52" in file_query
-        assert "51" not in file_query
-        assert "53" not in file_query
-
-
-# ── walk_buckets ──
-
-
 class TestWalkBuckets:
     def test_empty_range(self):
         ts = datetime(2026, 4, 8, tzinfo=UTC)
@@ -863,42 +691,3 @@ class TestWalkBuckets:
         # And contiguity still holds.
         for a, b in zip(chunks, chunks[1:], strict=False):
             assert a[1] == b[0]
-
-
-# ── get_source_column_range ──
-
-
-class TestGetSourceColumnRange:
-    async def test_reads_from_files_system_table(self):
-        cursor = MockCursor(
-            [
-                [
-                    ({"ts": {"lower_bound": "2024-01-01T00:00:00+00:00", "upper_bound": "2024-01-02T00:00:00+00:00"}},),
-                    ({"ts": {"lower_bound": "2026-04-01T00:00:00+00:00", "upper_bound": "2026-04-21T23:59:59+00:00"}},),
-                ]
-            ]
-        )
-        result = await get_source_column_range(cursor, "iceberg.db.t", "ts")
-        assert result is not None
-        lo, hi = result
-        assert lo == datetime(2024, 1, 1, tzinfo=UTC)
-        assert hi == datetime(2026, 4, 21, 23, 59, 59, tzinfo=UTC)
-        # Queries $files, not $all_entries — $all_entries would only return
-        # files added BY a single commit, not the live set.
-        assert 'iceberg.db."t$files"' in cursor.executed_sql[0]
-        assert "$all_entries" not in cursor.executed_sql[0]
-
-    async def test_empty_table(self):
-        cursor = MockCursor([[]])
-        assert await get_source_column_range(cursor, "db.t", "ts") is None
-
-    async def test_raises_when_filter_column_absent(self):
-        cursor = MockCursor(
-            [
-                [
-                    ({"other": {"lower_bound": "1", "upper_bound": "2"}},),
-                ]
-            ]
-        )
-        with pytest.raises(MissingFilterColumnError):
-            await get_source_column_range(cursor, "db.t", "ts")
