@@ -24,9 +24,10 @@ docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
 open http://localhost:8001
 ```
 
-Or run the service directly against any Trino:
+Or run the service directly against any Trino (here, the quickstart's):
 
 ```bash
+cp config.yaml.example config.yaml
 export TRINO_URL=http://localhost:28080 TRINO_USER=dev
 uv run iceberg-ivm -c config.yaml --views views.yaml -v
 ```
@@ -85,12 +86,12 @@ src/iceberg_ivm/
   introspect.py     output columns via DESCRIBE OUTPUT; CREATE TABLE for the target
   query_history.py  state.db: bookmarks, in-flight runs, query history, maintenance schedule
   server.py         FastAPI app: REST API, UI, Prometheus metrics, one worker per view
-  static/index.html the web UI (single file, no build step)
+  static/           the web UI: index.html (no build step) and a pinned copy of Alpine.js
 tests/
   unit/             fast tests with fake Trino cursors
   integration/      real Trino via tests/docker-compose.yml
 quickstart/         one-command demo stack
-docs/               how-it-works.md and screenshots
+docs/               how-it-works.md, screenshots and the logo
 ```
 
 ## Releases

@@ -143,7 +143,7 @@ The Trino user needs `SELECT` on sources, `CREATE TABLE` in the target schema, a
 | `target_partitioning` | none | Iceberg partitioning for a new target, e.g. `"ARRAY['day(minute)']"`. Partitioning by the bucket keeps refreshes fast. |
 | `refresh_interval_seconds` | `60` | How often to check the source for new snapshots |
 | `query_timeout_seconds` | none | Cancels a refresh (and its Trino queries) that runs longer |
-| `full_refresh_chunk` | none | Backfill in chunks (`hour` … `year`), each committed separately and resumable. Large catch-ups are chunked too. |
+| `full_refresh_chunk` | none | Backfill in chunks (`minute` … `year`), each committed separately and resumable. Large catch-ups are chunked too. |
 | `maintenance_interval_seconds` | `0` (off) | Run Iceberg maintenance on the target at most this often |
 | `optimize`, `expire_snapshots`, `remove_orphan_files` | `true` | Which maintenance operations run |
 | `optimize_file_size_threshold` | Trino's | e.g. `"128MB"` |
@@ -154,9 +154,9 @@ The Trino user needs `SELECT` on sources, `CREATE TABLE` in the target schema, a
 | Task | How |
 |---|---|
 | Refresh now | **Refresh** in the UI, or `POST /api/views/{name}/refresh` |
-| Recompute everything | `POST /api/views/{name}/rebuild`. The target stays readable while it runs. |
+| Recompute everything | **Rebuild** in the UI's ⋯ menu, or `POST /api/views/{name}/rebuild`. The target stays readable while it runs. |
 | Change settings | Edit `views.yaml`, the UI, or `PUT /api/views/{name}`. To change a query, delete the view and create it again. |
-| Delete a view | `DELETE /api/views/{name}`. The target table is kept; drop it yourself if you want the data gone. |
+| Delete a view | **Delete view** in the UI, or `DELETE /api/views/{name}`. The target table is kept; drop it yourself if you want the data gone. |
 | Restart or upgrade | Safe at any time. A run interrupted mid-backfill resumes from its last committed chunk. |
 
 **Keep `state.db` on a persistent volume.** It holds each view's bookmark. Without it, every view rebuilds from scratch on the next start.
@@ -168,10 +168,10 @@ The Trino user needs `SELECT` on sources, `CREATE TABLE` in the target schema, a
 | Alert on | Meaning |
 |---|---|
 | `increase(mv_refresh_errors_total[10m]) > 0` | Refreshes are failing |
-| `time() - mv_refresh_last_success_timestamp > 3 * <interval>` | A view stopped advancing |
+| `mv_lag_seconds > 600` | A view is more than 10 minutes behind its source: the gap between the source's newest commit and the one the view reflects |
 | `mv_refresh_duration_seconds` p95 growing | Refreshes are scanning more than you expect; check `target_partitioning` |
 
-Other endpoints: `GET /api/views` (views with status), `POST /api/views` (create), `POST /api/views/parse` (check a query), `GET /health`.
+Other endpoints: `GET /api/views` (views with status and freshness), `POST /api/views` (create), `POST /api/views/parse` (check a query), `GET /api/info`, `GET /health`.
 
 ## How it compares
 
@@ -179,7 +179,7 @@ Only tools whose sources **and** results are Iceberg tables are listed. That's t
 
 | | Runs on | Refreshes when | Aggregates refreshed incrementally | Late-arriving rows |
 |---|---|---|---|---|
-| **iceberg-ivm** | Trino | a new snapshot lands (checked every few seconds) | ✅ any aggregate: the touched buckets are recomputed | ✅ any age, found from file statistics |
+| **iceberg-ivm** | Trino | its next check after a commit (every 60 s by default, down to 1 s) | ✅ any aggregate: the touched buckets are recomputed | ✅ any age, found from file statistics |
 | Trino materialized views | Trino | you run `REFRESH MATERIALIZED VIEW` | ❌ a `GROUP BY` means a full refresh | — |
 | dbt-trino `microbatch` | Trino | the next scheduled run | ✅ any aggregate: whole batches (an hour or more) are recomputed | ⚠️ only within the lookback window |
 | SQLMesh `INCREMENTAL_BY_TIME_RANGE` | Trino, Spark, … | its cron schedule | ✅ any aggregate: whole intervals are recomputed | ⚠️ only intervals not yet processed, unless you restate them |
@@ -191,7 +191,7 @@ As of November 2026.
 
 **iceberg-ivm or dbt `microbatch`?** Both run on Trino and recompute whole time buckets, so any aggregate stays correct. The difference is in what drives them:
 
-- iceberg-ivm reacts to each Iceberg commit and recomputes exactly the buckets it touched, however old they are. When nothing changed it does nothing, and each range is replaced in one atomic `MERGE`. Buckets can be as small as a second, and compaction never triggers work.
+- iceberg-ivm reacts to each Iceberg commit and recomputes exactly the buckets it touched, however old they are. When nothing changed it does nothing, and each range is replaced in one atomic `MERGE`. Buckets can be as small as a millisecond, and compaction never triggers work.
 - `microbatch` runs on your schedule and recomputes every batch in its lookback window, changed or not. Rows older than the window are missed until you backfill by hand. Batches are an hour or longer, and each is replaced with a delete and an insert.
 - dbt does far more than maintain aggregates: joins and multiple sources, Jinja, tests, docs, and lineage across your whole project, with no extra service to run.
 

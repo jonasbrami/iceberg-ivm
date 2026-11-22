@@ -64,7 +64,7 @@ services:
       - ivm-state:/data/state
     command: ["-c", "/data/config.yaml", "--views", "/data/views.yaml"]
     ports:
-      # Loopback-only: the orchestrator UI has no auth in the quickstart.
+      # Loopback-only: the quickstart sets no IVM_PASSWORD, so the UI is open.
       - "127.0.0.1:8001:8000"
 
 volumes:

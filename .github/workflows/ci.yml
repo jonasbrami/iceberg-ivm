@@ -43,9 +43,8 @@ jobs:
 
       - run: uv run pytest -m "not integration"
 
-  # Heavy: boots Trino + MinIO + Postgres. Gated to PRs targeting master and
-  # manual dispatch, so it doesn't run on every branch push. First CI lane for
-  # the whole tests/integration suite (run manually/locally before this).
+  # Heavy: boots Trino + Postgres. Gated to PRs targeting master and manual
+  # dispatch, so it doesn't run on every branch push.
   integration:
     runs-on: ubuntu-latest
     needs: lint
@@ -55,7 +54,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Start Trino + MinIO + Postgres
+      - name: Start Trino + Postgres
         run: docker compose -f tests/docker-compose.yml up -d --wait trino
 
       - uses: astral-sh/setup-uv@v5
@@ -119,7 +118,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # metadata-action parses `refs/tags/v0.1.1` → `0.1.1`; the Dockerfile
-          # forwards it to SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ICEBERG_IVM
+          # forwards it to SETUPTOOLS_SCM_PRETEND_VERSION
           # so hatch-vcs bakes the correct version into the built package.
           build-args: |
             VERSION=${{ steps.meta.outputs.version }}

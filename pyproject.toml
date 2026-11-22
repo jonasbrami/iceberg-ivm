@@ -29,7 +29,7 @@ build-backend = "hatchling.build"
 # Version is derived from git tags: `v0.1.1` → `0.1.1`. Between tags,
 # installs produce a dev version (e.g. `0.1.2.dev3+g7817deb`). In Docker
 # builds (no `.git` in context) the publish workflow passes the tag via
-# SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ICEBERG_IVM.
+# SETUPTOOLS_SCM_PRETEND_VERSION (see Dockerfile).
 [tool.hatch.version]
 source = "vcs"
 

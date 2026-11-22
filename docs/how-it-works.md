@@ -24,10 +24,15 @@ Steps 1–4 read only metadata. Step 5 is the only one that reads data, and it r
 ### 1. Has the source changed?
 
 ```sql
-SELECT snapshot_id FROM iceberg.market_data."trades$refs" WHERE name = 'main'
+SELECT r.snapshot_id, s.committed_at
+FROM iceberg.market_data."trades$refs" AS r
+JOIN iceberg.market_data."trades$snapshots" AS s ON s.snapshot_id = r.snapshot_id
+WHERE r.name = 'main'
 ```
 
-The answer is the snapshot the source's `main` branch points at. iceberg-ivm stores, per view, the last snapshot it merged: the **bookmark**. If they match, the tick is a skip. Snapshots on other branches (for example write-audit-publish) are never read.
+The answer is the snapshot the source's `main` branch points at, and when it was committed. iceberg-ivm stores, per view, the last snapshot it merged: the **bookmark**. If they match, the tick is a skip. Snapshots on other branches (for example write-audit-publish) are never read.
+
+If the source table (or its schema) doesn't exist yet, the view is **waiting**, not failing. That is normal for a chained view whose upstream hasn't created its target yet.
 
 ### 2. Which snapshots are new?
 
@@ -125,7 +130,7 @@ When every MERGE of the run has committed, the bookmark moves to the pinned snap
 
 A full refresh makes the whole target equal to the query. It runs when:
 
-- the view has no bookmark: its first run, or after it was deleted and created again;
+- the view has no bookmark: its first run, after it was deleted and created again, or after you asked for a **rebuild** (UI, or `POST /api/views/{name}/rebuild`);
 - a change can't be bounded: a `delete` snapshot, a broken ancestry, or files without stats.
 
 Its window runs from the earliest to the latest of two ranges: the source's time range (from `$files` min/max) and the target's bucket range. Including the target's range matters. If the target holds rows the query no longer produces, for example from an older query that wrote to the same table, those buckets fall inside the window and the MERGE deletes them.
@@ -152,7 +157,9 @@ Three rules make this safe:
 2. **Progress saved after each commit.** `state.db` keeps `current_work`: the pinned snapshot M and the end of the last committed chunk. A resumed run reuses M as-is and doesn't re-detect, so its window can't drift.
 3. **Resume re-merges the boundary chunk.** The resume point is floored to the start of the chunk containing it. Re-merging a chunk is idempotent, and this stays gap-free even if you changed the chunk size since the run began.
 
-If M itself has expired by the time the run resumes, the run is discarded and the tick starts over with fresh detection.
+If M itself has expired by the time the run resumes, or the bookmark is no longer one of M's ancestors, the run is discarded and the tick starts over with fresh detection.
+
+A timeout (`query_timeout_seconds`), a deleted view or a shutdown cancels the Trino query that is running. Nothing past the last committed chunk is kept, and the next tick resumes from there.
 
 The chunk must hold whole buckets of the view's granularity:
 
@@ -221,6 +228,20 @@ Merge keys are the GROUP BY keys, and every other output column is updated in pl
 
 If `maintenance_interval_seconds` is above 0, the worker also runs `ALTER TABLE … EXECUTE optimize`, `expire_snapshots` and `remove_orphan_files` on the target after a tick, at most once per interval. Running it in the same worker as refreshes avoids commit conflicts with the view's own MERGEs.
 
+## Freshness
+
+Each check records two commit times: the source's newest snapshot, and the snapshot the view reflects (`data_as_of`). The gap between them is the view's **lag**: 0 when it is up to date, growing while a refresh runs or fails. The UI shows it as "Up to date" or "4m behind", and Prometheus gets it as `mv_lag_seconds`. If a view stops being checked at all, the UI says so.
+
+A view's status in the UI is one of:
+
+| Status | Meaning |
+|---|---|
+| Healthy | the last check succeeded |
+| Refreshing | MERGEs are running |
+| Backfilling / Catching up | a chunked run is in progress, with a progress bar |
+| Waiting | the source table doesn't exist yet |
+| Failing | the last tick failed; the error is shown, and the bookmark hasn't moved, so no data is skipped |
+
 ## Time zones
 
 Every Trino session iceberg-ivm opens is pinned to UTC. Bucket boundaries are computed in UTC for `TIMESTAMP WITH TIME ZONE` columns, and in plain wall-clock time for `TIMESTAMP` columns. Pinning the session keeps Trino's `date_trunc` on the same boundaries as the range iceberg-ivm computes. If they disagreed, a day bucket in New York time would straddle two UTC days and be recomputed from a partial range.
@@ -231,8 +252,8 @@ All state lives in one SQLite file, `state.db`, next to `views.yaml` by default:
 
 | Table | Holds |
 |---|---|
-| `view_status` | per view: the bookmark, `current_work` (pinned snapshot + last committed chunk), and the counters the UI shows |
-| `query_history` | the last 50 Trino queries per view, with links to the Trino UI |
+| `view_status` | per view: the bookmark, `current_work` (pinned snapshot + last committed chunk), freshness, and the counters the UI shows |
+| `query_history` | the last 50 Trino queries per view, with the time range each recomputed and a link to the Trino UI |
 | `maintenance_state` | when each maintenance op last ran, so restarts keep the schedule |
 
 Deleting a view through the API or UI removes its rows, so a view created again under the same name starts with a full refresh. The target table is left as it is.
@@ -242,7 +263,7 @@ Deleting a view through the API or UI removes its rows, so a view created again 
 - **The time column needs min/max statistics.** Iceberg writers collect them by default, but only for a table's first 100 columns unless configured otherwise. Set `write.metadata.metrics.column.<col>=full` if your time column is beyond that.
 - **Row-level updates must not move a row to another time bucket.** With merge-on-read, a deleted row is recorded as a position-delete file, which carries no time bounds. iceberg-ivm recomputes the buckets of the rewritten rows, so an update that changes a row's timestamp leaves its old bucket stale. Updates that keep the timestamp, including other views' MERGEs, are handled.
 - **Deletes cost a full refresh.** That is correct but can be expensive on a large source. Set `full_refresh_chunk` so it runs in resumable pieces.
-- **Don't drop the target table by hand.** The bookmark would still point past data the new, empty table never received. Delete the view and create it again to rebuild.
+- **Don't drop the target table by hand.** The bookmark would still point past data the new, empty table never received. If it happens, **rebuild** the view to fill the table again.
 - **Run one instance per set of views.** Two instances refreshing the same view would run conflicting MERGEs.
 - **The UI and API have no authentication unless you set `IVM_PASSWORD`.** It enables HTTP Basic auth on everything except `/health` and `/metrics`.
 

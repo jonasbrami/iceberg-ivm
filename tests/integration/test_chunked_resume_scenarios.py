@@ -10,8 +10,9 @@ Design under test (server.refresh_view + executor.execute_refresh):
     chunk commit; the bookmark advances to M ONLY on clean completion (which
     also clears ``current_work``).
   * Resume reuses the SAME pinned M (never re-detects).
-  * If M (or, for an incremental, the bookmark) has expired → discard
-    ``current_work`` and recompute full-from-scratch.
+  * If M has expired, or the bookmark is no longer M's ancestor → discard
+    ``current_work`` and re-detect (a full refresh when the change can't be
+    bounded).
 
 Each scenario drives the real ``server.refresh_view`` against seeded Iceberg
 tables, inspects ``state.db`` directly, and compares the target to a
