@@ -1,11 +1,10 @@
 server:
   port: 8000
   config_reload_interval_seconds: 30
-  # SQLite file holding the per-view recent_queries ring buffer and
-  # maintenance scheduling state. Defaults to "state.db" resolved relative
-  # to the views file's directory (which is a host bind-mount in Docker
-  # deployments). For Docker, point this at a persistent volume so history
-  # survives image upgrades — e.g. "/data/state.db".
+  # SQLite file with each view's bookmark (the last source snapshot it
+  # merged), any in-flight run, status and freshness, recent queries and the
+  # maintenance schedule. Keep it on persistent storage: without it every view
+  # rebuilds from scratch. Relative paths resolve next to the views file.
   # state_db_path: /data/state.db
 
 # Trino connection URL, user, and password are read from environment
@@ -19,6 +18,8 @@ server:
 #                     info_uri deep-links in the UI (optional — defaults to
 #                     TRINO_URL). Set when the orchestrator and the user's
 #                     browser reach Trino over different hostnames.
+#   IVM_PASSWORD      Protects the UI and API with HTTP Basic auth (optional,
+#                     any user name). /health and /metrics stay open.
 #
 # Only `catalog` and `schema` (the per-deployment Trino catalog + target
 # schema — not secrets) live in this file.

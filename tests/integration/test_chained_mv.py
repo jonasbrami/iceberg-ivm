@@ -171,10 +171,9 @@ class TestChainedMv:
             vs2 = app_state.view_statuses[MV2.name]
             assert vs1.last_error is None, f"cycle {i} ({label}): upstream MV1 errored: {vs1.last_error!r}"
             assert vs2.last_error is None, f"cycle {i} ({label}): downstream MV2 errored: {vs2.last_error!r}"
-            # First cycle: both views do a full refresh. Every subsequent
-            # cycle must be incremental — that's the regression guard for
-            # issue #49 (overwrite snapshots from MV1 must drive MV2's
-            # incremental path, not raise UnexpectedOperationError).
+            # First cycle: both views do a full refresh. Every later cycle
+            # must be incremental: MV1's MERGEs are `overwrite` snapshots,
+            # and they must drive MV2's incremental path (issue #49).
             if i == 1:
                 assert vs1.last_action == "full"
                 assert vs2.last_action == "full"

@@ -15,7 +15,7 @@ from iceberg_ivm.server import app
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="iceberg-ivm",
-        description="Incremental view maintenance for Iceberg tables on Trino",
+        description="Incremental materialized views on Apache Iceberg",
     )
     parser.add_argument(
         "-c",
