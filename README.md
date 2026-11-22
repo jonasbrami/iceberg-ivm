@@ -142,7 +142,7 @@ The Trino user needs `SELECT` on sources, `CREATE TABLE` in the target schema, a
 | `name` | `target_table` | Label in the UI, API and metrics |
 | `target_partitioning` | none | Iceberg partitioning for a new target, e.g. `"ARRAY['day(minute)']"`. Partitioning by the bucket keeps refreshes fast. |
 | `refresh_interval_seconds` | `60` | How often to check the source for new snapshots |
-| `query_timeout_seconds` | none | Cancels a refresh (and its Trino queries) that runs longer |
+| `query_timeout_seconds` | none | Limit for one refresh tick, all its MERGEs together. When reached, the running Trino query is cancelled; a chunked run resumes from its last committed chunk on the next tick. |
 | `full_refresh_chunk` | none | Backfill in chunks (`minute` … `year`), each committed separately and resumable. Large catch-ups are chunked too. |
 | `maintenance_interval_seconds` | `0` (off) | Run Iceberg maintenance on the target at most this often |
 | `optimize`, `expire_snapshots`, `remove_orphan_files` | `true` | Which maintenance operations run |
