@@ -14,6 +14,7 @@
   <a href="https://github.com/jonasbrami/iceberg-ivm/actions/workflows/ci.yml"><img src="https://github.com/jonasbrami/iceberg-ivm/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/jonasbrami/iceberg-ivm/pkgs/container/iceberg-ivm"><img src="https://img.shields.io/badge/image-ghcr.io-2563eb" alt="Container image"></a>
   <img src="https://img.shields.io/badge/python-3.12%2B-2563eb" alt="Python 3.12+">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-2563eb" alt="License: Apache 2.0"></a>
 </p>
 
 <p align="center">
@@ -189,3 +190,7 @@ iceberg-ivm fits when **Trino is your engine, Iceberg is your storage, and you n
 ## Contributing
 
 Bug reports and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers the development setup and the test suites; [docs/how-it-works.md](docs/how-it-works.md) explains the internals.
+
+## License
+
+[Apache License 2.0](LICENSE)
