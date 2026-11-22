@@ -3221,3 +3221,41 @@ async def test_rebuild_clears_the_bookmark_at_the_next_tick(setup_state, tmp_pat
 
 def test_rebuild_unknown_view_is_404(client):
     assert client.post("/api/views/nope/rebuild").status_code == 404
+
+
+async def test_freshness_is_recorded_on_refresh_and_on_idle_ticks(setup_state):
+    from datetime import datetime
+
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+    from iceberg_ivm.executor import QueryInfo
+
+    view = setup_state.config.views[0]
+    vs = setup_state.view_statuses["test_view"]
+    setup_state.stop_event.clear()
+    at_100 = datetime.fromtimestamp(100, tz=UTC)
+    at_200 = datetime.fromtimestamp(200, tz=UTC)
+
+    async def one_merge(*a, **kw):
+        yield QueryInfo(query_id="q", info_uri="", stage="merge", started_at=0, elapsed_ms=1)
+
+    def run(result):
+        return (
+            patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+            patch.object(server_mod, "discover_columns", _fake_discover),
+            patch.object(server_mod, "detect_changes", AsyncMock(return_value=result)),
+            patch.object(server_mod, "execute_refresh", one_merge),
+        )
+
+    with contextlib.ExitStack() as stack:
+        for p in run(ChangeResult(RefreshAction.FULL_REFRESH, 1, committed_at=at_100)):
+            stack.enter_context(p)
+        await server_mod.refresh_view(setup_state, view)
+    assert (vs.source_committed_at, vs.data_as_of) == (100, 100)
+    assert vs.last_checked is not None
+
+    with contextlib.ExitStack() as stack:
+        for p in run(ChangeResult(RefreshAction.NO_CHANGE, 2, committed_at=at_200)):
+            stack.enter_context(p)
+        await server_mod.refresh_view(setup_state, view)
+    assert (vs.source_committed_at, vs.data_as_of) == (200, 200)

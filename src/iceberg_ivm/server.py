@@ -28,6 +28,7 @@ from iceberg_ivm.detector import (
     SourceNotFound,
     detect_changes,
     incremental_range_since,
+    snapshot_committed_at,
     snapshot_exists,
 )
 from iceberg_ivm.executor import (
@@ -57,6 +58,7 @@ REFRESH_BYTES = Counter("mv_refresh_bytes_processed_total", "Bytes processed dur
 REFRESH_ROWS = Counter("mv_refresh_rows_processed_total", "Rows processed during refresh queries", ["view"])
 DETECTION_DURATION = Histogram("mv_detection_duration_seconds", "Change detection duration", ["view"])
 SOURCE_SNAPSHOT = Gauge("mv_source_snapshot_id", "Current source snapshot ID", ["view"])
+LAG = Gauge("mv_lag_seconds", "Commit time of the source's newest snapshot minus the one the view reflects", ["view"])
 
 # Per-chunk metrics for chunked first-run full refreshes — mv_refresh_total /
 # mv_refresh_duration_seconds only tick once when the whole backfill commits
@@ -106,6 +108,12 @@ class ViewStatus:
     chunks_total: int | None = None
     # Informational, not an error (e.g. "waiting for <source> to exist").
     note: str | None = None
+    # Freshness, as epoch seconds: the last successful check of the source,
+    # the commit time of the source's newest snapshot, and the commit time of
+    # the snapshot the view reflects. Equal last two = up to date.
+    last_checked: float | None = None
+    source_committed_at: float | None = None
+    data_as_of: float | None = None
     # Ring buffer of the last few refresh queries (MERGE / INSERT / DELETE).
     # In-memory only; cleared on process restart.
     recent_queries: list[QueryInfo] = field(default_factory=list)
@@ -247,6 +255,9 @@ def _view_status_persist_fields(vs: ViewStatus) -> dict:
         "total_errors": vs.total_errors,
         "chunks_done": vs.chunks_done,
         "chunks_total": vs.chunks_total,
+        "last_checked": vs.last_checked,
+        "source_committed_at": vs.source_committed_at,
+        "data_as_of": vs.data_as_of,
     }
 
 
@@ -257,6 +268,8 @@ async def _persist_view_status(s: AppState, view_name: str, vs: ViewStatus) -> N
     negligible (a few inserts per refresh, seconds apart) so we don't
     batch. Silently no-ops in tests that don't attach a QueryHistory.
     """
+    if vs.source_committed_at is not None and vs.data_as_of is not None:
+        LAG.labels(view=view_name).set(max(0.0, vs.source_committed_at - vs.data_as_of))
     if s.history is None:
         return
     await s.history.upsert_view_status(view_name, _view_status_persist_fields(vs))
@@ -386,6 +399,10 @@ async def _record_query(s: AppState, view_name: str, vs: ViewStatus, q: QueryInf
         vs.recent_queries = ([q, *vs.recent_queries])[:RECENT_QUERY_LIMIT]
 
 
+def _epoch(value) -> float | None:
+    return value.timestamp() if value is not None else None
+
+
 async def _skip_tick(s: AppState, view: ViewConfig, conn, vs: ViewStatus, *, advance_to: int | None) -> None:
     """Record a tick with nothing to merge: move the bookmark to ``advance_to``
     (None: leave it), clear any in-flight run and any error from an earlier
@@ -469,6 +486,7 @@ async def _refresh(s: AppState, view: ViewConfig, conn, vs: ViewStatus) -> None:
                     cursor, parsed.source_table, parsed.filter_column, parsed.granularity, bookmark, pinned
                 )
                 if window is None:
+                    vs.data_as_of = _epoch(await snapshot_committed_at(cursor, parsed.source_table, pinned))
                     await _skip_tick(s, view, conn, vs, advance_to=pinned)
                     return
             log.info("%s: resuming run pinned at snapshot %d from %s", view.name, pinned, resume_from)
@@ -478,17 +496,21 @@ async def _refresh(s: AppState, view: ViewConfig, conn, vs: ViewStatus) -> None:
                 await history.clear_current_work(view.name)
             pinned = resume_from = window = None
 
+    pinned_at = None  # commit time of the pinned snapshot, when known
     if pinned is None:
         t0 = time.monotonic()
         result = await detect_changes(cursor, parsed.source_table, parsed.filter_column, parsed.granularity, bookmark)
         DETECTION_DURATION.labels(view=view.name).observe(time.monotonic() - t0)
         if result.current_snapshot is not None:
             SOURCE_SNAPSHOT.labels(view=view.name).set(result.current_snapshot)
+        vs.last_checked = time.time()
+        vs.source_committed_at = _epoch(result.committed_at)
         if result.action == RefreshAction.NO_CHANGE:
+            vs.data_as_of = vs.source_committed_at  # nothing to merge: the view is current
             advance = result.current_snapshot if result.current_snapshot != bookmark else None
             await _skip_tick(s, view, conn, vs, advance_to=advance)
             return
-        pinned, window = result.current_snapshot, result.filter_range
+        pinned, window, pinned_at = result.current_snapshot, result.filter_range, result.committed_at
         if history:
             if result.action == RefreshAction.FULL_REFRESH and bookmark is not None:
                 # Forget the bookmark so a restart mid-run resumes it as a full refresh.
@@ -540,6 +562,9 @@ async def _refresh(s: AppState, view: ViewConfig, conn, vs: ViewStatus) -> None:
         await history.clear_current_work(view.name)
     vs.total_refreshes += 1
     vs.chunks_total = None  # keep chunks_done so the UI can show "7/7"
+    if pinned_at is None:
+        pinned_at = await snapshot_committed_at(cursor, parsed.source_table, pinned)
+    vs.data_as_of = _epoch(pinned_at)
     REFRESH_DURATION.labels(view=view.name).observe(total_elapsed)
     REFRESH_LAST_SUCCESS.labels(view=view.name).set(vs.last_refresh or time.time())
     REFRESH_BYTES.labels(view=view.name).inc(total_bytes)

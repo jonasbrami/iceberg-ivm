@@ -48,6 +48,7 @@ class ChangeResult:
     action: RefreshAction
     current_snapshot: int | None = None
     filter_range: tuple[datetime, datetime] | None = None  # bucket-aligned [start, end)
+    committed_at: datetime | None = None  # of current_snapshot
 
 
 def system_table(table: str, suffix: str) -> str:
@@ -56,21 +57,39 @@ def system_table(table: str, suffix: str) -> str:
     return f'{head}."{name}${suffix}"' if head else f'"{name}${suffix}"'
 
 
-async def get_current_snapshot(cursor, table: str) -> int | None:
-    """The snapshot the main branch points at, or None for an empty table."""
+async def main_snapshot(cursor, table: str) -> tuple[int, datetime] | None:
+    """``(snapshot_id, committed_at)`` of the main branch, or None for an empty table."""
+    refs, snaps = system_table(table, "refs"), system_table(table, "snapshots")
     try:
-        await cursor.execute(f"SELECT snapshot_id FROM {system_table(table, 'refs')} WHERE name = 'main'")
+        await cursor.execute(
+            f"SELECT r.snapshot_id, s.committed_at FROM {refs} AS r "
+            f"JOIN {snaps} AS s ON s.snapshot_id = r.snapshot_id WHERE r.name = 'main'"
+        )
     except Exception as e:
         if getattr(e, "error_name", None) in ("TABLE_NOT_FOUND", "SCHEMA_NOT_FOUND"):
             raise SourceNotFound(f"waiting for {table} to exist") from e
         raise
     row = await cursor.fetchone()
-    return row[0] if row else None
+    return (row[0], row[1]) if row else None
+
+
+async def get_current_snapshot(cursor, table: str) -> int | None:
+    """The snapshot the main branch points at, or None for an empty table."""
+    current = await main_snapshot(cursor, table)
+    return current[0] if current else None
 
 
 async def snapshot_exists(cursor, table: str, snapshot_id: int) -> bool:
-    await cursor.execute(f"SELECT 1 FROM {system_table(table, 'snapshots')} WHERE snapshot_id = {snapshot_id}")
-    return (await cursor.fetchone()) is not None
+    return await snapshot_committed_at(cursor, table, snapshot_id) is not None
+
+
+async def snapshot_committed_at(cursor, table: str, snapshot_id: int) -> datetime | None:
+    """When ``snapshot_id`` was committed, or None if it no longer exists (expired)."""
+    await cursor.execute(
+        f"SELECT committed_at FROM {system_table(table, 'snapshots')} WHERE snapshot_id = {snapshot_id}"
+    )
+    row = await cursor.fetchone()
+    return row[0] if row else None
 
 
 async def snapshots_between(cursor, table: str, since: int, upto: int) -> list[tuple[int, str]]:
@@ -293,16 +312,19 @@ async def detect_changes(
 ) -> ChangeResult:
     """Decide what a refresh must do to bring the view from ``last_snapshot``
     (None: never refreshed) to the source's current snapshot."""
-    current = await get_current_snapshot(cursor, source_table)
-    if current is None or current == last_snapshot:
-        return ChangeResult(RefreshAction.NO_CHANGE, current_snapshot=current)
+    main = await main_snapshot(cursor, source_table)
+    if main is None:
+        return ChangeResult(RefreshAction.NO_CHANGE)
+    current, committed_at = main
+    if current == last_snapshot:
+        return ChangeResult(RefreshAction.NO_CHANGE, current, committed_at=committed_at)
     if last_snapshot is None:
-        return ChangeResult(RefreshAction.FULL_REFRESH, current_snapshot=current)
+        return ChangeResult(RefreshAction.FULL_REFRESH, current, committed_at=committed_at)
     try:
         window = await incremental_range_since(cursor, source_table, filter_column, granularity, last_snapshot, current)
     except FullRefreshNeeded as e:
         log.warning("%s → full refresh", e)
-        return ChangeResult(RefreshAction.FULL_REFRESH, current_snapshot=current)
+        return ChangeResult(RefreshAction.FULL_REFRESH, current, committed_at=committed_at)
     if window is None:
-        return ChangeResult(RefreshAction.NO_CHANGE, current_snapshot=current)
-    return ChangeResult(RefreshAction.INCREMENTAL, current_snapshot=current, filter_range=window)
+        return ChangeResult(RefreshAction.NO_CHANGE, current, committed_at=committed_at)
+    return ChangeResult(RefreshAction.INCREMENTAL, current, window, committed_at)

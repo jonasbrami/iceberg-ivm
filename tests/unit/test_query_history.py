@@ -234,6 +234,9 @@ async def test_upsert_and_get_view_status_round_trip(history):
         "total_errors": 1,
         "chunks_done": 68,
         "chunks_total": None,
+        "last_checked": 1240.0,
+        "source_committed_at": 1230.0,
+        "data_as_of": 1200.0,
     }
     await history.upsert_view_status("v", fields)
     got = await history.get_view_status("v")

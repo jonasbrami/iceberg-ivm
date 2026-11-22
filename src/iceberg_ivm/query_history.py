@@ -67,6 +67,11 @@ CREATE TABLE IF NOT EXISTS view_status (
     chunks_done           INTEGER NOT NULL DEFAULT 0,
     chunks_total          INTEGER,
     last_source_snapshot  INTEGER,
+    -- Freshness (epoch seconds): last successful check of the source, commit
+    -- time of the source's current snapshot, commit time the view reflects.
+    last_checked           REAL,
+    source_committed_at    REAL,
+    data_as_of             REAL,
     -- In-flight run: the snapshot it is pinned to, and the end of its last
     -- committed chunk (the resume point). NULL when idle. The bookmark only
     -- moves when a run completes, so the run's lower bound is the bookmark.
@@ -88,6 +93,9 @@ _VIEW_STATUS_COLS: tuple[str, ...] = (
     "total_errors",
     "chunks_done",
     "chunks_total",
+    "last_checked",
+    "source_committed_at",
+    "data_as_of",
 )
 
 
@@ -125,17 +133,19 @@ class QueryHistory:
 
     async def _migrate(self) -> None:
         """Add columns introduced after a DB was first created (``CREATE TABLE
-        IF NOT EXISTS`` won't). Idempotent via the column-presence check (SQLite
-        has no ``ADD COLUMN IF NOT EXISTS``), so a released DB carrying only
-        ``last_source_snapshot`` + counters gains the ``current_work`` columns
-        cleanly.
-        """
+        IF NOT EXISTS`` won't, and SQLite has no ``ADD COLUMN IF NOT EXISTS``)."""
+        added = {
+            "work_max_snapshot": "INTEGER",
+            "work_last_merged_chunk": "TEXT",
+            "last_checked": "REAL",
+            "source_committed_at": "REAL",
+            "data_as_of": "REAL",
+        }
         async with self._db.execute("PRAGMA table_info(view_status)") as cur:
             cols = {row[1] for row in await cur.fetchall()}
-        if "work_max_snapshot" not in cols:
-            await self._db.execute("ALTER TABLE view_status ADD COLUMN work_max_snapshot INTEGER")
-        if "work_last_merged_chunk" not in cols:
-            await self._db.execute("ALTER TABLE view_status ADD COLUMN work_last_merged_chunk TEXT")
+        for column, type_ in added.items():
+            if column not in cols:
+                await self._db.execute(f"ALTER TABLE view_status ADD COLUMN {column} {type_}")
 
     async def close(self) -> None:
         if self._db is not None:

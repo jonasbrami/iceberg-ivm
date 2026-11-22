@@ -35,7 +35,7 @@ class MetaCursor:
     async def execute(self, sql):
         self.sql.append(sql)
         if "$refs" in sql:
-            self._rows = [(self.main,)] if self.main is not None else []
+            self._rows = [(self.main, COMMITTED)] if self.main is not None else []
         elif "$snapshots" in sql:
             self._rows = list(self.snapshots)
         elif "$all_entries" in sql:
@@ -61,6 +61,7 @@ def metrics(column="ts", lower="2026-04-09T10:15:00", upper="2026-04-09T15:30:00
 
 
 SRC = "iceberg.md.trades"
+COMMITTED = datetime(2026, 4, 9, 16, 0, tzinfo=UTC)
 
 
 def test_system_table_quotes_the_metadata_suffix():
@@ -210,6 +211,7 @@ async def test_detect_incremental():
     cur = MetaCursor(main=2, snapshots=[(1, None, "append"), (2, 1, "append")], entries=[metrics()])
     r = await detect_changes(cur, SRC, "ts", "hour", 1)
     assert r.action == RefreshAction.INCREMENTAL
+    assert r.committed_at == COMMITTED
     assert r.filter_range == (datetime(2026, 4, 9, 10), datetime(2026, 4, 9, 16))
 
 
