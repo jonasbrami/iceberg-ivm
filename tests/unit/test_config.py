@@ -587,3 +587,15 @@ def test_maintenance_accepts_valid():
             "remove_orphan_files_retention": "30d",
         }
     )
+
+
+@pytest.mark.parametrize("value", ["ARRAY['day(minute)']", "array[ 'day(ts)', 'symbol' ]", "ARRAY['bucket(16, id)']"])
+def test_target_partitioning_accepts_partition_arrays(value):
+    assert ViewConfig(**_BASE_VIEW, target_partitioning=value).target_partitioning == value.strip()
+
+
+@pytest.mark.parametrize("value", ["day(minute)", "ARRAY[day(minute)]", "ARRAY['x']); DROP TABLE t; --"])
+def test_target_partitioning_rejects_anything_else(value):
+    """It is pasted into CREATE TABLE, so only a plain array of strings is allowed (#68)."""
+    with pytest.raises(ValueError, match="array of partition transforms"):
+        ViewConfig(**_BASE_VIEW, target_partitioning=value)

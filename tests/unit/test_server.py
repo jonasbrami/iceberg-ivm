@@ -1363,7 +1363,7 @@ async def test_refresh_view_no_change_clears_sticky_error(setup_state):
     view = setup_state.config.views[0]
     setup_state.view_statuses["test_view"] = ViewStatus(
         name="test_view",
-        last_action="error",
+        last_action="skip",
         last_error="failed to execute: [Errno 104] Connection reset by peer",
         total_errors=1,
     )
@@ -3223,3 +3223,44 @@ async def test_created_view_starts_its_worker_right_away(setup_state):
     finally:
         setup_state.stop_event.set()
         setup_state.workers.clear()
+
+
+async def test_completing_a_run_clears_an_earlier_error_even_without_chunks(setup_state):
+    """A full refresh over an empty source and target merges nothing but still succeeds (#70)."""
+    from iceberg_ivm import server as server_mod
+    from iceberg_ivm.detector import ChangeResult, RefreshAction
+
+    setup_state.stop_event.clear()
+    vs = setup_state.view_statuses["test_view"]
+    vs.last_error = "connection reset"
+
+    async def no_chunks(*a, **kw):
+        return
+        yield
+
+    with (
+        patch.object(server_mod, "get_trino_connection", lambda s: _FakeConn()),
+        patch.object(server_mod, "discover_columns", _fake_discover),
+        patch.object(server_mod, "detect_changes", AsyncMock(return_value=ChangeResult(RefreshAction.FULL_REFRESH, 9))),
+        patch.object(server_mod, "execute_refresh", no_chunks),
+    ):
+        await server_mod.refresh_view(setup_state, setup_state.config.views[0])
+    assert vs.last_error is None
+
+
+def test_state_touching_handlers_run_on_the_event_loop():
+    """Sync handlers would run in a thread and race the view workers (#69)."""
+    import inspect
+
+    from iceberg_ivm import server as server_mod
+
+    for handler in (
+        "list_views",
+        "create_view",
+        "update_view",
+        "delete_view",
+        "trigger_refresh",
+        "rebuild_view",
+        "info",
+    ):
+        assert inspect.iscoroutinefunction(getattr(server_mod, handler)), handler

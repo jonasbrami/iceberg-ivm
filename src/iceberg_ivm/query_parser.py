@@ -56,6 +56,11 @@ class ParsedView:
         return query.where(in_range, append=True, copy=False).sql(dialect=DIALECT)
 
 
+def quote(name: str) -> str:
+    """A Trino quoted identifier: safe for reserved words and odd characters."""
+    return '"' + name.replace('"', '""') + '"'
+
+
 def timestamp_literal(value: datetime) -> exp.Expression:
     """A Trino timestamp literal for ``value``. Aware values are written in UTC
     as ``TIMESTAMP WITH TIME ZONE`` so they denote the same instant."""

@@ -31,6 +31,7 @@ CHUNKS_FOR: dict[str, tuple[str, ...]] = {
 }
 CHUNKS_FOR["week"] = ("week",)
 
+_PARTITIONING_RE = re.compile(r"^ARRAY\s*\[\s*'[^']+'\s*(,\s*'[^']+'\s*)*\]$", re.IGNORECASE)
 _DURATION_RE = re.compile(r"^\d+[smhd]$")  # Trino duration
 _DATASIZE_RE = re.compile(r"^\d+(B|KB|MB|GB|TB)$")  # Trino data size
 
@@ -76,6 +77,13 @@ class ViewConfig(BaseModel):
         if not QUALIFIED_NAME_RE.match(value):
             raise ValueError(f"{value!r} must be a SQL identifier or a dotted name like catalog.schema.table")
         return value
+
+    @field_validator("target_partitioning")
+    @classmethod
+    def _partitioning(cls, value: str | None) -> str | None:
+        if value is not None and not _PARTITIONING_RE.match(value.strip()):
+            raise ValueError(f"{value!r} must be an array of partition transforms, like ARRAY['day(minute)']")
+        return value.strip() if value else value
 
     @field_validator("expire_snapshots_retention", "remove_orphan_files_retention")
     @classmethod
